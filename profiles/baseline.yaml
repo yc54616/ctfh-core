@@ -1,0 +1,51 @@
+profile: baseline-codex-direct-v0
+version: 0
+
+objective:
+  primary: verified_completion_by_deadline
+  cost: guardrail
+
+task_source:
+  kind: local
+
+target:
+  provider: local
+  isolation: per-task
+
+worker_environment:
+  provider: local-process
+  isolation: per-attempt
+  capabilities:
+    - shell
+    - files
+
+agent:
+  adapter: codex-cli
+  binary: codex
+  model: gpt-6-sol
+  reasoning_effort: xhigh
+  permissions: pinned
+  session_resume: false
+
+strategy:
+  kind: direct
+  attempts: 1
+
+outcome:
+  authority: local
+  authoritative: true
+
+limits:
+  max_attempts_per_task: 1
+  attempt_deadline_seconds: 900
+  concurrent_attempts: 1
+
+context:
+  outer_optimizers: []
+
+browser:
+  enabled: false
+
+notes:
+  - This is a target configuration, not yet a claim that these exact parameters are optimal.
+  - The first benchmark compares this wrapper against direct native Codex on the same fixture.
