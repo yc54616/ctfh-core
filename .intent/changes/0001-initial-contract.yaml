@@ -1,0 +1,26 @@
+version: 1
+id: CHG-0001
+status: accepted
+source:
+  type: user
+  ref: "2026-10-05: intent gate structure request"
+summary: "Establish the initial active contract for CTFH v2."
+events:
+  - type: ADD
+    atom_id: INT-0001
+  - type: ADD
+    atom_id: INV-0001
+  - type: ADD
+    atom_id: INV-0002
+  - type: ADD
+    atom_id: INV-0003
+  - type: ADD
+    atom_id: REQ-0001
+  - type: ADD
+    atom_id: REQ-0002
+  - type: ADD
+    atom_id: REQ-0003
+  - type: ADD
+    atom_id: REQ-0004
+  - type: ADD
+    atom_id: ACC-0001

@@ -1,0 +1,100 @@
+version: 1
+atoms:
+  - id: INT-0001
+    kind: intent
+    authority: principal_only
+    polarity: require
+    status: active
+    statement: "CTFH optimizes verified score by the event deadline."
+    rationale: "Competition performance is the primary project objective."
+    verification:
+      kind: metric
+      ref: benchmarks/README.md
+
+  - id: INV-0001
+    kind: invariant
+    authority: principal_only
+    polarity: require
+    status: active
+    statement: "CTFH remains a thin supervisor around native agents, not another generic agent framework."
+    rationale: "Preserve native Codex/Claude strengths and avoid orchestration latency."
+    verification:
+      kind: review
+      ref: docs/ARCHITECTURE.md
+
+  - id: INV-0002
+    kind: invariant
+    authority: principal_only
+    polarity: require
+    status: active
+    statement: "Only independently authoritative verification may mark a task solved."
+    rationale: "Worker self-report is not sufficient evidence of completion."
+    verification:
+      kind: review
+      ref: docs/ARCHITECTURE.md
+
+  - id: INV-0003
+    kind: invariant
+    authority: principal_only
+    polarity: require
+    status: active
+    statement: "Target lifecycle is independent from disposable worker-environment lifecycle."
+    rationale: "Worker restart/cancel must not silently reset or destroy a valid challenge target."
+    verification:
+      kind: test
+      ref: tests/test_v0.py
+
+  - id: REQ-0001
+    kind: requirement
+    authority: agent_revisable
+    polarity: require
+    status: active
+    statement: "v0 must prove a real native-agent vertical slice before deferred orchestration modules are added."
+    rationale: "Measure real performance before expanding abstractions."
+    verification:
+      kind: test
+      ref: benchmarks/README.md
+
+  - id: REQ-0002
+    kind: requirement
+    authority: agent_revisable
+    polarity: require
+    status: active
+    statement: "Wrapper-overhead claims require a matched direct-native versus CTFH-supervised A/B comparison."
+    rationale: "Avoid attributing environment/model/configuration differences to CTFH."
+    verification:
+      kind: review
+      ref: benchmarks/README.md
+
+  - id: REQ-0003
+    kind: requirement
+    authority: agent_revisable
+    polarity: require
+    status: active
+    statement: "Environment/tooling is part of the benchmarked harness profile."
+    rationale: "Measured CTF results show prepared tooling can materially change solve rate."
+    verification:
+      kind: review
+      ref: docs/RESEARCH.md
+
+  - id: REQ-0004
+    kind: requirement
+    authority: agent_revisable
+    polarity: require
+    status: active
+    statement: "Planner/executor, pass@k, Jev, context-mode, codebase-memory and learned routing remain deferred until paired evidence justifies each one."
+    rationale: "Avoid adding layers that may increase wall-clock without increasing solves."
+    verification:
+      kind: review
+      ref: docs/ARCHITECTURE.md
+
+  - id: ACC-0001
+    kind: acceptance
+    authority: principal_only
+    polarity: require
+    status: active
+    statement: "A module is promoted only when paired evaluation shows a meaningful benefit without unacceptable solve loss or reliability regression."
+    rationale: "Evidence gate for future architectural growth."
+    verification:
+      kind: metric
+      ref: benchmarks/README.md

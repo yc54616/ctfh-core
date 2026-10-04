@@ -1,0 +1,25 @@
+version: 1
+project: ctfh-core
+status: confirmed
+authority: principal_only
+
+purpose: >-
+  Build a competition CTF supervisor that maximizes verified score by the event
+  deadline while preserving native-agent strengths.
+
+primary_success:
+  metric: verified_score_by_deadline
+  comparison: direct_native_agent_baseline
+
+non_negotiables:
+  - authorized_ctf_scope_only
+  - native_agents_remain_native
+  - every_added_layer_requires_paired_evidence
+  - outcome_authority_independent_from_worker_self_report
+  - components_remain_replaceable_over_time
+  - cost_is_guardrail_not_primary_optimizer
+
+change_policy:
+  principal_only_requires_confirmation: true
+  agent_revisable_auto_apply: true
+  derived_is_disposable: true
