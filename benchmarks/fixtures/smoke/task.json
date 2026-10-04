@@ -1,0 +1,6 @@
+{
+  "task_id": "smoke-local-combine",
+  "title": "Harmless local candidate construction",
+  "deadline_seconds": 120,
+  "points": 1
+}
