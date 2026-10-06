@@ -12,13 +12,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Iterator
 
-from .agent import CodexCLIAdapter
+from .agent import AgentAdapter, make_agent_adapter
 from .artifacts import ArtifactStore
 from .environment import CancelToken, LocalWorkerEnvironmentProvider
 from .outcome import LocalOutcomeAuthority
-from .runlock import build_runlock, write_runlock
+from .runlock import apply_knowledge_prompt, build_runlock, resolve_knowledge_snapshot, write_runlock
 from .store import StateStore
 from .target import LocalTargetProvider
+from .trace import seal_trace_manifest, trace_manifest_reference
 from .types import (
     AttemptRequest,
     AttemptState,
@@ -66,7 +67,7 @@ def next_host_epoch(path: Path) -> int:
 
 
 async def _run_agent_with_deadline(
-    adapter: CodexCLIAdapter,
+    adapter: AgentAdapter,
     req: AttemptRequest,
     env,
     env_provider: LocalWorkerEnvironmentProvider,
@@ -78,19 +79,44 @@ async def _run_agent_with_deadline(
     task = asyncio.create_task(
         adapter.run(req, env, env_provider, attempt_output, cancel)
     )
-    done, _ = await asyncio.wait({task}, timeout=deadline_s)
-    if task in done:
-        return await task, False
-
-    if before_cancel is not None:
-        before_cancel()
-    cancel.cancel()
-    await env_provider.kill(env, grace_s=0.5)
     try:
-        result = await asyncio.wait_for(task, timeout=3.0)
-    except (TimeoutError, asyncio.CancelledError):
-        result = None
-    return result, True
+        done, _ = await asyncio.wait({task}, timeout=deadline_s)
+        if task in done:
+            return await task, False
+
+        if before_cancel is not None:
+            before_cancel()
+        cancel.cancel()
+        await env_provider.kill(env, grace_s=0.5)
+        try:
+            result = await asyncio.wait_for(task, timeout=3.0)
+        except (TimeoutError, asyncio.CancelledError):
+            result = None
+        return result, True
+    except asyncio.CancelledError:
+        if before_cancel is not None:
+            try:
+                before_cancel()
+            except Exception:
+                pass
+        cancel.cancel()
+        kill_task = asyncio.create_task(
+            env_provider.kill(env, grace_s=0.5)
+        )
+        try:
+            await asyncio.shield(kill_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(kill_task)
+        task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=3.0,
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 async def run_supervised(
@@ -100,18 +126,33 @@ async def run_supervised(
     model: str,
     reasoning_effort: str,
     evaluator_data: dict[str, object],
-    sandbox: str = "workspace-write",
+    sandbox: str = "danger-full-access",
     prompt: str = DEFAULT_PROMPT,
     host_state_dir: Path | None = None,
+    interactive_session_service: bool = False,
+    browser_service: bool = False,
+    browser_allowed_domains: tuple[str, ...] = (),
+    knowledge_snapshot_dir: Path | None = None,
+    agent: str = "codex",
 ) -> dict[str, object]:
     run_root = run_root.resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     e2e_start = time.monotonic()
     queue_start = e2e_start
 
-    adapter = CodexCLIAdapter()
+    adapter = make_agent_adapter(agent)
+    knowledge_source, memory_mode, knowledge_digest = resolve_knowledge_snapshot(
+        knowledge_snapshot_dir
+    )
+    effective_prompt = apply_knowledge_prompt(prompt, memory_mode)
     target_provider = LocalTargetProvider()
-    env_provider = LocalWorkerEnvironmentProvider(run_root / "environments")
+    env_provider = LocalWorkerEnvironmentProvider(
+        run_root / "environments",
+        enable_interactive_session_service=interactive_session_service,
+        enable_browser_service=browser_service,
+        browser_allowed_domains=browser_allowed_domains,
+        knowledge_snapshot_dir=knowledge_source,
+    )
     outcome = LocalOutcomeAuthority(evaluator_data)
     artifacts = ArtifactStore(run_root / "artifacts")
     cancel = CancelToken()
@@ -121,6 +162,20 @@ async def run_supervised(
     attempt_output = run_root / "attempts" / attempt_id
     attempt_output.mkdir(parents=True, exist_ok=True)
 
+    admitted = ["native-shell", "workspace-files"]
+    if interactive_session_service:
+        admitted.append("interactive-session")
+    if browser_service:
+        admitted.append("browser")
+    admitted_capabilities = tuple(admitted)
+    environment_services = {
+        "interactive-session": (
+            "cli-unix-rpc-v1" if interactive_session_service else "disabled"
+        ),
+        "browser": (
+            "ghostchrome-serve-cli-v1" if browser_service else "disabled"
+        ),
+    }
     lock = build_runlock(
         treatment="ctfh-supervised",
         task=task,
@@ -129,7 +184,12 @@ async def run_supervised(
         reasoning_effort=reasoning_effort,
         sandbox=sandbox,
         deadline_seconds=task.deadline_seconds,
-        prompt=prompt,
+        prompt=effective_prompt,
+        admitted_capabilities=admitted_capabilities,
+        memory_mode=memory_mode,
+        knowledge_snapshot_digest=knowledge_digest,
+        environment_services=environment_services,
+        browser_allowed_domains=browser_allowed_domains,
     )
     write_runlock(run_root / "runlock.json", lock)
 
@@ -138,6 +198,8 @@ async def run_supervised(
         if host_state_dir is None
         else host_state_dir.resolve()
     )
+    owner: WorkerOwnerTag | None = None
+    env_created = False
     with host_lock(host_state_dir / "host.lock"):
         store = StateStore(run_root / "state.db")
         try:
@@ -166,6 +228,8 @@ async def run_supervised(
 
             env_start = time.monotonic()
             env = await env_provider.create(task, owner, cancel)
+            env_created = True
+            adapter.materialize(env, env_provider, lock.base_config)
             env_ready = time.monotonic()
             store.transition_attempt(attempt_id, AttemptState.RUNNING)
             store.event("attempt_running", attempt_id=attempt_id)
@@ -177,7 +241,7 @@ async def run_supervised(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 sandbox=sandbox,
-                prompt=prompt,
+                prompt=effective_prompt,
             )
 
             queue_wait = env_start - queue_start
@@ -242,6 +306,10 @@ async def run_supervised(
                                 candidate=verdict.candidate,
                             )
 
+            authoritative_result_s = (
+                time.monotonic() - e2e_start if verdict.authoritative else None
+            )
+
             # Preserve useful attempt outputs before destroying the environment.
             candidate_copy = attempt_output / "candidate.txt"
             final_copy = attempt_output / "final_message.txt"
@@ -257,7 +325,30 @@ async def run_supervised(
                 artifacts.publish_file(final_copy)
 
             cleanup_start = time.monotonic()
-            await env_provider.destroy(owner)
+            await env_provider.kill(env)
+            service_traces = await env_provider.publish_service_traces(
+                env, attempt_output
+            )
+            trace_manifest_path, trace_manifest_payload = seal_trace_manifest(
+                attempt_output,
+                task_id=task.task_id,
+                attempt_id=attempt_id,
+                runlock_base_hash=lock.base_hash,
+                adapter_name=adapter.name,
+                agent_trace_coverage=adapter.capabilities().trace_coverage,
+                timed_out=timed_out,
+            )
+            trace_manifest = trace_manifest_reference(
+                trace_manifest_path, trace_manifest_payload
+            )
+            for service_trace in service_traces:
+                artifacts.publish_file(service_trace)
+            trace_manifest_artifact = artifacts.publish_file(
+                trace_manifest_path
+            )
+            attempt_artifact = artifacts.seal_directory(attempt_output)
+            await env_provider.destroy_cancellation_safe(owner)
+            env_created = False
             if timed_out:
                 await env_provider.sweep_workers(set())
                 store.transition_attempt(attempt_id, AttemptState.CANCELLED)
@@ -284,6 +375,7 @@ async def run_supervised(
                 agent_duration_s=agent_duration,
                 candidate_first_seen_s=first_seen,
                 verification_s=verify_duration,
+                authoritative_result_s=authoritative_result_s,
                 cleanup_s=cleanup_end - cleanup_start,
                 end_to_end_s=cleanup_end - e2e_start,
             )
@@ -299,6 +391,11 @@ async def run_supervised(
                 "runlock_full_hash": lock.full_hash,
                 "verdict": asdict(verdict),
                 "exit_code": exit_code,
+                "trace_manifest": {
+                    **trace_manifest,
+                    "artifact": trace_manifest_artifact,
+                },
+                "attempt_artifact": attempt_artifact,
                 "metrics": asdict(metrics),
             }
             (run_root / "result.json").write_text(
@@ -306,4 +403,9 @@ async def run_supervised(
             )
             return payload
         finally:
-            store.close()
+            try:
+                if owner is not None and env_created:
+                    cancel.cancel()
+                    await env_provider.destroy_cancellation_safe(owner)
+            finally:
+                store.close()

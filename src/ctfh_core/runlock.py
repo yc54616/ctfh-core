@@ -5,17 +5,27 @@ import json
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .agent import CodexCLIAdapter
+from .agent import AgentAdapter, ClaudeCLIAdapter, CodexCLIAdapter
+from .digest import tree_snapshot_digest
+from .trace import TRACE_MANIFEST_SCHEMA
 from .types import RunLock, TaskSpec
+
+
+@lru_cache(maxsize=64)
+def _cached_sha256(path_text: str, size: int, mtime_ns: int) -> str:
+    del size, mtime_ns
+    return hashlib.sha256(Path(path_text).read_bytes()).hexdigest()
 
 
 def _sha_file(path: Path) -> str | None:
     if not path.is_file():
         return None
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    stat = path.stat()
+    return _cached_sha256(str(path), stat.st_size, stat.st_mtime_ns)
 
 
 def _tree_hash(root: Path) -> str:
@@ -36,43 +46,26 @@ def _stable_hash(value: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _optional_tree_hash(root: Path) -> str | None:
+    return tree_snapshot_digest(root) if root.is_dir() else None
+
+
 def _effective_codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).resolve()
 
 
 def _codex_behavior_fingerprint(codex_home: Path) -> dict[str, Any]:
+    # Only inputs that are actually mounted into the attempt belong here.
+    # Host config/plugins/hooks/memory are intentionally excluded because
+    # AgentAdapter.materialize() supplies the attempt-local native config.
     files: dict[str, str] = {}
-    direct = [
-        codex_home / "config.toml",
+    for path in (
         codex_home / "AGENTS.md",
         codex_home / "RTK.md",
-        codex_home / "memories" / "MEMORY.md",
-    ]
-    for path in direct:
+    ):
         digest = _sha_file(path)
         if digest is not None:
             files[str(path.relative_to(codex_home))] = digest
-
-    for base in (
-        codex_home / "hooks",
-        codex_home / "skills",
-        codex_home / "agents",
-    ):
-        if not base.is_dir():
-            continue
-        for path in sorted(p for p in base.rglob("*") if p.is_file()):
-            if path.stat().st_size > 5_000_000:
-                continue
-            files[str(path.relative_to(codex_home))] = hashlib.sha256(
-                path.read_bytes()
-            ).hexdigest()
-
-    plugin_root = codex_home / "plugins" / "cache"
-    if plugin_root.is_dir():
-        for path in sorted(plugin_root.rglob("SKILL.md")):
-            files[str(path.relative_to(codex_home))] = hashlib.sha256(
-                path.read_bytes()
-            ).hexdigest()
 
     return {
         "source_path": str(codex_home),
@@ -87,17 +80,20 @@ def _codex_install_fingerprint(binary: str) -> dict[str, Any]:
         raise FileNotFoundError(binary)
     launcher = Path(found)
     resolved = launcher.resolve()
-    files: dict[str, str] = {
-        str(resolved): hashlib.sha256(resolved.read_bytes()).hexdigest(),
-    }
+    files: dict[str, str] = {}
+    digest = _sha_file(resolved)
+    if digest is not None:
+        files[str(resolved)] = digest
     package_root = resolved.parent.parent if resolved.name == "codex.js" else resolved.parent
     package_json = package_root / "package.json"
-    if package_json.is_file():
-        files[str(package_json)] = hashlib.sha256(package_json.read_bytes()).hexdigest()
+    package_digest = _sha_file(package_json)
+    if package_digest is not None:
+        files[str(package_json)] = package_digest
     if package_root.is_dir():
         for path in sorted(package_root.glob("node_modules/@openai/codex-linux-*/vendor/*/codex")):
-            if path.is_file():
-                files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = _sha_file(path)
+            if digest is not None:
+                files[str(path)] = digest
 
     node_version = subprocess.run(
         ["node", "--version"],
@@ -114,18 +110,156 @@ def _codex_install_fingerprint(binary: str) -> dict[str, Any]:
     }
 
 
+def _generic_install_fingerprint(binary: str) -> dict[str, Any]:
+    found = shutil.which(binary)
+    if found is None:
+        raise FileNotFoundError(binary)
+    launcher = Path(found)
+    resolved = launcher.resolve()
+    digest = _sha_file(resolved)
+    files = {} if digest is None else {str(resolved): digest}
+    return {
+        "launcher": str(launcher),
+        "resolved": str(resolved),
+        "files": files,
+        "digest": _stable_hash({"files": files}),
+    }
+
+
+def _effective_claude_home() -> Path:
+    return (Path.home() / ".claude").resolve()
+
+
+def _adapter_runtime_profile(
+    adapter: AgentAdapter,
+    requested_skill_mode: str | None,
+    sandbox: str,
+) -> dict[str, Any]:
+    if isinstance(adapter, CodexCLIAdapter):
+        codex_home = _effective_codex_home()
+        skill_mode = requested_skill_mode or "host-pinned"
+        if skill_mode not in {"host-pinned", "off"}:
+            raise ValueError(f"unsupported Codex skill mode: {skill_mode}")
+        skill_digest = (
+            _optional_tree_hash(codex_home / "skills")
+            if skill_mode == "host-pinned"
+            else None
+        )
+        return {
+            "install": _codex_install_fingerprint(adapter.binary),
+            "native_home": {
+                "kind": "codex",
+                **_codex_behavior_fingerprint(codex_home),
+            },
+            "native_config": {
+                "policy": "ctfh-minimal-v1",
+                "digest": adapter.materialized_config_digest(),
+            },
+            "skills": {
+                "mode": skill_mode,
+                "digest": skill_digest,
+                "read_only": True,
+                "materializer": (
+                    "codex-native-copy-v1"
+                    if skill_mode == "host-pinned"
+                    else "none"
+                ),
+            },
+            "permissions": (
+                "worker-environment-bwrap-isolation;"
+                f"native-agent-inner-sandbox={sandbox}"
+            ),
+            "web_search": "native-config-disabled",
+        }
+
+    if isinstance(adapter, ClaudeCLIAdapter):
+        skill_mode = requested_skill_mode or "off"
+        if skill_mode != "off":
+            raise ValueError("Claude safe-mode adapter requires skills=off")
+        claude_home = _effective_claude_home()
+        return {
+            "install": _generic_install_fingerprint(adapter.binary),
+            "native_home": {
+                "kind": "claude",
+                "source_path": str(claude_home),
+                "files": {},
+                "digest": _stable_hash({}),
+            },
+            "native_config": {
+                "policy": adapter.native_config_policy,
+                "digest": adapter.native_config_digest(),
+            },
+            "skills": {
+                "mode": "off",
+                "digest": None,
+                "read_only": True,
+                "materializer": "none",
+            },
+            "permissions": (
+                "worker-environment-bwrap-isolation;"
+                "claude-permission-mode=bypassPermissions;"
+                "claude-safe-mode"
+            ),
+            "web_search": "tool-list-excluded",
+        }
+
+    raise TypeError(f"unsupported agent adapter: {type(adapter).__name__}")
+
+
+FROZEN_KNOWLEDGE_GUIDANCE = (
+    "\n\nA pinned read-only knowledge snapshot is available at "
+    "$CTFH_KNOWLEDGE_DIR (/ctfh-knowledge). Consult it only when relevant; "
+    "do not modify it."
+)
+
+
+def resolve_knowledge_snapshot(
+    snapshot_dir: Path | None,
+) -> tuple[Path | None, str, str | None]:
+    if snapshot_dir is None:
+        return None, "off", None
+    source = snapshot_dir.resolve()
+    if not source.is_dir():
+        raise ValueError(f"knowledge snapshot is not a directory: {source}")
+    return source, "frozen", tree_snapshot_digest(source)
+
+
+def apply_knowledge_prompt(prompt: str, memory_mode: str) -> str:
+    if memory_mode == "off":
+        return prompt
+    if memory_mode == "frozen":
+        return prompt.rstrip() + FROZEN_KNOWLEDGE_GUIDANCE
+    raise ValueError(f"unsupported memory mode: {memory_mode}")
+
+
 def build_runlock(
     *,
     treatment: str,
     task: TaskSpec,
-    adapter: CodexCLIAdapter,
+    adapter: AgentAdapter,
     model: str,
     reasoning_effort: str,
     sandbox: str,
     deadline_seconds: float,
     prompt: str,
+    admitted_capabilities: tuple[str, ...] = ("native-shell", "workspace-files"),
+    skill_mode: str | None = None,
+    memory_mode: str = "off",
+    knowledge_snapshot_digest: str | None = None,
+    environment_services: dict[str, str] | None = None,
+    browser_allowed_domains: tuple[str, ...] = (),
 ) -> RunLock:
-    codex_home = _effective_codex_home()
+    adapter_profile = _adapter_runtime_profile(adapter, skill_mode, sandbox)
+    if memory_mode not in {"off", "frozen"}:
+        raise ValueError(f"unsupported memory mode: {memory_mode}")
+    if memory_mode == "off" and knowledge_snapshot_digest is not None:
+        raise ValueError("memory=off cannot include a knowledge snapshot")
+    if memory_mode == "frozen" and not knowledge_snapshot_digest:
+        raise ValueError("memory=frozen requires a knowledge snapshot digest")
+    services = dict(sorted((environment_services or {
+        "interactive-session": "disabled",
+        "browser": "disabled",
+    }).items()))
     base = {
         "task_id": task.task_id,
         "task_public_hash": _tree_hash(task.public_dir),
@@ -134,17 +268,44 @@ def build_runlock(
         "agent": {
             "adapter": adapter.name,
             "adapter_version": adapter.version(),
-            "install": _codex_install_fingerprint(adapter.binary),
-            "codex_home": _codex_behavior_fingerprint(codex_home),
+            "install": adapter_profile["install"],
+            "native_home": adapter_profile["native_home"],
             "model": model,
             "reasoning_effort": reasoning_effort,
             "sandbox": sandbox,
             "ephemeral": True,
+            "native_config": adapter_profile["native_config"],
         },
-        "permissions": "bubblewrap-fs-isolation+codex-workspace-sandbox",
+        "permissions": adapter_profile["permissions"],
+        "capabilities": {
+            "policy": "static-narrow-only-v3",
+            "admitted": sorted(set(admitted_capabilities)),
+        },
+        "skills": adapter_profile["skills"],
+        "memory": {
+            "mode": memory_mode,
+            "knowledge_snapshot_digest": knowledge_snapshot_digest,
+            "native_memory_isolated": True,
+            "read_only": True,
+            "materializer": (
+                "snapshot-copy-v1" if memory_mode == "frozen" else "none"
+            ),
+        },
+        "environment_services": services,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "web_search": "prompt-disabled",
-        "browser": "disabled",
+        "web_search": adapter_profile["web_search"],
+        "browser": services.get("browser", "disabled"),
+        "browser_policy": {
+            "allowed_domains": sorted(set(browser_allowed_domains)),
+            "profile": "disposable-attempt-local",
+            "cross_attempt_reuse": False,
+        },
+        "trace": {
+            "manifest_schema": TRACE_MANIFEST_SCHEMA,
+            "agent_coverage": adapter.capabilities().trace_coverage,
+            "bulk_path": "attempt-private-files",
+            "kernel_sqlite_hot_path": False,
+        },
         "outer_context_optimizers": [],
         "deadline_seconds": deadline_seconds,
         "outcome_authority": "local-exact-candidate-v0",

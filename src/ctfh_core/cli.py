@@ -23,9 +23,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     smoke = sub.add_parser("smoke", help="run the local native-agent vertical slice")
     smoke.add_argument("--fixture", default=str(Path(__file__).resolve().parents[2] / "benchmarks" / "fixtures" / "smoke"))
-    smoke.add_argument("--model", default="gpt-6-sol")
+    smoke.add_argument(
+        "--agent",
+        choices=("codex", "claude"),
+        default="codex",
+        help="native agent adapter",
+    )
+    smoke.add_argument(
+        "--model",
+        help="native model; defaults to gpt-6-sol for Codex and claude-opus-5-5 for Claude",
+    )
     smoke.add_argument("--effort", default="high", choices=("low", "medium", "high", "xhigh"))
     smoke.add_argument("--mode", choices=("direct", "supervised", "pair"), default="pair")
+    smoke.add_argument(
+        "--interactive-session",
+        action="store_true",
+        help="admit the WorkerEnvironment interactive PTY session service",
+    )
+    smoke.add_argument(
+        "--browser",
+        action="store_true",
+        help="admit the WorkerEnvironment GhostChrome browser service",
+    )
+    smoke.add_argument(
+        "--browser-domain",
+        action="append",
+        default=[],
+        help="browser navigation allowlist domain; repeat for multiple domains",
+    )
+    smoke.add_argument(
+        "--knowledge-snapshot",
+        help="read-only frozen knowledge snapshot directory",
+    )
     smoke.add_argument("--out", help="output root; default .ctfh-runs/smoke-<timestamp>")
 
     intent = sub.add_parser("intent", help="resolve and enforce the active project contract")
@@ -73,11 +102,55 @@ async def _smoke(args: argparse.Namespace) -> dict[str, object]:
     bundle = LocalTaskSource(fixture).load()
     task = bundle.spec
     root = Path(args.out).resolve() if args.out else Path.cwd() / ".ctfh-runs" / f"smoke-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    model = args.model or (
+        "claude-opus-5-5" if args.agent == "claude" else "gpt-6-sol"
+    )
+    browser_domains = tuple(sorted(set(args.browser_domain)))
+    if browser_domains and not args.browser:
+        raise ValueError("--browser-domain requires --browser")
+    knowledge_snapshot = (
+        None
+        if args.knowledge_snapshot is None
+        else Path(args.knowledge_snapshot).resolve()
+    )
     if args.mode == "direct":
-        return await run_direct(task=task, run_root=root, model=args.model, reasoning_effort=args.effort, evaluator_data=bundle.evaluator_data)
+        return await run_direct(
+            task=task,
+            run_root=root,
+            model=model,
+            reasoning_effort=args.effort,
+            evaluator_data=bundle.evaluator_data,
+            interactive_session_service=args.interactive_session,
+            browser_service=args.browser,
+            browser_allowed_domains=browser_domains,
+            knowledge_snapshot_dir=knowledge_snapshot,
+            agent=args.agent,
+        )
     if args.mode == "supervised":
-        return await run_supervised(task=task, run_root=root, model=args.model, reasoning_effort=args.effort, evaluator_data=bundle.evaluator_data)
-    return await run_matched_pair(task=task, root=root, model=args.model, reasoning_effort=args.effort, evaluator_data=bundle.evaluator_data)
+        return await run_supervised(
+            task=task,
+            run_root=root,
+            model=model,
+            reasoning_effort=args.effort,
+            evaluator_data=bundle.evaluator_data,
+            interactive_session_service=args.interactive_session,
+            browser_service=args.browser,
+            browser_allowed_domains=browser_domains,
+            knowledge_snapshot_dir=knowledge_snapshot,
+            agent=args.agent,
+        )
+    return await run_matched_pair(
+        task=task,
+        root=root,
+        model=model,
+        reasoning_effort=args.effort,
+        evaluator_data=bundle.evaluator_data,
+        interactive_session_service=args.interactive_session,
+        browser_service=args.browser,
+        browser_allowed_domains=browser_domains,
+        knowledge_snapshot_dir=knowledge_snapshot,
+        agent=args.agent,
+    )
 
 
 def _load_proposal(path: Path) -> dict[str, object]:

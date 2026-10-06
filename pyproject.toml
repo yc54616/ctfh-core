@@ -11,6 +11,7 @@ dependencies = ["PyYAML>=6.0"]
 
 [project.scripts]
 ctfh2 = "ctfh_core.cli:main"
+ctfh-learn = "ctfh_learning.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
