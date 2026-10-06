@@ -1,0 +1,246 @@
+v: 1
+seq: 0
+prev: null
+actor: principal
+ops:
+- type: ADD
+  atom:
+    id: INT-0001
+    key: project.objective
+    kind: intent
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: CTFH maximizes verified score by the event deadline.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Competition performance is the primary project objective.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0001
+    key: architecture.thin_supervisor
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: CTFH remains a thin supervisor around native agents, not another generic
+      agent framework.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Preserve native agent strengths and avoid unnecessary orchestration
+      latency.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0002
+    key: outcome.authority
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: Only independently authoritative verification may mark a task solved.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Worker self-report is not sufficient evidence of completion.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0003
+    key: lifecycle.target_worker_separation
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: Target lifecycle is independent from disposable worker-environment
+      lifecycle.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Worker restart or cancellation must not silently reset or destroy a
+      valid target.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0004
+    key: scope.authorization
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: CTFH is used only for authorized CTF competitions and explicitly authorized
+      security tasks.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Project authority must remain bounded to authorized targets.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0005
+    key: architecture.replaceability
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: Model, agent, environment, browser, tool, context, and skill components
+      remain replaceable over time.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: The harness must not hard-code one provider or model family into the
+      kernel.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0006
+    key: optimization.cost_guardrail
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: Cost is a guardrail, not the primary optimization objective.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Solve probability and wall-clock performance have priority over minimizing
+      spend.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: INV-0007
+    key: architecture.evidence_gate
+    kind: invariant
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: Every added orchestration layer must earn promotion through paired
+      evidence without unacceptable solve-rate or reliability regression.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: Prevent complexity from accumulating without measured benefit.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: REQ-0001
+    key: v0.real_vertical_slice
+    kind: requirement
+    authority: agent
+    scope:
+      paths: []
+    polarity: require
+    statement: v0 must prove a real native-agent vertical slice before deferred orchestration
+      modules are added.
+    verification:
+      kind: manual
+      ref: benchmarks/README.md
+    rationale: Measure real performance before expanding abstractions.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: REQ-0002
+    key: benchmark.matched_ab
+    kind: requirement
+    authority: agent
+    scope:
+      paths: []
+    polarity: require
+    statement: Wrapper-overhead claims require a matched direct-native versus CTFH-supervised
+      A/B comparison.
+    verification:
+      kind: manual
+      ref: benchmarks/README.md
+    rationale: Avoid attributing environment, model, or configuration differences
+      to CTFH.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: REQ-0003
+    key: benchmark.environment_profile
+    kind: requirement
+    authority: agent
+    scope:
+      paths: []
+    polarity: require
+    statement: Environment and tooling are part of the benchmarked harness profile.
+    verification:
+      kind: manual
+      ref: docs/RESEARCH.md
+    rationale: Measured CTF results show prepared tooling can materially change solve
+      rate.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: REQ-0004
+    key: modules.deferred_until_evidence
+    kind: requirement
+    authority: agent
+    scope:
+      paths: []
+    polarity: require
+    statement: Planner/executor, pass@k, Jev, context-mode, codebase-memory, and learned
+      routing remain deferred until paired evidence justifies each one.
+    verification:
+      kind: manual
+      ref: docs/ARCHITECTURE.md
+    rationale: Avoid adding layers that may increase wall-clock time without increasing
+      verified solves.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+- type: ADD
+  atom:
+    id: DEC-0001
+    key: decision.intent_gate_ledger
+    kind: decision
+    authority: principal
+    scope:
+      paths: []
+    polarity: require
+    statement: Project intent is preserved by a single append-only active-contract
+      event ledger.
+    verification:
+      kind: manual
+      ref: principal-confirmed
+    rationale: The event ledger is authoritative; materialized views are generated
+      and checked.
+    source:
+      ref: 2026-10-05 intent-gate confirmation
+      type: user
+    body_ref: .intent/decisions/0001-active-contract-ledger.md
+    body_hash: fb9d6d2f0c91d0ba6e9eb63e73b1975e6b6e2fa319da9f42dc27ebb5fc7ef19e
+note: Principal-approved genesis contract for CTFH v2.

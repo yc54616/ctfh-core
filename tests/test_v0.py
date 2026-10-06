@@ -109,7 +109,11 @@ class V0Tests(unittest.IsolatedAsyncioTestCase):
         provider = LocalWorkerEnvironmentProvider(self.root / "envs")
         owner = WorkerOwnerTag("r", 1, self.task.task_id, "a")
         env = await provider.create(self.task, owner, CancelToken())
-        target = await LocalTargetProvider().acquire(run_id="r", task_id=self.task.task_id)
+        target = await LocalTargetProvider().acquire(
+            run_id="r",
+            task_id=self.task.task_id,
+            epoch=1,
+        )
         verdict = await LocalOutcomeAuthority(self.bundle.evaluator_data).verify(
             self.task,
             target,
@@ -134,7 +138,7 @@ class StoreTests(unittest.TestCase):
             store = StateStore(Path(td) / "state.db")
             try:
                 store.ensure_task("t", 1)
-                store.set_target_epoch("t", 2)
+                self.assertEqual(store.advance_target_epoch("t"), 2)
                 self.assertFalse(
                     store.commit_solved(
                         "t",
@@ -171,6 +175,7 @@ class StoreTests(unittest.TestCase):
             try:
                 store.ensure_task("t")
                 store.create_attempt("a", "t", "owner")
+                store.transition_attempt("a", AttemptState.STARTING)
                 store.transition_attempt("a", AttemptState.RUNNING)
                 self.assertEqual(store.recover_live_attempts(), 1)
                 state = store.conn.execute(

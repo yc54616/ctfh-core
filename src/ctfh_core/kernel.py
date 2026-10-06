@@ -145,9 +145,19 @@ async def run_supervised(
             recovered = store.recover_live_attempts()
             await env_provider.sweep_workers(set())
 
-            target = await target_provider.acquire(run_id=run_id, task_id=task.task_id)
-            store.ensure_task(task.task_id, target.epoch)
-            store.set_target_epoch(task.task_id, target.epoch)
+            store.ensure_task(task.task_id)
+            target_epoch = store.task_target_epoch(task.task_id)
+            target = await target_provider.acquire(
+                run_id=run_id,
+                task_id=task.task_id,
+                epoch=target_epoch,
+            )
+            target_state = await target_provider.reconcile(
+                target,
+                authoritative_epoch=target_epoch,
+            )
+            if target_state != "usable":
+                raise RuntimeError("target reconciliation failed before attempt admission")
 
             owner = WorkerOwnerTag(run_id, epoch, task.task_id, attempt_id)
             store.create_attempt(attempt_id, task.task_id, owner.label())
@@ -198,8 +208,11 @@ async def run_supervised(
                     AttemptState.FINISHED,
                     exit_code=result.exit_code,
                 )
-                target_state = await target_provider.reconcile(target)
                 current_epoch = store.task_target_epoch(task.task_id)
+                target_state = await target_provider.reconcile(
+                    target,
+                    authoritative_epoch=current_epoch,
+                )
                 if target_state != "usable" or current_epoch != target.epoch:
                     verdict = Verdict(
                         passed=False,

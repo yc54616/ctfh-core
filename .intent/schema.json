@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CTFH Intent Ledger Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "seq", "prev", "actor", "ops", "note"],
+  "properties": {
+    "v": {"type": "integer", "const": 1},
+    "seq": {"type": "integer", "minimum": 0},
+    "prev": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      ]
+    },
+    "actor": {"enum": ["principal", "agent"]},
+    "note": {"type": "string"},
+    "ops": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "atom"],
+            "properties": {
+              "type": {"const": "ADD"},
+              "atom": {"$ref": "#/$defs/atom"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "old_ids", "new_atoms"],
+            "properties": {
+              "type": {"const": "SUPERSEDE"},
+              "old_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "string"}
+              },
+              "new_atoms": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {"$ref": "#/$defs/atom"}
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "ids"],
+            "properties": {
+              "type": {"const": "CANCEL"},
+              "ids": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "string"}
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["paths"],
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": {"enum": ["command", "manual"]},
+        "ref": {"type": "string", "minLength": 1}
+      }
+    },
+    "atom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "key", "kind", "authority", "scope", "polarity",
+        "statement", "verification"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Z][A-Z0-9_-]*-[0-9]{4,}$"},
+        "key": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["intent", "invariant", "requirement", "decision"]},
+        "authority": {"enum": ["principal", "agent"]},
+        "scope": {"$ref": "#/$defs/scope"},
+        "polarity": {"enum": ["require", "forbid"]},
+        "statement": {"type": "string", "minLength": 1},
+        "verification": {"$ref": "#/$defs/verification"},
+        "rationale": {"type": "string"},
+        "source": {},
+        "restores": {"type": "string"},
+        "body_ref": {"type": "string", "pattern": "^\\.intent/decisions/.+"},
+        "body_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"kind": {"const": "decision"}},
+            "required": ["kind"]
+          },
+          "then": {"required": ["body_ref", "body_hash"]},
+          "else": {
+            "not": {
+              "anyOf": [
+                {"required": ["body_ref"]},
+                {"required": ["body_hash"]}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

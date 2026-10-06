@@ -1,671 +1,362 @@
-# Intent Gate — Active Contract Architecture
+# Intent Gate v0 — Deterministic Active Contract Ledger
 
-Status: design draft before implementation
+Status: implemented
 Date: 2026-10-05
 
-## 1. Problem
+## Purpose
 
-A long-running coding/agent project does not fail only because context is too
-small. It also fails because the current binding specification becomes
-ambiguous as requests accumulate.
+Intent Gate prevents long-running coding work from silently drifting away from
+the project's currently binding intent.
 
-Conversation history is append-only. Project intent is mutable.
+It is not a planning framework and does not run in the CTF solver hot loop. It
+only resolves what is binding, controls accepted contract changes, renders a
+small task brief, and checks completion against the exact contract revision.
 
-A later message may:
-- add a requirement
-- narrow its scope
-- replace it
-- temporarily override it
-- cancel it
-- propose an alternative that was never accepted
+Conversation history is evidence. It is not the source of truth.
 
-"Remember everything" is therefore wrong.
-"Follow the latest message" is also wrong.
+## Research basis
 
-The system must resolve an **active contract** before implementation.
+The design borrows narrowly from SLUMP/ProjectGuard, SpecPath, GitHub Spec Kit,
+OpenSpec, ADR/MADR, and policy/state-machine practice:
 
-## 2. Research basis
+- keep durable semantic project state outside a long agent conversation
+- use stable requirement identities and explicit revision history
+- preserve project principles and converge work against them
+- represent accepted changes as explicit deltas
+- keep accepted decisions immutable
+- enforce deterministic transitions in code rather than in an LLM prompt
 
-### SLUMP / ProjectGuard
+The full workflows of those systems are deliberately not copied.
 
-"When the Specification Emerges" (arXiv:2603.17104) measures faithfulness loss
-when specifications are progressively disclosed over long coding sessions.
+## One authoritative source
 
-Findings:
-- single-shot specs were more faithful on most evaluated tasks
-- structural integration degraded on both Claude Code and Codex
-- ProjectGuard, an external semantic + structural project-state layer,
-  recovered 90% of Claude Code's measured faithfulness gap in the paper
+Only the append-only event ledger is authoritative:
 
-ProjectGuard separates:
-- semantic state: durable accepted design commitments
-- structural state: repository layout, public symbols, interface relationships
+    .intent/events/*.yaml
 
-Decision:
-- Intent Gate needs durable semantic state outside the agent conversation
-- repository structure is a separate generated view, not the source of intent
+Each accepted event contains the complete atom payload required to reconstruct
+the contract.
 
-### SpecPath
+Other files have narrower roles:
 
-SpecPath (arXiv:2608.09799) identifies specification-path sensitivity:
-contract-equivalent requirement histories can produce different implementations.
+    .intent/approvals/
+        principal confirmations bound to exact event hashes
 
-Important abstraction:
-- requirements are stable atoms
-- atoms have scope and polarity
-- revision events activate/deactivate atoms
-- final behavior derives from the active set, not from recency
+    .intent/decisions/
+        immutable ADR bodies referenced by SHA-256
 
-The paper suggests an explicit contract ledger with requirement identities and
-statuses such as active, superseded, or cancelled.
+    .intent/generated/active-contract.json
+        disposable replay cache; never authoritative
 
-Decision:
-- requirements get stable IDs
-- overrides/supersession/cancellation are explicit state transitions
-- implementation plans derive from the active subset only
+    .intent/schema.json
+        machine-readable event/atom shape
 
-### GitHub Spec Kit
+The earlier intent.yaml, contract.yaml, and changes/ authorities were removed
+because they could diverge from replay.
 
-Useful ideas:
-- constitution: persistent project principles
-- specify -> plan -> tasks -> implement
-- read-only cross-artifact analyze
-- converge implementation back against spec/plan/tasks
+## Event chain
 
-Decision:
-- keep a small constitution/invariant layer
-- provide preflight consistency and post-implementation convergence gates
-- do not copy the full multi-command workflow into the hot path
-
-### OpenSpec
-
-Useful ideas:
-- change proposals are separate from canonical specs
-- delta specs explicitly ADDED / MODIFIED / REMOVED / RENAMED
-- validation before archive
-- completed changes become an auditable history
-
-Decision:
-- changes are deltas against the active contract
-- accepted changes are folded into canonical state
-- history is append-only/auditable
-
-### ADR / MADR
-
-Useful ideas:
-- accepted decisions are not silently edited
-- a changed decision is superseded by a new decision
-- rationale, alternatives, consequences and reevaluation triggers are preserved
-
-Decision:
-- architectural choices live in append-only decision records
-- active contract references active decisions
-
-### OPA / Cedar / policy-as-code
-
-Useful ideas:
-- rules are declarative
-- inputs and decisions are separated
-- policy evaluation can explain why a request was allowed/denied
-
-Decision:
-- gate rules are deterministic and explainable
-- do not embed gate authority inside an LLM prompt
-
-### State-machine/property methods
-
-TLA+/PlusCal and property-based testing reinforce a useful split:
-- state transitions describe what may happen
-- invariants describe what must always remain true
-
-Decision:
-- Intent Gate is a small state machine with executable invariants
-- full formal verification is not required for v0
-
-## 3. Design thesis
-
-Intent Gate is **not** another spec-driven development framework.
-
-It is a small active-contract resolver placed before planning and after
-implementation.
-
-```
-new request / conversation turn
-            │
-            ▼
-      Intent Resolver
-            │
-            ▼
-   Contract Delta Proposal
-            │
-            ▼
-       Change Gate
-            │
-     ┌──────┼────────┐
-     ▼      ▼        ▼
-   allow  confirm   reject
-     │
-     ▼
- Active Contract Ledger
-     │
-     ├─ principal intent
-     ├─ invariants
-     ├─ requirements
-     ├─ decisions
-     └─ acceptance
-     │
-     ▼
- plan / implementation
-     │
-     ▼
- Convergence Gate
-     │
-     ├─ traceability
-     ├─ invariant checks
-     ├─ acceptance checks
-     └─ decision consistency
-```
-
-The gate resolves **what is binding**.
-It does not decide **how to implement it**.
-
-## 4. Authority tiers
-
-### principal_only
-
-May change only with explicit principal/user confirmation.
-
-Examples:
-- project purpose
-- optimization objective
-- non-negotiable constraints
-- safety/authorization boundaries
-- success criteria
-- hard exclusions
-
-For CTFH:
-- performance-first
-- verified result by deadline
-- native-agent thin-supervisor principle
-- no hidden generic ReAct replacement
-- authorized CTF scope only
-
-### agent_revisable
-
-The agent may revise these without asking if the new value still satisfies every
-active principal-only atom.
-
-Examples:
-- current architecture
-- implementation strategy
-- module selection
-- benchmark plan
-- internal APIs
-- rollout order
-
-All revisions are recorded.
-
-### derived
-
-Disposable/regenerable.
-
-Examples:
-- task lists
-- estimates
-- temporary hypotheses
-- short-term plan
-- work queue
-
-Derived data is never allowed to override the active contract.
-
-## 5. Contract atom
-
-Every binding item has a stable identity.
-
-Conceptual schema:
-
-```yaml
-id: REQ-0042
-kind: intent | invariant | requirement | acceptance | decision_ref
-authority: principal_only | agent_revisable
-scope:
-  paths: []
-  modules: []
-  profiles: []
-polarity: require | forbid | prefer
-status: active | superseded | cancelled
-statement: "..."
-rationale: "..."
-source:
-  type: user | decision | research | derived
-  ref: "..."
-supersedes: []
-verification:
-  kind: test | command | review | metric | manual
-  ref: "..."
-created_at: ...
-```
+Every event contains v, seq, prev, actor, ops, and note.
 
 Rules:
-- IDs never change
-- text may not be silently rewritten
-- semantic changes create a new atom and supersede the old one
-- cancelled atoms remain in history
-- only active atoms enter the implementation brief
 
-## 6. Principal intent record
+- genesis is seq 0 with prev null
+- later sequence numbers are contiguous
+- prev must equal the previous canonical event hash
+- replay checks the rule version on every event
+- gaps, forks, malformed events, invalid transitions, missing required
+  approvals, and decision-body hash mismatches fail replay
+- tracked accepted history is append-only; preflight/append/converge reject
+  working-tree changes and ordinary committed rewrites/deletions of accepted
+  events, approvals, and decision bodies
+- accepted-ledger mutation is serialized with a host-local file lock; the
+  candidate base/head is rebuilt and revalidated inside that critical section
 
-The project has a very small top-level intent record.
+ledger_head identifies the exact audit history.
 
-For CTFH the initial principal intent is:
+## Atom model
 
-```
-Purpose:
-Build a competition CTF supervisor that maximizes verified score by the event
-deadline.
+Binding fields are:
 
-Primary success:
-Higher verified solve rate / score-by-deadline than the direct native-agent
-baseline.
+- id
+- key
+- kind: intent | invariant | requirement | decision
+- authority: principal | agent
+- scope.paths
+- polarity: require | forbid
+- statement
+- verification: command | manual
 
-Non-negotiables:
-- authorized CTF scope
-- native agents remain native
-- every added layer must earn its place in paired evaluation
-- outcome verification is independent from worker self-report
-- model/tool/browser/context components remain replaceable over time
-- cost is a guardrail, not the main optimizer
-```
+Decision atoms additionally carry body_ref and body_hash.
 
-This record should stay short enough to inject on every important planning turn.
+id is a history handle. key identifies the semantic slot. Empty path scope is
+global. Rationale/source/restoration provenance are non-binding audit metadata.
 
-## 7. Change events
+## Contract hash vs ledger head
 
-Conversation turns are converted into explicit events, not directly into spec
-text.
+contract_hash hashes normalized active binding semantics only:
 
-Event types:
+- key
+- kind
+- authority
+- normalized path scope
+- polarity
+- normalized statement
+- verification
+- decision body hash
 
-```
-ADD(atom)
-SUPERSEDE(old_id, new_atom)
-CANCEL(atom_id)
-RESTORE(atom_id)
-DECIDE(decision_id)
-SUPERSEDE_DECISION(old_id, new_id)
-```
+IDs, rationale, provenance, and event history do not affect contract_hash.
 
-A restatement/no-op produces no state change.
+Normalization uses Unicode NFC, collapsed statement whitespace,
+sorted/deduplicated scope, canonical JSON, and deterministic atom ordering.
 
-This makes "actually changed the contract" distinct from "talked about an idea."
+ledger_head hashes the canonical event chain. Equivalent final contracts may
+therefore have the same contract_hash and different ledger_head values.
 
-## 8. Active-contract resolution
+Intent Gate does not claim arbitrary natural-language paraphrases are equivalent.
 
-Resolution is deterministic:
+## v0 operations
 
-1. replay accepted change events in order
-2. resolve supersession/cancellation
-3. select active atoms
-4. check contradictions
-5. check required authority
-6. render normalized active contract
+Only three operations exist.
 
-The normalized contract is the only binding input to planning.
+### ADD
 
-Conversation history remains audit evidence, not the runtime source of truth.
+- new ID must never have been used
+- exact semantic duplicates of active atoms are rejected as no-op history
+- two different active atoms may not share a key with overlapping scope
 
-## 9. Change Gate
+### SUPERSEDE
 
-Before a contract delta is accepted, evaluate:
+v0 is deliberately strict:
 
-### G1 — authority
+- exactly one active old atom
+- exactly one new atom
+- new ID is unused
+- key is unchanged
+- normalized scope is unchanged
 
-Does this change modify a principal_only atom?
+Split/merge and partial-scope replacement are deferred.
 
-- no -> may proceed automatically
-- yes -> explicit user confirmation required
+### CANCEL
 
-### G2 — contradiction
+- all targets must currently be active
+- cancelling retires an obligation
+- cancellation does not mean the opposite behavior is now forbidden
 
-Does the delta conflict with an active invariant/requirement?
+There is no RESTORE operation in v0. Reintroducing an old idea creates a new
+atom and may carry non-binding restoration provenance.
 
-- no -> continue
-- yes -> reject or explicitly supersede the conflicting atom
+A multi-op event is validated as one atomic state transition.
 
-No implicit conflict resolution.
+## Authority
 
-### G3 — scope
+Principal atoms protect project purpose and non-negotiable constraints.
+Agent atoms cover automatically revisable engineering requirements.
 
-Is the proposed scope broader than the request?
+An agent event cannot create, supersede, or cancel a principal atom.
 
-If yes, require justification or confirmation.
+A principal-authority event requires a separate approval bound to the exact
+canonical event hash.
 
-### G4 — traceability
+The CLI's trusted v0 channel is interactive confirmation:
 
-Can every planned change point to at least one active atom?
+1. build the exact candidate event
+2. display its hash
+3. require the principal to type APPROVE <hash>
+4. enter the serialized append critical section
+5. rebuild the event against the current ledger head and require its hash to
+   equal the hash the principal approved
+6. record version, hash, approver, and channel
+7. append the event
+8. replay and regenerate the cache
+
+If the proposal or ledger changed after confirmation, the hash/base check
+rejects the append and the principal must review the new candidate. Accepted
+ledger mutation is serialized. Principal approval is published before the event,
+so a crash cannot expose an authoritative principal event without its matching
+approval; an orphan approval is inert. Atomic writes fsync file and directory
+metadata before returning.
 
-Untraced work is rejected as scope drift.
+### Threat model
 
-### G5 — decision consistency
+v0 prevents cooperative agent drift and accidental mutation. Event approvals
+and manual-evidence approvals are bound to exact hashes, but their files still
+live on the same machine. v0 therefore trusts the interactive principal channel
+and ordinary Git history. It is not a security boundary against a malicious
+process with arbitrary filesystem or Git-history rewrite access. Stronger
+OS/cryptographic isolation is deferred until that threat model exists.
+
+## Mechanical gate boundary
 
-Does this invalidate an accepted architectural decision?
+v0 enforces only facts it can determine mechanically:
+
+- event-chain integrity
+- authority
+- legal transition
+- ID freshness
+- exact semantic duplicate
+- key/scope collision
+- path applicability
+- active references
+- verification metadata
+- immutable decision-body hash
+- generated-cache freshness
+- convergence-evidence freshness
+
+It does not silently use an LLM to decide:
+
+- arbitrary prose contradiction
+- paraphrase equivalence
+- whether one natural-language request is broader than another
+- whether source code semantically satisfies prose
+- automatic conversation-to-contract acceptance
 
-If yes, create a superseding decision instead of silently editing history.
+Semantic uncertainty is review input, not gate authority.
 
-### G6 — verification
+## Generated contract and brief
 
-Does each binding requirement have a verification mode?
-
-Implementation may begin with a manual/review verifier, but an unverified
-requirement is visible debt rather than silently "done."
-
-## 10. Intent brief
-
-Workers should not receive the full ledger every turn.
-
-Render a compact brief:
-
-```
-INTENT
-- purpose
-- primary objective
-
-MUST PRESERVE
-- relevant principal-only atoms
-- relevant invariants
-
-ACTIVE REQUIREMENTS
-- only atoms relevant to this task
-
-ACTIVE DECISIONS
-- relevant decision summaries
-
-ACCEPTANCE
-- how this task will be judged
-
-OUT OF SCOPE
-- relevant forbidden/non-goal items
-```
-
-This is ProjectGuard-style compatibility-aware injection without replacing the
-native agent's context system.
-
-## 11. Structural state
-
-Maintain a generated, non-authoritative structural view:
-
-- files/modules
-- public symbols
-- important interfaces
-- atom -> code/test mappings
-- decision -> affected paths
-
-Possible later implementation:
-- direct AST/index
-- codebase-memory
-- simple ripgrep/static scan
-
-The structural view answers "where does this commitment live?"
-
-It may be regenerated at any time.
-It cannot modify the semantic contract.
-
-## 12. Traceability graph
-
-Minimal relations:
-
-```
-Intent
-  -> Requirement
-Requirement
-  -> Acceptance
-Requirement
-  -> Decision
-Requirement
-  -> Code paths
-Requirement
-  -> Tests
-Decision
-  -> Code paths
-Change
-  -> Atoms changed
-```
-
-The goal is not perfect documentation.
-
-The goal is to detect:
-- requirement with no implementation
-- implementation with no requirement
-- superseded requirement still controlling code
-- decision changed without supersession
-- test no longer covering its binding requirement
-
-## 13. Convergence Gate
-
-After implementation:
-
-### C1 — active contract coverage
-
-Every active requirement is:
-- satisfied
-- explicitly deferred
-- or failed
-
-No silent missing item.
-
-### C2 — invariant preservation
-
-Run executable invariant/property tests.
-
-For non-executable invariants, require explicit review result.
-
-### C3 — acceptance
-
-Run the authoritative acceptance command/test/benchmark.
-
-### C4 — stale-contract removal
-
-Check whether code/tests still encode superseded/cancelled atoms.
-
-### C5 — decision consistency
-
-Changed watched architecture areas must either:
-- comply with the active ADR
-- or reference a superseding ADR
-
-### C6 — unexpected behavior
-
-Record new behavior not traceable to an active atom.
-
-This is a warning/gate depending on severity.
-
-## 14. Modes
-
-Intent Gate should not slow CTF work.
-
-### fast mode — default
-
-Automatic:
-- ADD agent_revisable requirement
-- derived plan/task regeneration
-- implementation detail changes
-- decision creation inside existing principal intent
-
-Stops only on:
-- principal-only change
-- direct contradiction
-- broadened authority/scope
-- failed invariant
-- failed authoritative acceptance
-
-### strict mode
-
-For architecture migrations / release / benchmark changes:
-- every contract change rendered for review
-- full traceability required
-- convergence gate blocks completion on warnings
-
-## 15. Repository layout
-
-Proposed:
-
-```
-.intent/
-├── intent.yaml
-├── contract.yaml
-├── changes/
-│   └── 0001-*.yaml
-├── decisions/
-│   └── 0001-*.md
-├── generated/
-│   ├── active-contract.json
-│   ├── structure.json
-│   └── traceability.json
-└── schemas/
-    └── contract.schema.json
-
-docs/
-└── INTENT_GATE.md
-```
-
-Authoritative:
-- intent.yaml
-- contract.yaml
-- accepted change events
-- accepted/superseded decision records
-
-Generated/cache:
-- active-contract.json
-- structure.json
-- traceability.json
-
-## 16. What not to copy from other systems
-
-Do not reproduce the full Spec Kit pipeline inside CTFH.
-
-Do not require:
-- specify
-- clarify
-- plan
-- checklist
-- tasks
-- analyze
-- implement
-- converge
-
-for every small change.
-
-Do not make OpenSpec proposal folders mandatory for every edit.
-
-Do not make an LLM summary the source of truth.
-
-Do not let recent conversation text silently override an older binding rule.
-
-Do not use a giant OPA/TLA stack in v0.
-
-Take only:
-- stable contract IDs/statuses
-- delta semantics
-- immutable decision history
-- deterministic gate rules
-- pre/post convergence checks
-
-## 17. v0 Intent Gate
-
-Build only:
-
-1. intent.yaml
-2. contract.yaml with stable atoms
-3. append-only change events
-4. deterministic resolver
-5. preflight gate
-6. compact intent brief renderer
-7. convergence checks for:
-   - active requirements
-   - invariants
-   - acceptance commands
-8. ADR supersession convention
-
-No LLM is required inside the gate.
-
-The native agent may propose a delta, but the gate resolves and enforces it.
-
-## 18. Required tests
-
-### active contract
-
-- add requirement -> active
-- supersede -> old inactive/new active
-- cancel -> inactive
-- split additions -> both active
-- duplicate/restatement -> no semantic change
-
-### authority
-
-- agent cannot change principal_only atom
-- principal confirmation can
-
-### path invariance
-
-Build multiple change histories resolving to the same final contract.
-The normalized active contract hash must be identical.
-
-### traceability
-
-- active requirement without acceptance -> visible error
-- implementation change with no atom -> drift warning/error
-- superseded requirement referenced by new plan -> reject
-
-### decisions
-
-- accepted decision cannot be edited in place
-- superseding decision links old/new records
-
-### convergence
-
-- failed invariant blocks completion
-- failed acceptance blocks completion
-- cancelled requirement is not required for completion
-
-## 19. Integration with CTFH
-
-Intent Gate sits outside the solver hot loop.
-
-```
-project request/change
-      -> Intent Gate
-      -> frozen active contract
-      -> implementation / benchmark work
-
-live CTF event
-      -> CTFH Kernel
-      -> solver workers
-```
-
-Do not run Intent Gate for every shell/browser/tool action.
-
-Use it when:
-- changing CTFH architecture
-- changing solver strategy defaults
-- adding/removing modules
-- changing optimization objective
-- changing benchmark/promotion rules
-- changing safety/authorization boundaries
-
-This preserves project direction without adding latency to competition actions.
-
-## 20. Current CTFH gate target
-
-The first gate should protect these already-accepted commitments:
-
-- performance-first
-- thin supervisor, not another generic agent framework
-- native-agent baseline first
-- real vertical slice before deferred modules
-- environment/tooling is part of the benchmarked profile
-- outcome authority independent from worker self-report
-- target lifecycle separate from worker lifecycle
-- matched A/B required for wrapper-overhead claims
-- modules only promoted after paired benchmark evidence
-- planner/executor, pass@k, Jev, context-mode, codebase-memory and learned routing
-  remain deferred until their own evidence gate passes
+ctfh2 intent --root . resolve --write replays the ledger and writes the
+non-authoritative materialized cache.
+
+ctfh2 intent --root . brief --path <path> renders a compact brief stamped with
+contract_hash and ledger_head.
+
+The brief always carries active intent/invariants/principal commitments and adds
+task-scope requirements/decisions by deterministic path overlap. No LLM relevance
+ranking is used.
+
+## Preflight
+
+ctfh2 intent --root . check verifies:
+
+- accepted history was not modified/deleted
+- ledger replays successfully
+- optional generated cache matches replay
+- supplied atom references are active
+- supplied path scope is compatible with those references
+
+No supplied atom references produces a warning instead of guessing task meaning.
+
+## Convergence
+
+A convergence report is bound to contract_hash, ledger_head, git commit,
+normalized path scope, and whether command verification was enabled. Evidence
+created for another contract, history head, code commit, path scope, or command
+mode is stale.
+
+Convergence requires a Git worktree with a real HEAD commit and a clean
+non-ignored worktree before verification. This ensures HEAD identifies the
+exact implementation being judged; dirty source/config changes cannot reuse
+evidence for the previous commit.
+
+Verification commands are treated as observational. After they run, Intent Gate
+checks worktree cleanliness, HEAD, contract_hash, and ledger_head again. A check
+that mutates tracked implementation state cannot return PASS.
+
+Decision atoms are integrity-checked during replay and are not separate
+completion obligations.
+
+For every applicable intent/invariant/requirement atom, PASS requires status
+passed. Failed, deferred, open, not_run, and missing evidence all block.
+
+A principal manual PASS requires principal-authored evidence plus a separate
+principal approval bound to the canonical SHA-256 of that exact evidence
+payload. The evidence binds contract_hash, ledger_head, commit, normalized path
+scope, command mode, and the result set.
+
+The approve-evidence CLI displays that evidence hash and requires an exact
+interactive APPROVE-EVIDENCE confirmation. A text label such as actor=principal
+alone cannot pass a principal obligation.
+
+A deferred binding requirement is not done; if it should stop blocking, the
+contract itself must be changed through an authorized event.
+
+## Current CTFH genesis
+
+The principal-approved genesis protects:
+
+- maximize verified score by the event deadline
+- authorized CTF/security scope only
+- thin supervisor rather than a replacement generic agent framework
+- independent authoritative result verification
+- target lifecycle separated from disposable worker lifecycle
+- replaceable model/agent/environment/browser/tool/context/skill components
+- cost as guardrail rather than primary optimization objective
+- evidence gate for added orchestration layers
+
+The agent-revisable genesis requirements preserve:
+
+- real native-agent vertical slice before deferred orchestration
+- matched direct-native vs supervised A/B
+- environment/tooling as part of the benchmarked profile
+- planner/executor, pass@k, Jev, context-mode, codebase-memory, and learned
+  routing deferred until paired evidence
+
+The genesis also hashes the accepted Intent Gate ADR.
+
+## CLI
+
+    ctfh2 intent --root . resolve --write
+    ctfh2 intent --root . brief --path src/ctfh_core
+    ctfh2 intent --root . check --require-cache --ref INV-0001
+    ctfh2 intent --root . append proposal.yaml --actor agent
+    ctfh2 intent --root . append proposal.yaml --actor principal
+    ctfh2 intent --root . approve-evidence evidence.yaml
+    ctfh2 intent --root . converge --evidence evidence.yaml
+
+Intent Gate runs at architecture/change/task boundaries, never for every CTF
+shell/browser/debugger/model action.
+
+## v0 test invariants
+
+The implementation tests:
+
+- full genesis replay
+- approval hash tamper detection
+- missing/malformed approval rejection
+- principal approval bound to the exact candidate hash after confirmation
+- principal authority protection
+- add/cancel lifecycle
+- stale proposal base rejection
+- key/scope collision
+- 1:1 same-key same-scope supersession
+- partial-scope replacement rejection
+- semantic path-invariance hash behavior
+- fork/wrong-prev rejection
+- immutable decision-body hash
+- scope-aware brief rendering
+- convergence binding to contract/head/commit
+- convergence rejection on a dirty Git worktree
+- principal evidence authority and exact evidence-hash approval
+- deferred/open/not-run/failed blocking
+- root-path and scoped convergence behavior
+- absolute task-path rejection
+- Unicode-normalized contract hashing
+- strict schema/runtime event-shape parity
+- generated-cache mismatch
+- uncommitted and committed tracked-history mutation
+- numeric event ordering
+- rollback of failed event/approval publication
+- real Git commit requirement
+- verification-command mutation detection
+
+## Deferred
+
+Not part of v0:
+
+- RESTORE or temporary overrides
+- split/merge/partial-scope supersession
+- branching/merging contract histories
+- automatic natural-language contradiction or paraphrase detection
+- automatic request-scope inference
+- structural/symbol graphs
+- full traceability graph
+- codebase-memory integration
+- separate strict/fast engines
+- per-tool/per-turn gates
+- distributed approval infrastructure
+- OPA/Cedar/TLA+ runtime dependency
+- automatic conversation-to-contract mutation
+
+Any future addition must first demonstrate that this smaller mechanical gate is
+insufficient.

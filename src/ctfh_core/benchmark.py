@@ -60,7 +60,11 @@ async def run_direct(
     )
     write_runlock(run_root / "runlock.json", lock)
 
-    target = await target_provider.acquire(run_id=run_id, task_id=task.task_id)
+    target = await target_provider.acquire(
+        run_id=run_id,
+        task_id=task.task_id,
+        epoch=1,
+    )
     env_start = time.monotonic()
     env = await env_provider.create(task, owner, cancel)
     env_ready = time.monotonic()

@@ -93,11 +93,29 @@ class LocalWorkerEnvironmentProvider:
         return env
 
     async def create(self, task: TaskSpec, owner: WorkerOwnerTag, cancel: CancelToken) -> WorkerEnvironment:
-        # Synchronous and bounded in the v0 local provider: no background copy
-        # can outlive cancellation and later publish an untracked workspace.
         if cancel.cancelled():
             raise asyncio.CancelledError
-        env = self._create_sync(task, owner)
+
+        # Provision off the event loop, but shield it so cancellation cannot leave
+        # a background copy that later publishes an untracked workspace. The
+        # create operation is always driven to a terminal state before cleanup.
+        provision = asyncio.create_task(
+            asyncio.to_thread(self._create_sync, task, owner)
+        )
+        try:
+            env = await asyncio.shield(provision)
+        except asyncio.CancelledError:
+            cancel.cancel()
+            try:
+                await asyncio.shield(provision)
+            except Exception:
+                pass
+            await self.destroy(owner)
+            raise
+        except Exception:
+            await self.destroy(owner)
+            raise
+
         if cancel.cancelled():
             await self.destroy(owner)
             raise asyncio.CancelledError

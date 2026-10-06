@@ -2,4 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
-.ctfh-runs/\n
+.ctfh-runs/
+.intent/generated/
+.intent/.lock
+
+.intent/evidence-approvals/
