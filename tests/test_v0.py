@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import tempfile
 import time
 import unittest
@@ -616,6 +617,105 @@ class V0Tests(unittest.IsolatedAsyncioTestCase):
                     pass
             await provider.destroy(owner)
 
+    async def test_environment_kill_aborts_nonreading_rpc_response_transport(self):
+        provider = LocalWorkerEnvironmentProvider(
+            self.root / "envs",
+            enable_interactive_session_service=True,
+            max_session_transcript_bytes=3 * 1024 * 1024,
+        )
+        owner = WorkerOwnerTag(
+            "r",
+            1,
+            self.task.task_id,
+            "rpc-response-backpressure",
+        )
+        env = await provider.create(self.task, owner, CancelToken())
+        data_session = await provider.session_open(
+            env,
+            [
+                "python3",
+                "-u",
+                "-c",
+                (
+                    "import sys; "
+                    "sys.stdout.write('X' * 1500000); "
+                    "sys.stdout.flush()"
+                ),
+            ],
+        )
+        sleeper = await provider.session_open(
+            env,
+            ["python3", "-c", "import time; time.sleep(60)"],
+        )
+        reader = writer = None
+        try:
+            data = provider._get_session(env, data_session)
+            for _ in range(300):
+                if data.exit_code is not None and data.total_bytes >= 1_000_000:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(data.exit_code)
+            self.assertGreaterEqual(data.total_bytes, 1_000_000)
+
+            reader, writer = await asyncio.open_unix_connection(
+                str(provider._session_socket_path(env.root))
+            )
+            raw_socket = writer.get_extra_info("socket")
+            self.assertIsNotNone(raw_socket)
+            raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "op": "read",
+                            "session_id": data_session,
+                            "since_offset": 0,
+                            "max_bytes": 1024 * 1024,
+                            "wait_ms": 0,
+                            "until_quiescent": False,
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            await asyncio.sleep(0.08)
+            self.assertTrue(
+                any(
+                    not task.done()
+                    for task in provider._session_rpc_tasks[owner.label()]
+                )
+            )
+
+            await asyncio.wait_for(
+                provider.kill(env, grace_s=0.05),
+                timeout=2.0,
+            )
+            self.assertFalse(env.processes)
+            self.assertFalse(provider._session_rpc_tasks.get(owner.label()))
+            self.assertFalse(provider.session_list(env)[1]["running"])
+
+            # Bytes already accepted by the Unix socket may still be readable
+            # after the server aborts the transport. The invariant is that no
+            # handler/process remains and the peer reaches EOF promptly.
+            drained = 0
+            async with asyncio.timeout(1.0):
+                while True:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        break
+                    drained += len(chunk)
+                    self.assertLessEqual(drained, 2 * 1024 * 1024)
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
+            await provider.destroy(owner)
+
     async def test_rpc_writer_closes_when_response_drain_is_cancelled(self):
         class BlockingWriter:
             def __init__(self):
@@ -647,6 +747,47 @@ class V0Tests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertTrue(writer.closed)
+
+    async def test_rpc_writer_aborts_when_wait_closed_is_cancelled(self):
+        class Transport:
+            def __init__(self):
+                self.aborted = False
+
+            def abort(self) -> None:
+                self.aborted = True
+
+        class BlockingCloseWriter:
+            def __init__(self):
+                self.transport = Transport()
+                self.closed = False
+                self.wait_closed_started = asyncio.Event()
+
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                self.wait_closed_started.set()
+                await asyncio.Event().wait()
+
+        writer = BlockingCloseWriter()
+        task = asyncio.create_task(
+            LocalWorkerEnvironmentProvider._finish_rpc_writer(
+                writer,  # type: ignore[arg-type]
+                {"ok": True},
+            )
+        )
+        await asyncio.wait_for(writer.wait_closed_started.wait(), timeout=0.5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(writer.closed)
+        self.assertTrue(writer.transport.aborted)
 
     async def test_session_cli_reaches_provider_over_unix_socket(self):
         provider = LocalWorkerEnvironmentProvider(

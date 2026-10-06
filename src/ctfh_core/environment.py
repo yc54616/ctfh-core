@@ -140,6 +140,7 @@ class LocalWorkerEnvironmentProvider:
         self._browser_rpc_tasks: dict[str, set[asyncio.Task[object]]] = {}
         self._browser_start_locks: dict[str, asyncio.Lock] = {}
         self._browsers: dict[str, _BrowserRuntime] = {}
+        self._kill_tasks: dict[str, asyncio.Task[None]] = {}
 
     def _env_root(self, owner: WorkerOwnerTag) -> Path:
         return self.root / owner.label().replace(":", "_")
@@ -907,45 +908,63 @@ class LocalWorkerEnvironmentProvider:
             }
 
     @staticmethod
+    def _abort_rpc_writer(writer: asyncio.StreamWriter) -> None:
+        transport = getattr(writer, "transport", None)
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            abort()
+            return
+        writer.close()
+
+    @staticmethod
     async def _finish_rpc_writer(
         writer: asyncio.StreamWriter,
         response: dict[str, object] | None,
     ) -> None:
         cancelled = False
-        try:
-            if response is not None:
-                try:
-                    writer.write(
-                        (json.dumps(response, sort_keys=True) + "\n").encode()
-                    )
-                    await asyncio.wait_for(writer.drain(), timeout=0.25)
-                except asyncio.CancelledError:
-                    # Preserve cancellation, but do not allow it to skip the
-                    # synchronous transport close below.
-                    cancelled = True
-                except (
-                    asyncio.TimeoutError,
-                    BrokenPipeError,
-                    ConnectionError,
-                    OSError,
-                ):
-                    pass
-        finally:
-            # StreamWriter.close() is synchronous: invoke it unconditionally
-            # before any further await can observe task cancellation.
-            writer.close()
-
-        if not cancelled:
+        force_abort = False
+        if response is not None:
             try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=0.25)
+                writer.write(
+                    (json.dumps(response, sort_keys=True) + "\n").encode()
+                )
+                await asyncio.wait_for(writer.drain(), timeout=0.25)
+            except asyncio.CancelledError:
+                cancelled = True
+                force_abort = True
             except (
                 asyncio.TimeoutError,
                 BrokenPipeError,
                 ConnectionError,
                 OSError,
             ):
-                pass
+                force_abort = True
+
+        if force_abort:
+            LocalWorkerEnvironmentProvider._abort_rpc_writer(writer)
         else:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.25)
+            except asyncio.CancelledError:
+                # A task cancelled while close() is flushing may otherwise
+                # leave the transport half-closed until GC. Abort immediately
+                # so RPC teardown cannot escape the environment kill barrier.
+                LocalWorkerEnvironmentProvider._abort_rpc_writer(writer)
+                raise
+            except asyncio.TimeoutError:
+                # close() may retain buffered bytes waiting for a peer that
+                # never reads. Abort the transport so server.wait_closed()
+                # cannot hold the environment kill barrier indefinitely.
+                LocalWorkerEnvironmentProvider._abort_rpc_writer(writer)
+            except (
+                BrokenPipeError,
+                ConnectionError,
+                OSError,
+            ):
+                pass
+
+        if cancelled:
             raise asyncio.CancelledError
 
     @staticmethod
@@ -1556,7 +1575,41 @@ class LocalWorkerEnvironmentProvider:
         if _pg_alive(pgid):
             raise RuntimeError(f"worker process group {pgid} still alive after SIGKILL")
 
-    async def kill(self, env: WorkerEnvironment, *, grace_s: float = 1.0) -> None:
+    async def kill(
+        self,
+        env: WorkerEnvironment,
+        *,
+        grace_s: float = 1.0,
+    ) -> None:
+        label = env.owner.label()
+        teardown = self._kill_tasks.get(label)
+        if teardown is None or teardown.done():
+            teardown = asyncio.create_task(
+                self._kill_once(env, grace_s=grace_s)
+            )
+            self._kill_tasks[label] = teardown
+
+        was_cancelled = False
+        while not teardown.done():
+            try:
+                await asyncio.shield(teardown)
+            except asyncio.CancelledError:
+                # Teardown is a cancellation barrier: caller cancellation is
+                # deferred until the shared owner cleanup reaches terminal.
+                was_cancelled = True
+                continue
+
+        # Propagate cleanup failure before the deferred caller cancellation.
+        teardown.result()
+        if was_cancelled:
+            raise asyncio.CancelledError
+
+    async def _kill_once(
+        self,
+        env: WorkerEnvironment,
+        *,
+        grace_s: float = 1.0,
+    ) -> None:
         browser_server: asyncio.AbstractServer | None = None
         session_server: asyncio.AbstractServer | None = None
         if self.enable_browser_service:
@@ -1571,12 +1624,18 @@ class LocalWorkerEnvironmentProvider:
             await self._settle_session_rpc_tasks(env)
         if self.enable_browser_service:
             await self._settle_browser_rpc_tasks(env)
-        await self._wait_rpc_server_closed(
-            session_server, label="session"
-        )
-        await self._wait_rpc_server_closed(
-            browser_server, label="browser"
-        )
+        listener_errors: list[Exception] = []
+        for server, label in (
+            (session_server, "session"),
+            (browser_server, "browser"),
+        ):
+            try:
+                await self._wait_rpc_server_closed(server, label=label)
+            except Exception as exc:
+                # Listener shutdown must never prevent owned process cleanup.
+                # Report the listener failure only after the kill domain is
+                # confirmed empty.
+                listener_errors.append(exc)
 
         pgids = list(env.processes)
         for pgid in pgids:
@@ -1603,6 +1662,10 @@ class LocalWorkerEnvironmentProvider:
             self._browsers.pop(env.owner.label(), None)
         if env.root.exists():
             self._write_marker(env, spawn_state="stopped")
+        if listener_errors:
+            raise RuntimeError(
+                "RPC listener shutdown failed after process cleanup"
+            ) from listener_errors[0]
 
     def _publish_service_traces_sync(
         self,

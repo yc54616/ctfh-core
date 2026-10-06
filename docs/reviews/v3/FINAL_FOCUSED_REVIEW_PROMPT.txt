@@ -1,0 +1,43 @@
+Review the CURRENT CTFH V3 HEAD after the latest blocker fixes (HEAD c320210). Read the relevant current source/tests and current architecture/review synthesis if needed. Do not edit files and do not use network.
+
+Known latest evidence:
+- 104 pytest tests passed after blocker patches and reviewer regressions.
+- real supervised Codex smoke passed authoritatively and produced a streaming CAS-sealed attempt artifact and trace-manifest CAS.
+- earlier real gates passed for Codex matched pairs, Claude matched pair before later OAuth revoke, interactive PTY tool, GhostChrome browser tool, frozen knowledge, trace sealing, and offline ctfh-learn promotion flow.
+
+Previous final-review logs found concrete issues that have now been patched:
+1. blocked PTY RPC could delay kill before process-group termination;
+2. PTY transcript file on disk was unbounded and truncation not explicit in evidence;
+3. concurrent browser lazy-start could spawn duplicate GhostChrome serve runtimes;
+4. ArtifactStore sealed entire attempts through BytesIO RAM buffering;
+5. a candidate could be rejected and later promoted;
+6. candidate provenance hash was not rechecked on load;
+7. promotion/final task split depended on caller input each time;
+8. evaluation evidence was not bound to candidate artifact digest and RunLock hash.
+
+Current implementation adds:
+- cancel/settle RPCs before PGID snapshot/kill, cancellation-safe handlers and browser startup/controller cleanup;
+- disk PTY capture quota plus session metadata and manifest truncation coverage;
+- per-owner browser start lock;
+- streaming file/tar hashing and CAS commit;
+- candidate provenance-hash revalidation;
+- immutable evaluation-splits registry;
+- candidate evaluation bindings to content digest + runlock hash;
+- one terminal decisions/<candidate_id>.json under promotion lock.
+
+Review specifically whether those fixes are correct and whether any NEW commit-blocking correctness issue remains in:
+src/ctfh_core/environment.py
+src/ctfh_core/artifacts.py
+src/ctfh_core/trace.py
+src/ctfh_learning/*
+tests/test_v0.py
+tests/test_learning.py
+
+Return exactly:
+VERDICT: READY or NOT_READY
+BLOCKERS
+HIGH_PRIORITY_NONBLOCKERS
+EVIDENCE_CHECK
+TOP_PATCHES_IF_ANY
+
+Use concrete file/function references. If READY, write BLOCKERS: none.

@@ -67,7 +67,7 @@ All three independently returned **NEEDS-CHANGES** on the first V3 proposal.
 
 After implementation, GPT-6.1 Sol and GPT-6 Astra were run again against the lifecycle, artifact, trace, and learning-provenance patches. Both final blocker rechecks returned **READY** with **no blockers**.
 
-The final regression suite passed with **102 tests**, and a real supervised Codex smoke completed with an authoritative PASS while publishing both the trace manifest and sealed attempt artifact to content-addressed storage. GPT-6.1 Sol then performed one final focused response-flush cancellation recheck and returned **READY / blockers none**.
+The final regression suite passed with **106 tests**, and a real supervised Codex smoke completed with an authoritative PASS while publishing both the trace manifest and sealed attempt artifact to content-addressed storage. GPT-6.1 Sol then performed one final focused response-flush cancellation recheck and returned **READY / blockers none**.
 
 Claude Opus 5.5 could not be rerun for the final patch-level check because the local Claude CLI OAuth session had expired and could not be refreshed. Its earlier architecture review was completed and all architecture-level findings were incorporated before implementation.
 

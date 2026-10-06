@@ -1,0 +1,50 @@
+You are doing a FINAL BLOCKER RECHECK for CTFH V3 after your previous long implementation review timed out.
+
+Do NOT re-review the entire architecture. Do NOT edit files. Do NOT use network access. Focus only on whether the previously identified correctness blockers are now closed and whether the patches introduced a new blocker.
+
+Repository: current uncommitted tree.
+
+Inspect only these files unless a directly referenced helper is necessary:
+- src/ctfh_core/environment.py
+- src/ctfh_core/artifacts.py
+- src/ctfh_core/trace.py
+- src/ctfh_learning/promotion.py
+- src/ctfh_learning/evidence.py
+- tests/test_v0.py
+- tests/test_learning.py
+
+Previously identified blockers/findings that were patched:
+1. blocked PTY/session RPC could deadlock kill() before process groups were terminated;
+2. PTY disk transcript ignored max_session_transcript_bytes and evidence could claim too much coverage;
+3. concurrent browser lazy init could race and start multiple GhostChrome serve processes;
+4. GhostChrome startup/controller cancellation had orphan windows;
+5. ArtifactStore publish_file/seal_directory buffered complete files/tar archives in RAM;
+6. candidate.json provenance-bearing candidate_hash/candidate_id were not recomputed on load;
+7. same candidate could record reject and later promote;
+8. promotion/final split sets were supplied ad hoc on each call and could drift;
+9. evaluation records were not strongly bound to RunLock/config and exact candidate artifact digest.
+
+Current evidence after patches:
+- targeted learning suite: 12 passed
+- reviewer runtime regression subset: 6 passed
+- full suite: 85 passed
+- real supervised gpt-6-sol smoke after patches: authoritative PASS, trace manifest CAS + attempt CAS both created
+
+Review the code and, if useful, run ONLY targeted local tests/read-only inspection.
+
+Return exactly:
+VERDICT: READY or NOT_READY
+BLOCKERS
+NONBLOCKERS
+PATCH_RECHECK
+- PTY shutdown:
+- PTY quota/evidence:
+- browser start/cancel:
+- artifact streaming:
+- candidate provenance:
+- terminal decision:
+- immutable splits:
+- evaluation binding:
+TOP_3_REMAINING_RISKS
+
+If any blocker remains, cite the exact file/function and a concrete failure mode. Otherwise write BLOCKERS: none.
