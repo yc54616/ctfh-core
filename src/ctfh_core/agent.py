@@ -39,6 +39,26 @@ class AgentAdapter(Protocol):
     ) -> AttemptResult: ...
 
 
+def _make_attempt_tree_writable(root: Path) -> None:
+    """Normalize copied snapshot modes for owner cleanup.
+
+    Read-only semantics are enforced by the bwrap ro-bind. The host-side
+    attempt copy must remain owner-writable so cancellation/recovery can
+    always delete it, even when the promoted source is 0555/0444.
+    """
+    if not root.is_dir():
+        return
+    root.chmod(0o755)
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            executable = bool(path.stat().st_mode & 0o111)
+            path.chmod(0o755 if executable else 0o644)
+
+
 def _materialize_frozen_knowledge(
     env: WorkerEnvironment,
     env_provider: LocalWorkerEnvironmentProvider,
@@ -78,6 +98,7 @@ def _materialize_frozen_knowledge(
         )
 
     shutil.copytree(source, destination, symlinks=False)
+    _make_attempt_tree_writable(destination)
     materialized_digest = tree_snapshot_digest(destination)
     if materialized_digest != source_digest:
         raise RuntimeError("materialized knowledge digest mismatch")
@@ -168,6 +189,7 @@ daemon_auto_start = false
                         "skill source changed after RunLock resolution"
                     )
                 shutil.copytree(source, destination, symlinks=False)
+                _make_attempt_tree_writable(destination)
                 skill_digest = tree_snapshot_digest(destination)
                 if skill_digest != source_digest:
                     raise RuntimeError("materialized skill digest mismatch")

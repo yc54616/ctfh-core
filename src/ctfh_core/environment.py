@@ -229,10 +229,55 @@ class LocalWorkerEnvironmentProvider:
             },
         )
 
+    @staticmethod
+    def _remove_owned_tree_sync(root: Path) -> None:
+        """Remove an attempt-owned tree without following symlinks.
+
+        The worker may chmod files/directories arbitrarily. Normalize modes on
+        the owned tree itself before rmtree so cleanup cannot silently leave a
+        0555/000 subtree behind.
+        """
+        if not root.exists() and not root.is_symlink():
+            return
+        if root.is_symlink():
+            root.unlink()
+            return
+
+        for dirpath, dirnames, filenames in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+        ):
+            directory = Path(dirpath)
+            try:
+                directory.chmod(0o700)
+            except FileNotFoundError:
+                continue
+            for name in filenames:
+                path = directory / name
+                if path.is_symlink():
+                    continue
+                try:
+                    path.chmod(0o600)
+                except FileNotFoundError:
+                    pass
+            for name in dirnames:
+                path = directory / name
+                if path.is_symlink():
+                    continue
+                try:
+                    path.chmod(0o700)
+                except FileNotFoundError:
+                    pass
+
+        shutil.rmtree(root)
+        if root.exists() or root.is_symlink():
+            raise RuntimeError(f"failed to remove owned worker tree: {root}")
+
     def _create_sync(self, task: TaskSpec, owner: WorkerOwnerTag) -> WorkerEnvironment:
         root = self._env_root(owner)
-        if root.exists():
-            shutil.rmtree(root)
+        if root.exists() or root.is_symlink():
+            self._remove_owned_tree_sync(root)
         workspace = root / "workspace"
         root.mkdir(parents=True, exist_ok=True)
         self._prepare_codex_runtime_home(root)
@@ -262,14 +307,14 @@ class LocalWorkerEnvironmentProvider:
                 await asyncio.shield(provision)
             except Exception:
                 pass
-            await self.destroy(owner)
+            await self.destroy_cancellation_safe(owner)
             raise
         except Exception:
-            await self.destroy(owner)
+            await self.destroy_cancellation_safe(owner)
             raise
 
         if cancel.cancelled():
-            await self.destroy(owner)
+            await self.destroy_cancellation_safe(owner)
             raise asyncio.CancelledError
         self._live[owner.label()] = env
         try:
@@ -277,8 +322,8 @@ class LocalWorkerEnvironmentProvider:
                 await self._start_session_server(env)
             if self.enable_browser_service:
                 await self._start_browser_server(env)
-        except Exception:
-            await self.destroy(owner)
+        except BaseException:
+            await self.destroy_cancellation_safe(owner)
             raise
         return env
 
@@ -866,12 +911,33 @@ class LocalWorkerEnvironmentProvider:
         writer: asyncio.StreamWriter,
         response: dict[str, object] | None,
     ) -> None:
-        if response is not None:
+        cancelled = False
+        try:
+            if response is not None:
+                try:
+                    writer.write(
+                        (json.dumps(response, sort_keys=True) + "\n").encode()
+                    )
+                    await asyncio.wait_for(writer.drain(), timeout=0.25)
+                except asyncio.CancelledError:
+                    # Preserve cancellation, but do not allow it to skip the
+                    # synchronous transport close below.
+                    cancelled = True
+                except (
+                    asyncio.TimeoutError,
+                    BrokenPipeError,
+                    ConnectionError,
+                    OSError,
+                ):
+                    pass
+        finally:
+            # StreamWriter.close() is synchronous: invoke it unconditionally
+            # before any further await can observe task cancellation.
+            writer.close()
+
+        if not cancelled:
             try:
-                writer.write(
-                    (json.dumps(response, sort_keys=True) + "\n").encode()
-                )
-                await asyncio.wait_for(writer.drain(), timeout=0.25)
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.25)
             except (
                 asyncio.TimeoutError,
                 BrokenPipeError,
@@ -879,16 +945,8 @@ class LocalWorkerEnvironmentProvider:
                 OSError,
             ):
                 pass
-        writer.close()
-        try:
-            await asyncio.wait_for(writer.wait_closed(), timeout=0.25)
-        except (
-            asyncio.TimeoutError,
-            BrokenPipeError,
-            ConnectionError,
-            OSError,
-        ):
-            pass
+        else:
+            raise asyncio.CancelledError
 
     @staticmethod
     async def _wait_rpc_server_closed(
@@ -1633,7 +1691,7 @@ class LocalWorkerEnvironmentProvider:
         self._browser_rpc_tasks.pop(label, None)
         self._browser_start_locks.pop(label, None)
         root = self._env_root(owner)
-        await asyncio.to_thread(shutil.rmtree, root, True)
+        await asyncio.to_thread(self._remove_owned_tree_sync, root)
 
     async def sweep_workers(self, live_owner_labels: set[str]) -> list[str]:
         removed: list[str] = []
@@ -1658,6 +1716,9 @@ class LocalWorkerEnvironmentProvider:
             await asyncio.to_thread(
                 shutil.rmtree, self._browser_socket_dir(root), True
             )
-            await asyncio.to_thread(shutil.rmtree, root, True)
+            await asyncio.to_thread(
+                self._remove_owned_tree_sync,
+                root,
+            )
             removed.append(label)
         return removed

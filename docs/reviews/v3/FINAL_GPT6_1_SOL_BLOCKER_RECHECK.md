@@ -15,3 +15,12 @@ NONBLOCKERS
 
 - No dedicated `publish_file` regression test found.
 - The supplied 100-pass suite result was not rerun; this recheck was read-only.
+
+## Follow-up response-flush cancellation recheck
+
+After the final RPC writer patch, GPT-6.1 Sol was asked to inspect only the prior response-flush cancellation blocker and its regression test.
+
+- Verdict: **READY**
+- Blockers: **none**
+- Regression: `test_rpc_writer_closes_when_response_drain_is_cancelled`
+- Full local suite after the patch: **102 passed in 10.74s**

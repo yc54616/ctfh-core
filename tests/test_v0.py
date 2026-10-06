@@ -205,6 +205,41 @@ class V0Tests(unittest.IsolatedAsyncioTestCase):
             devnull.close()
             await provider.destroy(owner)
 
+    async def test_create_cancellation_during_service_start_cleans_owned_environment(self):
+        provider = LocalWorkerEnvironmentProvider(
+            self.root / "envs",
+            enable_browser_service=True,
+        )
+        owner = WorkerOwnerTag(
+            "r",
+            1,
+            self.task.task_id,
+            "create-service-cancel",
+        )
+        entered = asyncio.Event()
+
+        async def blocked_start(_env):
+            entered.set()
+            await asyncio.Event().wait()
+
+        with patch.object(
+            provider,
+            "_start_browser_server",
+            new=blocked_start,
+        ):
+            create_task = asyncio.create_task(
+                provider.create(self.task, owner, CancelToken())
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            create_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(create_task, timeout=2.0)
+
+        self.assertNotIn(owner.label(), provider._live)
+        self.assertFalse(provider._env_root(owner).exists())
+        self.assertFalse(provider._session_socket_dir(provider._env_root(owner)).exists())
+        self.assertFalse(provider._browser_socket_dir(provider._env_root(owner)).exists())
+
     async def test_interactive_session_round_trip_and_transcript(self):
         provider = LocalWorkerEnvironmentProvider(self.root / "envs")
         owner = WorkerOwnerTag("r", 1, self.task.task_id, "a")
@@ -580,6 +615,38 @@ class V0Tests(unittest.IsolatedAsyncioTestCase):
                 except (BrokenPipeError, ConnectionError, OSError):
                     pass
             await provider.destroy(owner)
+
+    async def test_rpc_writer_closes_when_response_drain_is_cancelled(self):
+        class BlockingWriter:
+            def __init__(self):
+                self.closed = False
+                self.drain_started = asyncio.Event()
+
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                self.drain_started.set()
+                await asyncio.Event().wait()
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                pass
+
+        writer = BlockingWriter()
+        task = asyncio.create_task(
+            LocalWorkerEnvironmentProvider._finish_rpc_writer(
+                writer,  # type: ignore[arg-type]
+                {"ok": True},
+            )
+        )
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=0.5)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(writer.closed)
 
     async def test_session_cli_reaches_provider_over_unix_socket(self):
         provider = LocalWorkerEnvironmentProvider(
@@ -1338,6 +1405,61 @@ else:
             self.assertFalse((materialized / "MUTATE").exists())
         finally:
             await provider.destroy(owner)
+
+    async def test_read_only_promoted_snapshot_and_locked_workspace_cleanup(self):
+        source = self.root / "promoted-readonly"
+        source.mkdir()
+        note = source / "note.txt"
+        note.write_text("PROMOTED\n")
+        digest = tree_snapshot_digest(source)
+        note.chmod(0o444)
+        source.chmod(0o555)
+
+        provider = LocalWorkerEnvironmentProvider(
+            self.root / "envs",
+            knowledge_snapshot_dir=source,
+        )
+        owner = WorkerOwnerTag(
+            "r",
+            1,
+            self.task.task_id,
+            "readonly-cleanup",
+        )
+        env = await provider.create(self.task, owner, CancelToken())
+        adapter = CodexCLIAdapter()
+        lock = build_runlock(
+            treatment="knowledge-cleanup-test",
+            task=self.task,
+            adapter=adapter,
+            model="gpt-6-sol",
+            reasoning_effort="high",
+            sandbox="danger-full-access",
+            deadline_seconds=self.task.deadline_seconds,
+            prompt=apply_knowledge_prompt("probe", "frozen"),
+            memory_mode="frozen",
+            knowledge_snapshot_digest=digest,
+        )
+        try:
+            adapter.materialize(env, provider, lock.base_config)
+            materialized = provider._knowledge_runtime_dir(env.root)
+            self.assertTrue(materialized.stat().st_mode & 0o200)
+            self.assertTrue((materialized / "note.txt").stat().st_mode & 0o200)
+
+            locked = env.workspace / "locked"
+            locked.mkdir()
+            locked_file = locked / "payload"
+            locked_file.write_text("x")
+            locked_file.chmod(0o000)
+            locked.chmod(0o500)
+
+            await provider.destroy(owner)
+            self.assertFalse(env.root.exists())
+        finally:
+            # TemporaryDirectory teardown also needs to clean the source tree.
+            source.chmod(0o755)
+            note.chmod(0o644)
+            if env.root.exists():
+                await provider.destroy(owner)
 
     async def test_frozen_knowledge_source_mutation_fails_closed(self):
         source = self.root / "knowledge-source"
