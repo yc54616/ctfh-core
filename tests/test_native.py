@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import re
 import time
 import unittest
 import uuid
@@ -56,7 +57,10 @@ class FakeRunner:
         if show is not None:
             show(f"{name} 진행")
         value = self.answers[name].pop(0)
-        return value(cwd) if callable(value) else value
+        value = value(cwd) if callable(value) else value
+        if name == "submit" and "results" not in value:  # one answer for every flag in the run
+            value = {"results": [dict(value, slug=slug) for slug in re.findall(r"^- slug: (\S+)", prompt, re.M)]}
+        return value
 
 
 def make_challenge(root: Path, slug: str, solved=False) -> Path:
@@ -321,7 +325,7 @@ class CheckerFlowTests(Base):
         status = self.status("web")
         self.assertEqual(status["state"], "done")
         self.assertEqual([c[0] for c in runner.calls], ["submit", "review"])
-        self.assertEqual(runner.calls[0][1], chal / ".ctfh-check")
+        self.assertEqual(runner.calls[0][1], self.root / ".ctfh" / "submit")
         self.assertEqual(status["submissions"][0]["result"], "accepted")
         self.assertNotIn("FLAG{abc}", json.dumps(status))
         self.assertNotIn("web", checker.tmux.windows())
@@ -711,25 +715,29 @@ class CheckerFlowTests(Base):
         native.save_status(self.root / "challenges" / "dfir", {"state": "pending", "download_tries": 1})
         self.assertEqual(text("dfir"), "첨부 재시도 대기 (1회 실패)")
 
-    def test_submit_waiting_for_its_turn_is_not_recorded_as_sent(self):
+    def test_queued_flags_wait_unrecorded_then_go_out_in_one_run(self):
         import threading
-        chal = make_challenge(self.root, "heap")
+        slugs = ("heap", "rsa")
         runner = FakeRunner(submit=[{"result": "accepted", "message": ""}])
         checker = self.checker(runner)
         busy = threading.Event()
-        checker.submit_pool.submit(busy.wait, 30)  # another challenge is being submitted
+        checker.submit_pool.submit(busy.wait, 30)  # another submit run is busy
+        for slug in slugs:
+            write_solution(make_challenge(self.root, slug))
         checker.tick()
-        write_solution(chal)
         deadline = time.time() + 10
-        while "제출 차례" not in self.status("heap").get("reason", "") and time.time() < deadline:
+        while not all("제출 차례" in self.status(s).get("reason", "") for s in slugs) and time.time() < deadline:
             checker.tick()
             cf.wait(list(checker.jobs.values()), timeout=0.5)
-        self.assertEqual(self.status("heap")["state"], "verified")  # a restart now would resubmit it
-        self.assertEqual(self.status("heap")["submissions"], [])
+        for slug in slugs:  # a restart now would resubmit them
+            self.assertEqual((self.status(slug)["state"], self.status(slug).get("submissions")), ("verified", []))
         self.assertEqual(checker.pool.submit(lambda: "free").result(5), "free")  # checks are not held up
         busy.set()
         self.settle(checker)
-        self.assertEqual(self.status("heap")["state"], "accepted")
+        self.assertEqual([self.status(s)["state"] for s in slugs], ["accepted", "accepted"])
+        self.assertEqual([c[0] for c in runner.calls], ["submit"])
+        self.assertNotIn("skills get core`로", runner.calls[0][2])
+        self.assertIn("--stdin", runner.calls[0][2])
 
     def test_board_counts_solved_challenges(self):
         for slug, state in (("a", "accepted"), ("b", "site_solved"), ("c", "solving")):
@@ -740,11 +748,12 @@ class CheckerFlowTests(Base):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")
         seen = []
-        with patch("ctfh_core.native.submit", side_effect=lambda contest, chal, opts, runner:
-                   seen.append(("submit", opts.model, opts.effort)) or {"result": "unknown", "message": ""}), \
+        native.save_status(chal, {"state": "verified", "flag_sha256": "d"})
+        with patch("ctfh_core.native.submit", side_effect=lambda contest, chals, opts, runner:
+                   seen.append(("submit", opts.model, opts.effort)) or {}), \
              patch("ctfh_core.native.review", side_effect=lambda chal, opts, runner:
                    seen.append(("review", opts.model, opts.effort)) or {}):
-            checker.job_submit(chal)
+            checker.submit_batch([chal])
             checker.job_review(chal, 0)
         self.assertEqual(seen, [("submit", "gpt-6-sol", "low"), ("review", "gpt-6-sol", "medium")])
 

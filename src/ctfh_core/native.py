@@ -8,6 +8,7 @@ is the only contract between the solver sessions and the checker.
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures as cf
 import hashlib
 import json
@@ -195,6 +196,7 @@ USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
 SUBMIT_RETRIES = 3  # resend a flag whose submit outcome stayed unclear this many times
 SUBMIT_RETRY_SECONDS = 120
+SUBMIT_BATCH = 8  # flags one submit run sends in a row
 OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
 OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
 OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
@@ -474,8 +476,11 @@ COLLECT_SCHEMA = _strict({
     "notes": {"type": "string"},
 })
 SUBMIT_SCHEMA = _strict({
-    "result": {"type": "string", "enum": ["accepted", "wrong", "already_solved", "unknown", "needs_user"]},
-    "message": {"type": "string"},
+    "results": {"type": "array", "items": _strict({
+        "slug": {"type": "string"},
+        "result": {"type": "string", "enum": ["accepted", "wrong", "already_solved", "unknown", "needs_user"]},
+        "message": {"type": "string"},
+    })},
 })
 REVIEW_SCHEMA = _strict({
     "expected_approach": {"type": "string"},
@@ -789,19 +794,30 @@ def verify_flag(chal: Path, flag_regex: str, timeout: int) -> CheckResult:
     return CheckResult(True, "solve.py 재실행으로 같은 flag를 재현했습니다.", digest)
 
 
-def submit(contest: Contest, chal: Path, opts: Options, runner=run_codex_json) -> dict:
-    meta = _read_json(chal / "challenge.json", {})
+def submit(contest: Contest, chals: list[Path], opts: Options, runner=run_codex_json) -> dict[str, dict]:
+    """Send the flags of `chals` in a row from one Codex run: {challenge folder name: {result, message}}."""
+    browser = "env AGENT_BROWSER_SESSION=ctfh-submit chrome-use"
+    items = "\n".join(f"- slug: {chal.name} | 문제: {_read_json(chal / 'challenge.json', {}).get('name', chal.name)}"
+                      f" | 페이지: {_read_json(chal / 'challenge.json', {}).get('url') or '목록에서 찾기'}"
+                      f" | flag 파일: {chal / 'flag.txt'}" for chal in chals)
     prompt = f"""[검사기 작업] 너는 flag 제출 담당이다. 대회: {contest.url}
-문제: {meta.get('name', chal.name)} (문제 페이지: {meta.get('url', '../challenge.md 참고')})
-flag는 ../flag.txt에 있다. `chrome-use skills get core`로 사용법을 읽고 세션 이름 `ctfh-submit`으로
-사용자의 로그인된 Chrome에서 이 문제에 flag를 정확히 한 번 제출하고 사이트의 응답을 읽어라.
+사용자의 로그인된 Chrome에서 아래 문제마다 flag를 정확히 한 번씩, 차례로 제출하고 사이트의 응답을 읽어라.
+{items}
 제출 방법 힌트: {contest.site().get('submit_hint') or '(없음)'}
+chrome-use 사용법은 아래가 전부다. 설명서(`skills get`, `--help`)를 읽지 말고 바로 써라.
+- 열기: `{browser} open <URL>`
+- 요소 보기: `{browser} snapshot -i -c` (클릭·입력할 요소의 @ref를 얻는다)
+- 클릭: `{browser} click @eN --observe`
+- flag 입력: `printf %s "$(cat '<flag 파일>')" | {browser} fill @eN --stdin` (flag를 명령줄에 직접 쓰지 마라)
 - 이미 해결됨으로 표시되어 있으면 제출하지 말고 already_solved.
 - 응답이 애매하면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 제출하지 말고 needs_user.
-- message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라. 최종 응답은 스키마 JSON으로만 한다."""
-    work = chal / ".ctfh-check"
-    flag = (chal / "flag.txt").read_text().strip()
-    return runner(opts, work, prompt, SUBMIT_SCHEMA, work, "submit", 900, redact=(flag,))
+- results에 위 slug마다 한 줄씩 적는다. message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라.
+최종 응답은 스키마 JSON으로만 한다."""
+    work = contest.state_dir / "submit"
+    work.mkdir(parents=True, exist_ok=True)
+    flags = tuple((chal / "flag.txt").read_text().strip() for chal in chals)
+    answer = runner(opts, work, prompt, SUBMIT_SCHEMA, work, "submit", 900 + 120 * (len(chals) - 1), redact=flags)
+    return {row.get("slug"): row for row in answer.get("results", [])}
 
 
 def review(chal: Path, opts: Options, runner=run_codex_json) -> dict:
@@ -951,7 +967,8 @@ class Checker:
         self.contest, self.opts, self.tmux, self.runner = contest, opts, tmux, runner
         self.pool = cf.ThreadPoolExecutor(max_workers=6)  # collect and download may run for long
         self.jobs: dict[str, cf.Future] = {}
-        self.submit_pool = cf.ThreadPoolExecutor(max_workers=1)  # one browser submit at a time, off the check pool
+        self.submit_pool = cf.ThreadPoolExecutor(max_workers=1)  # one browser submit run at a time, off the check pool
+        self.submit_queue: collections.deque[Path] = collections.deque()  # verified, waiting for the next run
         self.last_scan = time.time()
         self.rollouts: dict[str, Path] = {}
         self.tokens: dict[str, int | None] = {}
@@ -1020,20 +1037,40 @@ class Checker:
         elif not self.opts.submit:
             self.tell(chal, "flag 재현 확인됨 (자동 제출 꺼짐). writeup.md를 마무리해라.")
 
-    def job_submit(self, chal: Path) -> None:
-        # Runs on submit_pool when its turn comes; until then the challenge stays verified.
-        status = load_status(chal)
-        digest = status.get("flag_sha256")
-        # Record the attempt before the browser acts: a crash must never lead to a blind replay.
-        status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
-        status.pop("approved_sha256", None)
-        status.setdefault("submissions", []).append({"sha256": digest, "result": "pending", "at": _now()})
-        save_status(chal, status)
+    def job_submit(self) -> None:
+        # Runs on submit_pool. The first run to get its turn also takes the challenges queued behind it;
+        # until then they stay verified, so a restart resubmits them.
+        batch = []
+        while self.submit_queue and len(batch) < SUBMIT_BATCH:
+            batch.append(self.submit_queue.popleft())
+        if batch:
+            self.submit_batch(batch)
+
+    def submit_batch(self, chals: list[Path]) -> None:
+        sending = []
+        for chal in chals:
+            status = load_status(chal)
+            if status.get("state") != "verified":  # held or marked done while it waited
+                continue
+            # Record the attempt before the browser acts, so a restart knows it may have gone out.
+            status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
+            status.pop("approved_sha256", None)
+            status.setdefault("submissions", []).append({"sha256": status.get("flag_sha256"), "result": "pending",
+                                                         "at": _now()})
+            save_status(chal, status)
+            sending.append(chal)
+        if not sending:
+            return
         try:
-            result = submit(self.contest, chal, replace(self.opts, effort=self.opts.submit_effort or self.opts.effort),
-                            self.runner)
-        except Exception as exc:  # noqa: BLE001 - the outcome is unknown, never retried blindly
-            result = {"result": "unknown", "message": f"제출 작업 오류: {exc}"}
+            results = submit(self.contest, sending,
+                             replace(self.opts, effort=self.opts.submit_effort or self.opts.effort), self.runner)
+        except Exception as exc:  # noqa: BLE001 - the outcome is unknown
+            results = {chal.name: {"result": "unknown", "message": f"제출 작업 오류: {exc}"} for chal in sending}
+        for chal in sending:
+            self.record_submit(chal, results.get(chal.name) or {"result": "unknown",
+                                                                "message": "제출 응답에 이 문제가 없습니다."})
+
+    def record_submit(self, chal: Path, result: dict) -> None:
         status = load_status(chal)
         outcome = result.get("result", "unknown")
         entry = status["submissions"][-1]
@@ -1167,7 +1204,8 @@ class Checker:
             if time.time() >= status.get("retry_after", 0):
                 status["reason"] = "제출 차례를 기다리는 중입니다."
                 save_status(chal, status)
-                return self.submit_pool.submit(self.job_submit, chal)
+                self.submit_queue.append(chal)
+                return self.submit_pool.submit(self.job_submit)
             return None
         writeup = chal / "writeup.md"
         if (state == "accepted" or (state == "verified" and not self.opts.submit)) and writeup.exists() \
