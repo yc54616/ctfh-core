@@ -707,6 +707,11 @@ class CheckerFlowTests(Base):
             waiting.join(5)
         self.assertEqual([s["result"] for s in self.status("heap")["submissions"]], ["unknown"])
 
+    def test_board_counts_solved_challenges(self):
+        for slug, state in (("a", "accepted"), ("b", "site_solved"), ("c", "solving")):
+            native.save_status(make_challenge(self.root, slug), {"state": state})
+        self.assertIn("푼 문제 2/3", self.checker().view()[0][0])
+
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")

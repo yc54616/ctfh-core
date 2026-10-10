@@ -1397,7 +1397,8 @@ class Checker:
         manual = [row["name"] for row in rows if row["state"] == "manual"]
         busy = ", ".join(sorted(k for k, f in self.jobs.items() if not f.done() and k != "__solved__")) or "-"
         alert = self.contest.state_dir / "needs_user.txt"
-        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 합계 {total:,}  검사 중: {busy}"
+        solved = sum(row["state"] in FINISHED | {"accepted"} for row in rows)
+        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  푼 문제 {solved}/{len(rows)}  토큰 합계 {total:,}  검사 중: {busy}"
                 f"  동시 창 {self.opts.max_parallel or '전체'}"]
         if alert.exists():
             head.append("!! " + alert.read_text().strip())
