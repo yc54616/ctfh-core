@@ -597,6 +597,12 @@ DOWNLOAD_SCHEMA = _strict({
 })
 
 
+def attachment_urls(chal: Path) -> frozenset[str]:
+    info = _read_json(chal / "challenge.json", {})
+    items = info.get("attachments") if isinstance(info, dict) else None
+    return frozenset(str(item["url"]) for item in items or [] if isinstance(item, dict) and item.get("url"))
+
+
 def files_ready(chal: Path, status: dict) -> bool:
     """Attachments are in, or there are none to wait for (folders collected before attachment lists count as ready)."""
     info = _read_json(chal / "challenge.json", {})
@@ -673,6 +679,8 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
    - challenge.json: {{"id": 사이트 id, "name", "category", "points", "solves": 푼 팀 수 (모르면 null), "url": 문제 페이지,
      "solved": 내 계정 기준 해결 여부, "attachments": [{{"name", "url", "size": 사이트에 보이는 크기 (모르면 null)}}]
      (첨부가 없으면 [])}}
+   - 같은 시리즈의 다른 문제(#0 등)에만 붙은 파일을 이 문제도 쓰면 (설명이 그 파일을 가리키거나 시리즈가 같은 증거를
+     나눠 쓰면) 이 문제의 attachments에도 같은 url로 적는다. 그래야 검사기가 그 파일을 받은 뒤 풀이를 시작한다.
    - 첨부 파일은 내려받지 않는다. 검사기가 따로 받으므로 목록만 attachments에 적는다.
    인스턴스를 켜야 하는 문제는 켜지 말고 challenge.md에 그 사실과 방법만 적는다.
 5. flag 형식(정규식)과 제출 방법(어느 페이지의 어떤 입력창/버튼인지)을 알아낸다.
@@ -1109,6 +1117,21 @@ class Checker:
     def waiting_files(self) -> list[Path]:
         return [chal for chal in self.contest.challenges()
                 if (status := load_status(chal)).get("state") not in FINISHED and not files_ready(chal, status)]
+
+    def share_or_wait(self, chal: Path, urls: dict[Path, frozenset[str]]) -> bool:
+        """Attachments another challenge already fetched are hard-linked here, and ones it is still fetching are
+        waited for, so a series sharing one big image downloads it once. True when no download should start."""
+        others = [other for other, same in urls.items() if other != chal and urls[chal] and same == urls[chal]]
+        source = next((other for other in others if (other / "files" / FILES_DONE).exists()), None)
+        if source:
+            for path in (source / "files").rglob("*"):
+                dest = chal / "files" / path.relative_to(source / "files")
+                if path.is_file() and path.name != FILES_DONE and not dest.exists():
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(path, dest)
+            (chal / "files" / FILES_DONE).touch()
+            return True
+        return any(not job.done() for other in others if (job := self.jobs.get(f"__download_{other.name}__")))
 
     def job_download(self, chal: Path) -> None:
         """Fetch one challenge's attachments in its own Chrome session; it starts as soon as they are in."""
@@ -1638,9 +1661,11 @@ class Checker:
         if not self.outage:
             self.fill_slots(self.tmux.windows())
         if not self.outage and not ended:
+            urls = {chal: attachment_urls(chal) for chal in self.contest.challenges()}
             for chal in self.waiting_files():  # every challenge at once; one that failed waits before the next try
                 key = f"__download_{chal.name}__"
-                if key not in self.jobs and time.time() >= load_status(chal).get("download_after", 0):
+                if key not in self.jobs and time.time() >= load_status(chal).get("download_after", 0) \
+                        and not self.share_or_wait(chal, urls):
                     self.jobs[key] = self.browser_pool.submit(self.job_download, chal)
         if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
             self.last_solved_poll = time.time()

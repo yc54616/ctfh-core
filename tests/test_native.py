@@ -665,6 +665,35 @@ class CheckerFlowTests(Base):
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         self.assertEqual(len(runs.read_text().split()), 5)  # a checker that cannot start stops retrying
 
+    def test_a_series_sharing_one_image_downloads_it_once(self):
+        for slug in ("pc-0", "pc-1"):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({
+                "name": slug, "attachments": [{"name": "image", "url": "https://drive/x", "size": None}]}))
+        prompts, pending = [], []
+        def downloader(opts, cwd, prompt, *rest, **kw):
+            prompts.append(prompt)
+            (cwd / "challenges" / "pc-0" / "files" / "H4CGAME.zip").write_bytes(b"PK image")
+            (cwd / "challenges" / "pc-0" / "files" / native.FILES_DONE).touch()
+            return {"downloaded": ["pc-0"], "failed": []}
+        checker = self.checker(runner=downloader)
+        def later(fn, *args):  # the download is still running during this tick
+            future = cf.Future()
+            pending.append((future, fn, args))
+            return future
+        with patch.object(checker.browser_pool, "submit", side_effect=later):
+            checker.tick()
+            self.assertEqual(len(pending), 1)  # pc-1 waits for pc-0's download instead of fetching it again
+            future, fn, args = pending[0]
+            future.set_result(fn(*args))
+            checker.tick()
+        self.assertEqual(len(prompts), 1)
+        shared = self.root / "challenges" / "pc-1" / "files" / "H4CGAME.zip"
+        self.assertEqual(shared.stat().st_ino, (self.root / "challenges" / "pc-0" / "files" / "H4CGAME.zip").stat().st_ino)
+        self.assertTrue((shared.parent / native.FILES_DONE).exists())
+        checker.tick()
+        self.assertEqual({self.status(s)["state"] for s in ("pc-0", "pc-1")}, {"solving"})
+
     def test_challenges_start_while_big_attachments_download(self):
         web = make_challenge(self.root, "web")
         (web / "challenge.json").write_text(json.dumps({"name": "web", "category": "web", "attachments": []}))
@@ -672,7 +701,7 @@ class CheckerFlowTests(Base):
             chal = make_challenge(self.root, slug)
             (chal / "challenge.json").write_text(json.dumps({
                 "name": slug, "category": "forensics" if slug == "dfir" else "rev",
-                "attachments": [{"name": f"{slug}.bin", "url": "https://x/f", "size": size}]}))
+                "attachments": [{"name": f"{slug}.bin", "url": f"https://x/{slug}", "size": size}]}))
         prompts = []
         def downloader(opts, cwd, prompt, *rest, **kw):
             prompts.append((opts.model, prompt))
