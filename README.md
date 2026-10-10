@@ -231,10 +231,6 @@ Checker safeguards:
   closed, the challenge waits for the server instead of counting as a wrong solve.
 - **Checker restarts itself** after a crash (5 s later); `q`/Ctrl-C ends it, and
   5 quick crashes in a row stop the retries and leave the error on screen.
-- **Skipped categories and cost report**: `--skip-category osint,misc` leaves
-  those challenges on hold (`r` starts one). `.ctfh/report.md` lists solver
-  tokens and outcome per challenge and category, refreshed every 10 minutes and
-  at the contest end.
 - **Cheaper side jobs**: submitting runs at low effort and writeup review at
   medium, on the solver model (`--submit-thinking`, `--review-thinking`;
   `same` follows `--thinking`).

@@ -416,8 +416,6 @@ def _native_options(parser: argparse.ArgumentParser) -> None:
                         help=f"주기적 재스캔에만 쓸 모델 (same이면 --model과 같음, 기본 {ctfh_native.RESCAN_MODEL})")
     parser.add_argument("--rescan-thinking", choices=(*ctfh_native.EFFORTS, "same"),
                         help="주기적 재스캔에만 쓸 추론 강도 (same이면 --thinking과 같음, 기본 low)")
-    parser.add_argument("--skip-category", help="쉼표로 구분한 분야는 자동 풀이를 시작하지 않고 hold로 둔다 "
-                        "(이름 일부만 맞아도 됨, 예: osint,misc; r로 직접 시작)")
     parser.add_argument("--submit-thinking", choices=(*ctfh_native.EFFORTS, "same"),
                         help="사이트 제출 작업의 추론 강도 (same이면 --thinking과 같음, 기본 low)")
     parser.add_argument("--review-thinking", choices=(*ctfh_native.EFFORTS, "same"),
@@ -441,13 +439,10 @@ def _native_settings(args) -> ctfh_native.Options:
         ctfh_native.memory_limit(str(pick("memory_max", "memory_max", "auto")))
     except ValueError as error:
         raise SystemExit(f"ctfh2: {error}")
-    skip = pick("skip_category", "skip_categories", "")
-    skip = ",".join(map(str, skip)) if isinstance(skip, list) else str(skip)
     return ctfh_native.Options(
         binary=binary, model=pick("model", "model", ctfh_native.DEFAULT_MODEL), effort=pick("reasoning_effort", "thinking", None),
         rescan_model=None if (rescan_model := pick("rescan_model", "rescan_model", ctfh_native.RESCAN_MODEL)) == "same" else rescan_model,
         rescan_effort=None if (rescan_effort := pick("rescan_thinking", "rescan_thinking", "low")) == "same" else rescan_effort,
-        skip_categories=tuple(part.strip().lower() for part in skip.split(",") if part.strip()),
         submit_effort=None if (submit_effort := pick("submit_thinking", "submit_thinking", "low")) == "same" else submit_effort,
         review_effort=None if (review_effort := pick("review_thinking", "review_thinking", "medium")) == "same" else review_effort,
         max_parallel=max(0, int(pick("max_parallel", "max_parallel", 0))),

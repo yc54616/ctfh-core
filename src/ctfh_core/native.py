@@ -54,7 +54,6 @@ class Options:
     effort: str | None = None
     rescan_model: str | None = RESCAN_MODEL  # periodic rescans only re-read the list; None: same as model
     rescan_effort: str | None = "low"  # None: same as effort
-    skip_categories: tuple[str, ...] = ()  # lowercase parts of category names left on hold
     submit_effort: str | None = "low"  # submitting is a few clicks; None: same as effort
     review_effort: str | None = "medium"  # writeup review; None: same as effort
     max_parallel: int = 0  # 0: every unsolved challenge at once
@@ -72,8 +71,6 @@ class Options:
                 "--rescan-minutes", str(self.rescan_seconds // 60),
                 "--idle-seconds", str(self.idle_seconds), "--nudge-limit", str(self.nudge_limit),
                 "--solve-timeout", str(self.solve_timeout), "--memory-max", self.memory_max]
-        if self.skip_categories:
-            args += ["--skip-category", ",".join(self.skip_categories)]
         if self.model:
             args += ["--model", self.model]
         if self.effort:
@@ -192,7 +189,6 @@ SOLVED_POLL_SECONDS = 60
 USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
 OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
-REPORT_SECONDS = 600  # .ctfh/report.md refresh
 OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
 OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
                             r"network error|connection (?:refused|reset)", re.I)
@@ -898,14 +894,13 @@ class Checker:
         self.last_scan = time.time()
         self.rollouts: dict[str, Path] = {}
         self.tokens: dict[str, int | None] = {}
-        self.spent: dict[str, dict[str, int]] = {}
         self.activity: dict[str, dict] = {}
         self.probes: dict[tuple[str, int], tuple[float, str]] = {}
         self.solved_probe = site_solved
         self.last_solved_poll = 0.0
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
         self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
-        self.last_outage_check = self.last_probe = self.last_report = 0.0
+        self.last_outage_check = self.last_probe = 0.0
         saved = _read_json(contest.state_dir / "checker.json", {})
         saved = saved if isinstance(saved, dict) else {}
         limit, self.base_parallel = saved.get("max_parallel") or {}, opts.max_parallel
@@ -1145,8 +1140,6 @@ class Checker:
         self.rollouts[chal.name] = path
         info = rollout_info(path)
         self.tokens[chal.name] = info["tokens"]
-        if info["tokens"]:  # every session's total, so a restarted solver still counts in the report
-            self.spent.setdefault(chal.name, {})[str(path)] = info["tokens"]
         self.activity[chal.name] = info
         return info
 
@@ -1239,11 +1232,6 @@ class Checker:
             return f"진전 없음: 재촉 {STALL_NUDGES}번 동안 NOTES.md 그대로, 직접 확인 필요"
         return None
 
-    def skipped(self, chal: Path) -> str:
-        info = _read_json(chal / "challenge.json", {})
-        category = str(info.get("category") or "") if isinstance(info, dict) else ""
-        return category if any(part in category.lower() for part in self.opts.skip_categories) else ""
-
     def fill_slots(self, windows: set[str]) -> None:
         """Start pending solvers and restart exited ones, up to max_parallel windows (0: no limit)."""
         challenges = self.contest.challenges()
@@ -1254,10 +1242,6 @@ class Checker:
                 continue
             status = load_status(chal)
             state = status.get("state")
-            if state == "pending" and (category := self.skipped(chal)):
-                status.update(state="hold", reason=f"건너뛰는 분야 ({category}): r로 시작")
-                save_status(chal, status)
-                continue
             if state == "pending" or (state == "blocked" and status.get("blocked_by")
                                       != f"{self.opts.binary}:{self.opts.model or '-'}"):
                 fresh.append((chal, status))
@@ -1441,34 +1425,6 @@ class Checker:
             self.close(chal)
             status.update(state="hold", reason="대회 종료: 자동 풀이를 멈춤 (r로 계속).")
             save_status(chal, status)
-        self.write_report()
-
-    def write_report(self) -> None:
-        """Tokens and outcome per challenge and category, to pick which categories pay off next time."""
-        self.last_report = time.time()
-        path = self.contest.state_dir / "tokens.json"
-        spent = _read_json(path, {})
-        spent = spent if isinstance(spent, dict) else {}
-        for name, sessions in self.spent.items():
-            spent[name] = {**(spent.get(name) if isinstance(spent.get(name), dict) else {}), **sessions}
-        _write_atomic(path, json.dumps(spent) + "\n")
-        rows, groups = [], {}
-        for chal in self.contest.challenges():
-            info = _read_json(chal / "challenge.json", {})
-            info = info if isinstance(info, dict) else {}
-            category, state = str(info.get("category") or "-"), load_status(chal).get("state", "-")
-            sessions = spent.get(chal.name)
-            tokens = sum(v for v in sessions.values() if isinstance(v, int)) if isinstance(sessions, dict) else 0
-            rows.append(f"| {chal.name} | {category} | {info.get('points') or '-'} | {state} | {tokens:,} |")
-            group = groups.setdefault(category, [0, 0, 0])
-            group[0], group[1], group[2] = group[0] + 1, group[1] + (state in FINISHED), group[2] + tokens
-        summary = [f"| {category} | {count} | {solved} | {tokens:,} | {f'{tokens // solved:,}' if solved else '-'} |"
-                   for category, (count, solved, tokens) in sorted(groups.items(), key=lambda item: -item[1][2])]
-        _write_atomic(self.contest.state_dir / "report.md", "\n".join([
-            f"# {self.contest.url} ({datetime.now():%Y-%m-%d %H:%M})", "",
-            "풀이 창 토큰만 셉니다 (수집·제출·검토 제외).", "", "## 분야별", "",
-            "| 분야 | 문제 | 푼 문제 | 토큰 | 푼 문제당 토큰 |", "|---|---|---|---|---|", *summary, "",
-            "## 문제별", "", "| 문제 | 분야 | 점수 | 상태 | 토큰 |", "|---|---|---|---|---|", *rows]) + "\n")
 
     def save_state(self) -> None:
         """What the checker must remember across restarts; a new --max-parallel replaces the live limit."""
@@ -1515,8 +1471,6 @@ class Checker:
             self.end_handled = ends.isoformat()
             self.save_state()
             self.stop_for_end()
-        if time.time() - self.last_report >= REPORT_SECONDS:
-            self.write_report()
         for key, future in list(self.jobs.items()):
             if not future.done():
                 continue

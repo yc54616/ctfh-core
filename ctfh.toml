@@ -14,7 +14,6 @@ dangerously_bypass_approvals_and_sandbox = true
 # submit = true
 # rescan_model = "gpt-6-luna"  # 주기적 재스캔 모델 ("same" = model과 같음; 첫 수집은 항상 model)
 # rescan_thinking = "low" # 주기적 재스캔 추론 강도 ("same" = thinking과 같음)
-# skip_categories = ["osint"]  # 자동으로 시작하지 않고 hold로 둘 분야 (이름 일부, r로 직접 시작)
 # submit_thinking = "low"   # 사이트 제출 작업 추론 강도 (모델은 model과 같음, "same" = thinking과 같음)
 # review_thinking = "medium" # writeup 검토 추론 강도 (모델은 model과 같음, "same" = thinking과 같음)
 # rescan_minutes = 60     # 새 문제·해결 상태 재수집 주기 (분, 0 = 끔)

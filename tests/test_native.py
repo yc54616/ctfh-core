@@ -640,23 +640,6 @@ class CheckerFlowTests(Base):
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         self.assertEqual(len(runs.read_text().split()), 5)  # a checker that cannot start stops retrying
 
-    def test_skipped_category_is_held_and_report_counts_every_session(self):
-        chal = make_challenge(self.root, "geo")
-        (chal / "challenge.json").write_text(json.dumps({"name": "geo", "category": "OSINT", "points": 100}))
-        make_challenge(self.root, "heap")
-        checker = self.checker(skip_categories=("osint",))
-        checker.tick()
-        self.assertEqual(self.status("geo")["state"], "hold")
-        self.assertEqual(self.status("heap")["state"], "solving")
-        self.assertIn("--skip-category", checker.opts.to_args())
-        checker.spent = {"heap": {"a.jsonl": 1000, "b.jsonl": 500}}
-        checker.write_report()
-        report = (self.root / ".ctfh" / "report.md").read_text()
-        self.assertIn("| OSINT | 1 | 0 | 0 | - |", report)
-        self.assertIn("| heap | - | - | solving | 1,500 |", report)
-        checker.act("restart", "geo")
-        self.assertEqual(self.status("geo")["state"], "solving")
-
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")
