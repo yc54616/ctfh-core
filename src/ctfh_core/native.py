@@ -323,7 +323,8 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 (이 규칙은 풀이 세션용이다. 프롬프트가 `[검사기 작업]`으로 시작하면 그 지시가 우선한다.)
 - 공격 대상은 문제에서 주어진 파일과 서버뿐이다. 대회 플랫폼(로그인, 점수판, 다른 참가자)은 공격하지 않는다.
 - 호스트 도구(gdb, pwntools, qemu, 퍼저 등)를 자유롭게 쓴다. 오래 걸리는 명령에는 timeout을 건다.
-- 웹 확인이 필요하면 `chrome-use`를 쓰고 세션 이름은 `ctfh-{slug}`로 한다.
+- 웹 확인이 필요하면 `chrome-use`를 쓴다. 세션은 환경변수 AGENT_BROWSER_SESSION=ctfh-{slug}로 정해져 있으니
+  `--session`이나 `--session-name`을 따로 주지 마라 (창이 닫힐 때 검사기가 이 세션의 탭을 닫는다).
 - 사이트에서 VM/인스턴스를 켜거나 접속 정보를 읽기 전에, 열린 문제 창의 제목이 challenge.json의 name과 같은지
   먼저 확인한다. 다른 문제의 창·인스턴스·서비스면 쓰지 않고 닫은 뒤 이 문제를 다시 연다.
   받은 접속 정보는 어느 문제 창에서 얻었는지와 함께 `work/NOTES.md`에 적는다.
@@ -629,6 +630,10 @@ def browser_rules(session: str) -> str:
 다른 작업도 각자 다른 세션으로 동시에 Chrome을 쓰고 있다. 이 세션 `{session}`만 쓰고 다른 탭은 건드리지 마라."""
 
 
+def solver_session(chal: Path) -> str:
+    return f"ctfh-{chal.name}"
+
+
 def close_browser(session: str) -> None:
     """Close what a checker job's own chrome-use session opened; the user's Chrome and other sessions stay."""
     try:
@@ -744,7 +749,10 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
     fetched = {chal: info["attachments"] for chal in contest.challenges() if (chal / "files" / FILES_DONE).exists()
                and isinstance(info := _read_json(chal / "challenge.json", {}), dict) and info.get("attachments")}
-    result = runner(opts, contest.root, prompt, COLLECT_SCHEMA, contest.state_dir, "collect", show=show)
+    try:
+        result = runner(opts, contest.root, prompt, COLLECT_SCHEMA, contest.state_dir, "collect", show=show)
+    finally:
+        close_browser("ctfh-collect")
     for chal, attachments in fetched.items():  # a rescan that retyped a fetched file's URL can only get it wrong
         info = _read_json(chal / "challenge.json", None)
         if isinstance(info, dict) and info.get("attachments") != attachments:
@@ -1060,7 +1068,8 @@ class Checker:
     # -- solver windows
     def launch(self, chal: Path, status: dict, resume: bool = False, count: bool = True) -> None:
         prompt = SOLVER_PROMPT + (" 세션이 다시 시작됐다. status.json도 확인해라." if resume else "")
-        argv = memory_prefix(self.opts, chal) + env_prefix(self.opts.binary) \
+        argv = memory_prefix(self.opts, chal) + ["env", f"AGENT_BROWSER_SESSION={solver_session(chal)}"] \
+            + env_prefix(self.opts.binary) \
             + codex_argv(self.opts, chal, prompt, interactive=True)
         self.tmux.new_window(window_name(chal.name), chal, argv)
         self.rollouts.pop(chal.name, None)
@@ -1080,6 +1089,7 @@ class Checker:
     def close(self, chal: Path) -> None:
         if window_name(chal.name) in self.tmux.windows():
             self.tmux.kill(window_name(chal.name))
+            close_browser(solver_session(chal))
 
     # -- heavy jobs (run in the pool)
     def job_check(self, chal: Path, mtime: int, solve_mtime: int = 0) -> None:

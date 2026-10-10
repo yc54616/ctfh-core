@@ -184,11 +184,12 @@ rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it
 ```
 
 1. A `codex exec` collector logs in through connected Chrome (`chrome-use`,
-   session `ctfh-collect`) and writes one folder per challenge.
+   session `ctfh-collect`, closed when the run ends) and writes one folder per challenge.
 2. A tmux session `ctfh-<contest>` opens a `checker` window plus one
    `codex --dangerously-bypass-approvals-and-sandbox` window per challenge
    (`--max-parallel`, default 0 = every challenge at once). Attach with `tmux attach -t ctfh-<contest>` and
-   type into any window as usual.
+   type into any window as usual. Each window's chrome-use session is pinned to
+   `ctfh-<slug>` (`AGENT_BROWSER_SESSION`), and its tabs close when the window does.
 3. The checker re-runs `solve.py` and requires the same flag. It submits each
    flag hash through Chrome, every ready flag at once, each from its own
    chrome-use session (`ctfh-submit-<slug>`) that the checker closes when the run

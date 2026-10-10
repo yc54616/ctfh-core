@@ -163,6 +163,7 @@ class LayoutTests(Base):
         self.assertEqual((name, cwd), ("collect", self.contest.root))
         self.assertIn("needs_user", prompt)
         self.assertNotIn("secret-fill", prompt)
+        self.assertEqual(self.closed, ["ctfh-collect"])  # the collect run's tabs close with it
 
 
     def test_a_rescan_keeps_the_urls_of_fetched_attachments(self):
@@ -702,6 +703,17 @@ class CheckerFlowTests(Base):
         self.assertIn("id=1iW2iseW82LOwZC4Iw_vy2_qfrCMgcGHK&export=download&confirm=t", calls[0][-1])
         self.assertEqual(runner.calls, [])  # no Codex run for a Drive-only challenge
         self.assertNotIn("download_tries", self.status("art"))
+
+    def test_a_closed_solver_window_closes_its_browser_session(self):
+        chal = make_challenge(self.root, "web-1")
+        checker = self.checker()
+        checker.tick()
+        argv = checker.tmux.open["web-1"]
+        self.assertIn("AGENT_BROWSER_SESSION=ctfh-web-1", argv)
+        self.assertLess(argv.index("AGENT_BROWSER_SESSION=ctfh-web-1"), argv.index(checker.opts.binary))
+        self.assertEqual(self.closed, [])
+        checker.close(chal)
+        self.assertEqual((checker.tmux.windows(), self.closed), (set(), ["ctfh-web-1"]))
 
     def test_a_series_sharing_one_image_downloads_it_once(self):
         for slug in ("pc-0", "pc-1"):
