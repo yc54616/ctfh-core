@@ -261,9 +261,12 @@ challenges/<slug>/
   status.json .ctfh-check/                            # checker only
 ```
 
-Login uses the Chrome profile you are already signed into. Optionally,
+Login uses the Chrome profile you are already signed into. When the site logs
+it out, a collect or submit run opens the login page and clicks the login
+button without typing: if Chrome saved the site's password, its autofill sends
+it on that click (the page and the model see empty fields). Optionally,
 `~/.config/ctfh/credentials.toml` (mode 600, `["host"] username/password`) lets
-the collector fill the login form through `ctfh2 secret-fill`. That command
+the run fill the login form through `ctfh2 secret-fill` when autofill fails. That command
 passes the value via `chrome-use fill --from-env`, so the model never sees it.
 2FA and captchas are handed back to you. Solver sessions run with full host
 access, so they can read any file you can.

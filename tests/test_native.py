@@ -163,6 +163,7 @@ class LayoutTests(Base):
         self.assertEqual((name, cwd), ("collect", self.contest.root))
         self.assertIn("needs_user", prompt)
         self.assertNotIn("secret-fill", prompt)
+        self.assertIn("아무것도 입력하지 말고 로그인 버튼을 한 번 누른다", prompt)  # Chrome's saved password
         self.assertEqual(self.closed, ["ctfh-collect"])  # the collect run's tabs close with it
 
 
@@ -178,6 +179,24 @@ class LayoutTests(Base):
         native.collect(self.contest, native.Options(), FakeRunner(collect=[collector]))
         info = json.loads((chal / "challenge.json").read_text())
         self.assertEqual((info["attachments"], info["solved"]), (real, True))
+
+
+    def test_a_logged_out_submit_tries_autofill_then_the_credentials_file(self):
+        chal = make_challenge(self.root, "web-1")
+        (chal / "flag.txt").write_text("FLAG{x}\n")
+        runner = FakeRunner(submit=[{"result": "unknown", "message": ""}] * 2)
+        native.submit(self.contest, chal, native.Options(), runner, session="ctfh-submit-web-1")
+        self.assertIn("아무것도 입력하지 말고 로그인 버튼", runner.calls[0][2])
+        self.assertNotIn("secret-fill", runner.calls[0][2])
+        creds = Path(self.temp.name) / "credentials.toml"
+        creds.write_text('["ctf.example"]\nusername = "u"\npassword = "p"\n')
+        creds.chmod(0o600)
+        with patch.object(native, "CREDENTIALS", creds):
+            native.submit(self.contest, chal, native.Options(), runner, session="ctfh-submit-web-1")
+        prompt = runner.calls[1][2]
+        self.assertLess(prompt.index("로그인 버튼을 한 번"), prompt.index("secret-fill"))
+        self.assertIn("--session ctfh-submit-web-1", prompt)
+        self.assertNotIn('"p"', prompt)
 
 
 class VerifyTests(Base):

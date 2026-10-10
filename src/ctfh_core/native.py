@@ -715,15 +715,24 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
     return runner(opts, contest.root, prompt, DOWNLOAD_SCHEMA, work, "download", DOWNLOAD_TIMEOUT)
 
 
+def login_steps(contest: Contest, session: str, give_up: str) -> str:
+    """How a collect or submit run logs back in: Chrome's saved-password autofill first (tested: the values reach
+    the form on a real click though the page and the snapshot show empty fields), then the credentials file."""
+    autofill = ("로그인 페이지를 열고, 칸이 비어 보여도 아무것도 입력하지 말고 로그인 버튼을 한 번 누른다 "
+                "(Chrome이 저장된 계정을 자동완성해 두며, 값은 화면에 안 보여도 클릭할 때 넘어간다). ")
+    if credential(urlparse(contest.url).hostname or "") is None:
+        return (autofill + "그래도 로그인되지 않거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고 "
+                f"{give_up}로 바로 끝낸다.")
+    helper = shlex.join(self_command("secret-fill", str(contest.root), "<username|password>", "<@ref>",
+                                     "--session", session))
+    return (autofill + "그래도 안 되면 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
+            f"(값은 너에게 보이지 않는다): `{helper}`. 그다음 로그인 버튼을 누른다. "
+            f"2FA·캡차가 나오거나 실패하면 {give_up}로 바로 끝낸다. 비밀번호를 직접 입력하거나 출력하지 마라.")
+
+
 def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -> dict:
     existing = ", ".join(p.name for p in contest.challenges()) or "(없음)"
-    login = ("로그인되어 있지 않거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고 login=\"needs_user\"로 바로 끝낸다.")
-    if credential(urlparse(contest.url).hostname or "") is not None:
-        helper = shlex.join(self_command("secret-fill", str(contest.root), "<username|password>", "<@ref>",
-                                         "--session", "ctfh-collect"))
-        login = ("로그인되어 있지 않으면 로그인 폼에서 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
-                 f"(값은 너에게 보이지 않는다): `{helper}`. 그다음 로그인 버튼을 누른다. "
-                 "2FA·캡차가 나오거나 실패하면 login=\"needs_user\"로 바로 끝낸다. 비밀번호를 직접 입력하거나 출력하지 마라.")
+    login = "로그인되어 있지 않으면 " + login_steps(contest, "ctfh-collect", 'login="needs_user"')
     prompt = f"""너는 CTF 대회의 문제 수집 담당이다. 대상: {contest.url}
 문제를 풀지 마라. 현재 폴더가 대회 폴더다.
 1. 먼저 `chrome-use skills get core`로 사용법을 읽고, 사용자의 로그인된 Chrome을 세션 이름 `ctfh-collect`로 쓴다.
@@ -891,7 +900,8 @@ flag는 ../flag.txt에 있다. 사용자의 로그인된 Chrome에서 이 문제
   (flag를 명령줄에 직접 쓰지 마라)
 제출 방법 힌트: {contest.site().get('submit_hint') or '(없음)'}
 - 이미 해결됨으로 표시되어 있으면 제출하지 말고 already_solved.
-- 응답이 애매하거나 제출이 너무 잦다고 막히면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 제출하지 말고 needs_user.
+- 응답이 애매하거나 제출이 너무 잦다고 막히면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 {login_steps(contest, session, 'result="needs_user"')}
+  로그인되면 이 문제로 돌아가 제출한다.
 - message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라. 최종 응답은 스키마 JSON으로만 한다."""
     work = chal / ".ctfh-check"
     flag = (chal / "flag.txt").read_text().strip()
