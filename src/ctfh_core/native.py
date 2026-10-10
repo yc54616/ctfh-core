@@ -36,6 +36,15 @@ ACTIVE = frozenset({"solving", "needs_fix", "manual", "hold"})  # manual: auto n
 STALL_NUDGES = 2  # nudges in a row without a new work/NOTES.md before handing the solver to the user
 FINISHED = frozenset({"done", "user_solved", "site_solved"})
 BOARD_ORDER = {"manual": 0, "unknown": 0, "blocked": 1, "pending": 3, "hold": 3, **{state: 4 for state in FINISHED}}  # others 2
+# Board: Korean state names, and the group each state is shown in (needs you, working, waiting, finished).
+STATE_LABELS = {"pending": "대기", "solving": "풀이 중", "needs_fix": "다시 풀이", "checking": "검사 중",
+                "verified": "제출 대기", "submitting": "제출 중", "accepted": "정답", "done": "완료",
+                "site_solved": "사이트 해결", "user_solved": "직접 해결", "unknown": "결과 모름",
+                "manual": "직접 확인", "blocked": "막힘", "hold": "보류"}
+BOARD_GROUPS = {"manual": "!", "unknown": "!", "blocked": "!", "pending": "⏳", "hold": "⏳",
+                **{state: "✓" for state in FINISHED | {"accepted"}}}  # others: ● working
+QUIET_REASONS = {"solve.py 재실행으로 같은 flag를 재현했습니다.", "사이트가 정답 처리했습니다.", "사이트에 제출하는 중입니다.",
+                 "사이트에 해결됨으로 표시됨.", "writeup 검토 통과."}  # the state already says it
 DEFAULT_MODEL = "gpt-6-sol"
 RESCAN_MODEL = "gpt-6-luna"  # cheap model for periodic rescans; the cost is mostly input tokens
 SOLVE_SETTLE_SECONDS = 20  # recheck a changed solve.py only after it stopped changing
@@ -1391,19 +1400,26 @@ class Checker:
             status = load_status(chal)
             tokens = self.tokens.get(chal.name)
             total += tokens or 0
-            rows.append({"name": chal.name, "state": status.get("state", "-"),
-                         "tokens": f"{tokens:,}" if tokens else "-",
-                         "activity": self.activity_text(chal, status, windows),
-                         "reason": str(status.get("reason", "")) or (
-                             FILES_WAIT if status.get("state") == "pending" and not files_ready(chal, status) else "")})
-        rows.sort(key=lambda row: BOARD_ORDER.get(row["state"], 2))  # stable: name order within a group
+            state, activity = status.get("state", "-"), self.activity_text(chal, status, windows)
+            reason = str(status.get("reason", ""))
+            if reason in QUIET_REASONS or (reason == FILES_WAIT and activity.startswith("첨부")):
+                reason = ""
+            rows.append({"name": chal.name, "state": state, "group": BOARD_GROUPS.get(state, "●"),
+                         "label": STATE_LABELS.get(state, state),
+                         "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
+                         "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
+                         "activity": "" if activity == "-" else activity, "reason": reason})
+        group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
+        rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name
         manual = [row["name"] for row in rows if row["state"] == "manual"]
-        busy = ", ".join(sorted(k for k, f in self.jobs.items() if not f.done() and k != "__solved__"
-                                and not k.startswith("__download_"))) or "-"
         alert = self.contest.state_dir / "needs_user.txt"
-        solved = sum(row["state"] in FINISHED | {"accepted"} for row in rows)
-        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  푼 문제 {solved}/{len(rows)}  토큰 합계 {total:,}  검사 중: {busy}"
-                f"  동시 창 {self.opts.max_parallel or '전체'}"]
+        count = lambda *states: sum(row["state"] in states for row in rows)
+        solved = sum(row["group"] == "✓" for row in rows)
+        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 {total / 10000:,.0f}만"
+                f"  동시 창 {self.opts.max_parallel or '전체'}",
+                f"✓ 푼 문제 {solved}/{len(rows)}   ● 풀이 {count('solving', 'needs_fix')}"
+                f"   ◐ 검사 {count('checking')}   ↑ 제출 {count('verified', 'submitting')}"
+                f"   ⏳ 대기 {count('pending', 'hold')}   ! 확인 필요 {sum(row['group'] == '!' for row in rows)}"]
         if alert.exists():
             head.append("!! " + alert.read_text().strip())
         limits = max((i for i in self.activity.values() if i.get("limits")), key=lambda i: i["mtime"], default=None)
@@ -1438,9 +1454,9 @@ class Checker:
 
     def board(self) -> str:
         head, rows = self.last_view = self.view()
-        lines = [f"{'문제':<28} {'상태':<12} {'토큰':>12}  {'활동':<24} 메모"]
-        lines += [f"{row['name'][:28]:<28} {row['state']:<12} {row['tokens']:>12}  {row['activity']:<24} "
-                  f"{row['reason'][:60]}" for row in rows]
+        lines = [f"   {'문제':<28} {'상태':<10} {'토큰':>8}  {'활동':<24} 메모"]
+        lines += [f"{row['group']}  {row['name'][:28]:<28} {row['label']:<10} {row['tokens']:>8}  "
+                  f"{row['activity']:<24} {row['reason'][:60]}" for row in rows]
         return "\n".join(head + lines) + "\n"
 
     def act(self, action: str, name: str) -> str:

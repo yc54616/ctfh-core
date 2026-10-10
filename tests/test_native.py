@@ -461,7 +461,7 @@ class CheckerFlowTests(Base):
         native.save_status(b, status)
         checker.tmux.kill("b")
         checker.tick()
-        rows = {line.split()[0]: line for line in checker.board().splitlines()[2:]}
+        rows = {line.split()[1]: line for line in checker.board().splitlines()[3:]}
         self.assertRegex(rows["a"], r"\d+초째 멈춤 \(재촉 0/2\)")
         self.assertIn("창 없음 (재시작 한도)", rows["b"])
         self.assertIn("시작 중", rows["c"])
@@ -592,7 +592,7 @@ class CheckerFlowTests(Base):
         self.assertIn("재촉 한도 3회", status["reason"])
         self.assertIn("Codex 주간 사용량 42%", checker.board())
         self.assertNotIn("!! Codex", checker.board())
-        self.assertRegex(checker.board(), r"heap +manual .*수동 대기")
+        self.assertRegex(checker.board(), r"heap +직접 확인 .*수동 대기")
         self.append_rollout(chal, {"type": "task_started"})  # the user typed into the window
         checker.tick()
         self.assertEqual(self.status("heap")["state"], "solving")
@@ -623,7 +623,7 @@ class CheckerFlowTests(Base):
         self.assertNotIn(native.window_name("heap"), checker.tmux.windows())
         checker.tick()  # a held challenge is not reopened automatically
         self.assertNotIn(native.window_name("heap"), checker.tmux.windows())
-        self.assertRegex(checker.board(), r"heap +hold .*보류 \(r로 재개\)")
+        self.assertRegex(checker.board(), r"heap +보류 .*보류 \(r로 재개\)")
         self.assertIn("풀이 창을 다시 열었습니다", checker.act("restart", "heap"))
         self.assertEqual(self.status("heap")["state"], "solving")
 
@@ -695,7 +695,8 @@ class CheckerFlowTests(Base):
         checker.tick()
         self.assertEqual(self.status("rev")["state"], "solving")
         self.assertEqual(self.status("dfir")["state"], "pending")
-        self.assertIn(native.FILES_WAIT, checker.board())
+        self.assertIn("첨부 재시도 대기 (1회 실패)", checker.board())
+        self.assertNotIn(native.FILES_WAIT, checker.board())  # the activity already says it
         self.assertNotIn("__download_dfir__", checker.jobs)  # a failed one waits before the next try
         for _ in range(native.DOWNLOAD_TRIES - 1):
             checker.job_download(self.root / "challenges" / "dfir")
@@ -743,7 +744,7 @@ class CheckerFlowTests(Base):
     def test_board_counts_solved_challenges(self):
         for slug, state in (("a", "accepted"), ("b", "site_solved"), ("c", "solving")):
             native.save_status(make_challenge(self.root, slug), {"state": state})
-        self.assertIn("푼 문제 2/3", self.checker().view()[0][0])
+        self.assertIn("✓ 푼 문제 2/3", self.checker().view()[0][1])
 
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")
@@ -848,7 +849,7 @@ class CheckerFlowTests(Base):
                     await pilot.pause(0.1)
                     if table.row_count == 2:
                         break
-                self.assertEqual([table.get_row_at(i)[0].plain for i in range(2)], ["zzz", "aaa"])
+                self.assertEqual([table.get_row_at(i)[1].plain for i in range(2)], ["zzz", "aaa"])
                 self.assertIn("직접 확인 필요 (manual 1개): zzz", str(app.query_one("#head").render()))
                 await pilot.press("o")
                 self.assertIsInstance(app.screen, NotesScreen)

@@ -64,6 +64,7 @@ class CheckerApp(App):
     CSS = """
     #head { height: auto; padding: 0 1; }
     DataTable { height: 1fr; }
+    #detail { height: auto; max-height: 6; padding: 0 1; border-top: solid $accent; }
     """
     BINDINGS = [
         Binding("enter", "jump", "창으로 이동", priority=True),
@@ -87,10 +88,11 @@ class CheckerApp(App):
     def compose(self) -> ComposeResult:
         yield Static(id="head")
         yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+        yield Static(id="detail")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("문제", "상태", "토큰", "활동", "메모")
+        self.query_one(DataTable).add_columns("", "문제", "분류", "상태", "토큰", "활동", "메모")
         threading.Thread(target=self.loop, name="checker", daemon=True).start()
 
     def on_unmount(self) -> None:
@@ -115,8 +117,9 @@ class CheckerApp(App):
     def show(self, view: tuple[list[str], list[dict]], error: str | None = None) -> None:
         head, rows = view
         text = Text()
-        for line in head:
-            style = "bold red" if line.startswith("!!") else "bold yellow" if line.startswith("직접 확인") else ""
+        for i, line in enumerate(head):
+            style = ("bold red" if line.startswith("!!") else "bold yellow" if line.startswith("직접 확인")
+                     else "bold" if i == 1 else "")
             text.append(line + "\n", style=style)
         if error:
             text.append(error + "\n", style="bold red")
@@ -125,14 +128,35 @@ class CheckerApp(App):
         table = self.query_one(DataTable)
         keep = self.selected()
         table.clear()
+        self.rows = {row["name"]: row for row in rows}
         for row in rows:
             style = STYLES.get(row["state"], "")
-            table.add_row(Text(row["name"], style=style), Text(row["state"], style=style),
-                          Text(row["tokens"], justify="right"),
-                          Text(row["activity"], style="dim" if "서버 대기" in row["activity"] else ""),
-                          Text(row["reason"]), key=row["name"])
-        if keep in {row["name"] for row in rows}:
+            finished = row["group"] == "✓"
+            table.add_row(Text(row["group"], style=style), Text(row["name"], style=style + (" dim" if finished else "")),
+                          Text(row["category"], style="dim"), Text(row["label"], style=style),
+                          Text(row["tokens"], justify="right", style="dim" if finished else ""),
+                          Text(row["activity"], style="dim" if finished or "서버 대기" in row["activity"] else ""),
+                          Text(row["reason"] if len(row["reason"]) <= 48 else row["reason"][:47] + "…",
+                               style="dim" if finished else ""), key=row["name"])
+        if keep in self.rows:
             table.move_cursor(row=table.get_row_index(keep))
+        self.show_detail()
+
+    def show_detail(self) -> None:
+        """Below the table: the selected challenge in full, since the table cuts long notes short."""
+        row = getattr(self, "rows", {}).get(self.selected() or "")
+        text = Text()
+        if row:
+            text.append(f"{row['name']}", style="bold")
+            text.append(f"  {row['category'] or '-'} · {row['label']} · 토큰 {row['tokens']}\n", style="dim")
+            if row["activity"]:
+                text.append(f"활동: {row['activity']}\n")
+            if row["reason"]:
+                text.append(f"메모: {row['reason']}")
+        self.query_one("#detail", Static).update(text)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self.show_detail()
 
     def selected(self) -> str | None:
         table = self.query_one(DataTable)
