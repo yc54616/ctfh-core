@@ -1415,7 +1415,8 @@ class Checker:
         alert = self.contest.state_dir / "needs_user.txt"
         count = lambda *states: sum(row["state"] in states for row in rows)
         solved = sum(row["group"] == "✓" for row in rows)
-        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 {total / 10000:,.0f}만"
+        spent = f"{total / 10000:,.0f}만" if total >= 10000 else f"{total:,}"
+        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 {spent}"
                 f"  동시 창 {self.opts.max_parallel or '전체'}",
                 f"✓ 푼 문제 {solved}/{len(rows)}   ● 풀이 {count('solving', 'needs_fix')}"
                 f"   ◐ 검사 {count('checking')}   ↑ 제출 {count('verified', 'submitting')}"
