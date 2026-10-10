@@ -209,6 +209,7 @@ rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it
    | `p` | hold: close the window, no automatic restart until `r` (a teammate is on it) |
    | `d` | mark solved (a teammate solved it) and close the window |
    | `s` | rescan the site now (default every 60 minutes on `gpt-6-luna`, low effort) |
+   | `t` | sort by the next column; clicking a header sorts by it, again reverses, a third time returns to the grouping |
    | `+` / `-` | change the window limit live (kept across checker restarts until `--max-parallel` changes); limited slots open the most-solved challenges first |
    | `q` | quit the checker; solver windows keep running |
 

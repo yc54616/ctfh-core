@@ -18,6 +18,16 @@ STYLES = {"manual": "bold yellow", "hold": "blue", "unknown": "bold red", "block
           "done": "green", "user_solved": "green", "site_solved": "green", "pending": "dim"}
 
 
+# Table columns: key, header, and how a header click sorts by it (None = the board's own grouping).
+COLUMNS = [("group", ""), ("name", "문제"), ("category", "분류"), ("label", "상태"), ("tokens", "토큰"),
+           ("activity", "활동"), ("reason", "메모")]
+SORT_KEYS = {"name": lambda row: row["name"], "category": lambda row: (row["category"], row["name"]),
+             "label": lambda row: (row["label"], row["name"]), "tokens": lambda row: row["tokens_n"],
+             "activity": lambda row: (row["activity"] == "", row["activity"]),
+             "reason": lambda row: (row["reason"] == "", row["reason"])}
+DESCENDING_FIRST = {"tokens"}  # the biggest spenders first
+
+
 class NotesScreen(ModalScreen):
     """Read-only view of one challenge's work/NOTES.md."""
 
@@ -74,6 +84,7 @@ class CheckerApp(App):
         Binding("d", "done", "해결 표시"),
         Binding("p", "hold", "보류"),
         Binding("s", "rescan", "지금 재스캔"),
+        Binding("t", "sort_next", "정렬"),
         Binding("plus,equals_sign", "parallel(1)", "창 +1"),
         Binding("minus", "parallel(-1)", "창 -1"),
         Binding("q", "quit", "검사기 종료"),
@@ -84,6 +95,7 @@ class CheckerApp(App):
         super().__init__()
         self.checker = checker
         self.stop, self.wake = threading.Event(), threading.Event()
+        self.sort: tuple[str, bool] | None = None  # (column, descending); None keeps the board's grouping
 
     def compose(self) -> ComposeResult:
         yield Static(id="head")
@@ -92,7 +104,7 @@ class CheckerApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns("", "문제", "분류", "상태", "토큰", "활동", "메모")
+        self.set_columns()
         threading.Thread(target=self.loop, name="checker", daemon=True).start()
 
     def on_unmount(self) -> None:
@@ -116,6 +128,8 @@ class CheckerApp(App):
 
     def show(self, view: tuple[list[str], list[dict]], error: str | None = None) -> None:
         head, rows = view
+        if self.sort:
+            rows = sorted(rows, key=SORT_KEYS[self.sort[0]], reverse=self.sort[1])
         text = Text()
         for i, line in enumerate(head):
             style = ("bold red" if line.startswith("!!") else "bold yellow" if line.startswith("직접 확인")
@@ -141,6 +155,39 @@ class CheckerApp(App):
         if keep in self.rows:
             table.move_cursor(row=table.get_row_index(keep))
         self.show_detail()
+
+    def set_columns(self) -> None:
+        """Headers with ▲/▼ on the sorted column; clicking a header sorts by it."""
+        table = self.query_one(DataTable)
+        table.clear(columns=True)
+        for key, title in COLUMNS:
+            arrow = (" ▼" if self.sort[1] else " ▲") if self.sort and self.sort[0] == key else ""
+            table.add_column(title + arrow, key=key)
+
+    def sort_by(self, column: str | None) -> None:
+        """Same column again flips the order, and a third time returns to the board's grouping."""
+        first = column in DESCENDING_FIRST
+        if column not in SORT_KEYS:
+            self.sort = None
+        elif not self.sort or self.sort[0] != column:
+            self.sort = (column, first)
+        elif self.sort[1] == first:
+            self.sort = (column, not first)
+        else:
+            self.sort = None
+        self.set_columns()
+        if getattr(self.checker, "last_view", None):
+            self.show(self.checker.last_view)
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        self.sort_by(event.column_key.value)
+
+    def action_sort_next(self) -> None:
+        """Keyboard: step through the columns, each in its first order, then back to the grouping."""
+        keys = list(SORT_KEYS)
+        current = keys.index(self.sort[0]) if self.sort else -1
+        self.sort = None
+        self.sort_by(keys[current + 1] if current + 1 < len(keys) else None)
 
     def show_detail(self) -> None:
         """Below the table: the selected challenge in full, since the table cuts long notes short."""

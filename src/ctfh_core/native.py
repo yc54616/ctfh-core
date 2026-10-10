@@ -1410,7 +1410,7 @@ class Checker:
             rows.append({"name": chal.name, "state": state, "group": BOARD_GROUPS.get(state, "●"),
                          "label": STATE_LABELS.get(state, state),
                          "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
-                         "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
+                         "tokens_n": tokens or 0, "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
                          "activity": "" if activity == "-" else activity, "reason": reason})
         group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
         rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name
@@ -1430,7 +1430,7 @@ class Checker:
         if limits:
             resets = limits["limits"]["resets"]
             head.append(("!! " if limits["limits"]["used"] >= USAGE_WARN else "")
-                        + f"Codex 주간 사용량 {limits['limits']['used']:.0f}%"
+                        + f"Codex 주간 남은 사용량 {max(0, 100 - limits['limits']['used']):.0f}%"
                         + (f" ({datetime.fromtimestamp(resets):%m/%d %H:%M} 초기화)" if resets else ""))
         if self.outage:
             head.append(f"!! 일시정지: {self.outage}. 재촉·재시작을 멈췄고, 풀리면 자동으로 이어 갑니다.")

@@ -590,7 +590,7 @@ class CheckerFlowTests(Base):
         status = self.status("heap")
         self.assertEqual(status["state"], "manual")
         self.assertIn("재촉 한도 3회", status["reason"])
-        self.assertIn("Codex 주간 사용량 42%", checker.board())
+        self.assertIn("Codex 주간 남은 사용량 58%", checker.board())
         self.assertNotIn("!! Codex", checker.board())
         self.assertRegex(checker.board(), r"heap +직접 확인 .*수동 대기")
         self.append_rollout(chal, {"type": "task_started"})  # the user typed into the window
@@ -827,6 +827,41 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("heap")["state"], "user_solved")
         self.assertNotIn(native.window_name("heap"), checker.tmux.windows())
         self.assertIn("이미 끝난", checker.act("done", "heap"))
+
+    def test_dashboard_sorts_by_a_clicked_header(self):
+        from rich.text import Text
+        from textual.widgets import DataTable
+        from ctfh_core.native_tui import CheckerApp
+        make_challenge(self.root, "aaa")
+        make_challenge(self.root, "zzz")
+        checker = self.checker()
+        head, rows = checker.view()
+        rows.reverse()  # as the board's grouping might put them
+        rows[1]["tokens_n"] = 50000
+
+        async def drive():
+            with patch.object(CheckerApp, "loop", lambda app: None):  # no ticks: only this view is shown
+                app = CheckerApp(checker)
+                async with app.run_test(size=(140, 30)) as pilot:
+                    table = app.query_one(DataTable)
+                    checker.last_view = (head, rows)
+                    app.show(checker.last_view)
+                    names = lambda: [table.get_row_at(i)[1].plain for i in range(table.row_count)]
+                    self.assertEqual(names(), ["zzz", "aaa"])
+                    await pilot.press("t")  # keyboard: name first
+                    self.assertEqual((names(), str(table.columns["name"].label)), (["aaa", "zzz"], "문제 ▲"))
+                    click = lambda: table.post_message(DataTable.HeaderSelected(table, table.columns["tokens"].key, 4, Text("토큰")))
+                    click()
+                    await pilot.pause(0.1)
+                    self.assertEqual((names(), str(table.columns["tokens"].label)), (["aaa", "zzz"], "토큰 ▼"))
+                    click()
+                    await pilot.pause(0.1)
+                    self.assertEqual((names(), str(table.columns["tokens"].label)), (["zzz", "aaa"], "토큰 ▲"))
+                    click()  # third click: back to the board's own order
+                    await pilot.pause(0.1)
+                    self.assertEqual((names(), app.sort, str(table.columns["tokens"].label)), (["zzz", "aaa"], None, "토큰"))
+
+        asyncio.run(drive())
 
     def test_dashboard_puts_manual_first_and_reopens_selected_row(self):
         from textual.widgets import DataTable
