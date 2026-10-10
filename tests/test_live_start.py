@@ -269,7 +269,8 @@ class StartFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_connection_failure_is_not_retried_with_another_engine(self):
         with tempfile.TemporaryDirectory() as temp:
-            with patch("ctfh_core.live_start.shutil.which", return_value="/fixture/command"):
+            with patch("ctfh_core.live_start.shutil.which", return_value="/fixture/command"), \
+                    patch("ctfh_core.live_start.open_contest_browser"):  # never the user's real Chrome
                 with patch("ctfh_core.live_start.run_live_contest", new_callable=AsyncMock) as run:
                     run.side_effect = AgentRunError("fixture failed", kind="connection_failed")
                     with contextlib.redirect_stdout(io.StringIO()):
