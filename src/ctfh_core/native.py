@@ -629,8 +629,9 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
 {browser_rules(session)}
 1. challenges/{slug}/challenge.json의 attachments를 challenges/{slug}/files/에 내려받는다 (압축은 풀지 않는다).
    다른 문제의 첨부는 다른 작업이 받고 있으니 이 문제만 다룬다.
-2. 끝까지 다 받았으면 (크기가 사이트에 보인 크기와 맞는지 확인) challenges/{slug}/files/{FILES_DONE} 빈 파일을 만든다.
-   검사기는 이 파일을 보는 즉시 풀이를 시작한다. 덜 받은 파일이 있으면 만들지 마라.
+2. 다 받았으면 challenges/{slug}/files/{FILES_DONE} 빈 파일을 만든다. 검사기는 이 파일을 보는 즉시 풀이를 시작한다.
+   사이트나 challenge.json에 크기가 있으면 맞는지 대조한다. 크기가 없으면 다운로드가 오류 없이 끝났고 파일이 비어 있지
+   않을 때 다 받은 것으로 본다 (크기를 확인할 수 없다는 이유로 멈추지 마라). 덜 받았거나 빈 파일이면 만들지 마라.
 3. 받지 못했으면 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고
    failed로 적고 끝낸다.
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
