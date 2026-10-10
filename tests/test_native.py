@@ -665,6 +665,30 @@ class CheckerFlowTests(Base):
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         self.assertEqual(len(runs.read_text().split()), 5)  # a checker that cannot start stops retrying
 
+    def test_drive_files_come_in_resumed_parts_without_codex(self):
+        chal = make_challenge(self.root, "art")
+        (chal / "challenge.json").write_text(json.dumps({"name": "art", "attachments": [
+            {"name": "file download", "url": "https://drive.google.com/file/d/1iW2iseW82LOwZC4Iw_vy2_qfrCMgcGHK/view", "size": None}]}))
+        data, calls = bytes(range(256)) * 40, []
+        def curl(args, out=None, timeout=1800):
+            calls.append(args)
+            if "-D" in args:
+                return subprocess.CompletedProcess(args, 0, f'content-range: bytes 0-0/{len(data)}\r\n'
+                                                         f'content-disposition: attachment; filename="data.mp4"\r\n'.encode())
+            start, end = map(int, args[args.index("-r") + 1].split("-"))
+            cut = len([a for a in calls if a[1:2] == args[1:2]]) == 1 and end - start > 10  # every first try breaks
+            out.write(data[start:(start + (end - start) // 2) if cut else end + 1])
+            return subprocess.CompletedProcess(args, 18 if cut else 0)
+        runner = FakeRunner()
+        checker = self.checker(runner=runner)
+        with patch.object(native, "_curl", side_effect=curl), patch.object(native, "DRIVE_CHUNK", 3000):
+            checker.job_download(chal)
+        self.assertEqual((chal / "files" / "data.mp4").read_bytes(), data)
+        self.assertEqual(sorted(p.name for p in (chal / "files").iterdir()), [native.FILES_DONE, "data.mp4"])
+        self.assertIn("id=1iW2iseW82LOwZC4Iw_vy2_qfrCMgcGHK&export=download&confirm=t", calls[0][-1])
+        self.assertEqual(runner.calls, [])  # no Codex run for a Drive-only challenge
+        self.assertNotIn("download_tries", self.status("art"))
+
     def test_a_series_sharing_one_image_downloads_it_once(self):
         for slug in ("pc-0", "pc-1"):
             chal = make_challenge(self.root, slug)

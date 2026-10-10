@@ -28,7 +28,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 
 from .live_config import codex_environment
 
@@ -637,13 +637,65 @@ def close_browser(session: str) -> None:
         pass
 
 
-def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json) -> dict:
+DRIVE_FILE = re.compile(r"drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:\S*?&)?id=)([\w-]{20,})")
+DRIVE_CHUNK = 128 << 20
+DRIVE_CONNECTIONS = 16
+
+
+def _curl(args: list[str], out=None, timeout: int = 1800) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["curl", "-fsSL", *args], stdout=out if out is not None else subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 28, b"")
+
+
+def drive_fetch(url: str, folder: Path) -> str:
+    """A public Google Drive file from its direct download URL, in ranges over several connections: the browser
+    only gets the virus-scan page for a big file, and one connection crawls on a lossy link. Parts left by an
+    interrupted run are resumed. Returns the saved file name."""
+    direct = f"https://drive.usercontent.google.com/download?id={DRIVE_FILE.search(url).group(1)}&export=download&confirm=t"
+    head = (_curl(["-r", "0-0", "-o", "/dev/null", "-D", "-", direct], timeout=60).stdout or b"").decode("utf-8", "replace")
+    total = re.search(r"content-range:\s*bytes 0-0/(\d+)", head, re.I)
+    name = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";\r\n]+)", head, re.I)
+    if not total or not name or not Path(unquote(name.group(1))).name.strip("."):
+        raise RuntimeError("Google Drive가 파일 대신 다른 응답을 줌 (공개 링크가 아니거나 막힘)")
+    total, name = int(total.group(1)), Path(unquote(name.group(1))).name
+    parts = folder / f".{name}.parts"
+    parts.mkdir(parents=True, exist_ok=True)
+
+    def part(start: int) -> None:
+        end, path = min(start + DRIVE_CHUNK, total) - 1, parts / f"{start:015d}"
+        for _ in range(50):
+            have = path.stat().st_size if path.exists() else 0
+            if have >= end - start + 1:
+                return
+            with path.open("ab") as out:
+                _curl(["-r", f"{start + have}-{end}", direct], out=out)
+            if (path.stat().st_size if path.exists() else 0) == have:
+                time.sleep(5)  # no progress: the link is down for a moment
+        raise RuntimeError(f"{name}의 {start}바이트부터 50번 이어받기 실패")
+
+    with cf.ThreadPoolExecutor(DRIVE_CONNECTIONS) as pool:
+        list(pool.map(part, range(0, total, DRIVE_CHUNK)))
+    with (folder / name).open("wb") as out:
+        for path in sorted(parts.iterdir()):
+            with path.open("rb") as chunk:
+                shutil.copyfileobj(chunk, out)
+    if (folder / name).stat().st_size != total:
+        raise RuntimeError(f"{name} 크기가 {total}바이트와 다름")
+    shutil.rmtree(parts)
+    return name
+
+
+def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json, fetched=()) -> dict:
     slug = chal.name
+    already = f"\n   검사기가 이미 받은 파일이니 다시 받지 마라: {', '.join(fetched)}" if fetched else ""
     prompt = f"""너는 CTF 대회의 첨부 파일 다운로드 담당이다. 대상: {contest.url}
 문제를 풀지 마라. 현재 폴더가 대회 폴더다. 사용자의 로그인된 Chrome을 쓴다.
 {browser_rules(session)}
 1. challenges/{slug}/challenge.json의 attachments를 challenges/{slug}/files/에 내려받는다 (압축은 풀지 않는다).
-   다른 문제의 첨부는 다른 작업이 받고 있으니 이 문제만 다룬다.
+   다른 문제의 첨부는 다른 작업이 받고 있으니 이 문제만 다룬다.{already}
    Google Drive 링크(drive.google.com/file/d/<ID>/...)는 브라우저로 받지 마라 (큰 파일은 경고 페이지만 받아진다).
    `curl -fL --retry 5 -C - -o <저장 경로> 'https://drive.usercontent.google.com/download?id=<ID>&export=download&confirm=t'`로
    받고, `curl -sL -r 0-0 -o /dev/null -D - '<같은 URL>'`의 content-range `/` 뒤 숫자(전체 크기)와 받은 크기를 대조한다.
@@ -1137,9 +1189,22 @@ class Checker:
         """Fetch one challenge's attachments in its own Chrome session; it starts as soon as they are in."""
         opts = replace(self.opts, model=self.opts.rescan_model or self.opts.model,
                        effort=self.opts.rescan_effort or self.opts.effort)
-        session, result = f"ctfh-download-{chal.name}", {}
+        session, result, fetched = f"ctfh-download-{chal.name}", {}, []
         try:
-            result = download(self.contest, opts, chal, session, self.runner)
+            info = _read_json(chal / "challenge.json", {})
+            attachments = [item for item in (info.get("attachments") or []) if isinstance(item, dict)]
+            drive = [item for item in attachments if DRIVE_FILE.search(str(item.get("url", "")))]
+            for item in drive:  # the checker fetches these itself; no browser needed
+                try:
+                    fetched.append(drive_fetch(str(item["url"]), chal / "files"))
+                except (OSError, RuntimeError) as exc:
+                    result = {"downloaded": [], "failed": [{"slug": chal.name, "reason": f"Google Drive: {exc}"}]}
+                    return
+            if drive and len(fetched) == len(attachments):
+                (chal / "files" / FILES_DONE).touch()
+                result = {"downloaded": [chal.name], "failed": []}
+                return
+            result = download(self.contest, opts, chal, session, self.runner, fetched)
         finally:  # a crashed or timed-out run counts as a try too
             close_browser(session)
             self.count_download_try(chal, result)
