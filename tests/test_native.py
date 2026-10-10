@@ -602,6 +602,61 @@ class CheckerFlowTests(Base):
         self.assertIn("풀이 창을 다시 열었습니다", checker.act("restart", "heap"))
         self.assertEqual(self.status("heap")["state"], "solving")
 
+    def test_remote_flag_that_changes_per_run_is_replaced(self):
+        chal = make_challenge(self.root, "pwn")
+        (chal / "remote.txt").write_text("nc host 1337\n")
+        (chal / "solve.py").write_text('print("FLAG{" + "n3w_1nstanc3" + "}")\n')
+        (chal / "flag.txt").write_text("FLAG{0ld_1nstanc3}\n")
+        result = native.verify_flag(chal, r"FLAG\{[^}]+\}", 30)
+        self.assertTrue(result.ok and result.rewritten)
+        self.assertEqual((chal / "flag.txt").read_text().strip(), "FLAG{n3w_1nstanc3}")
+        self.assertNotIn("n3w_1nstanc3", (chal / ".ctfh-check" / "rerun.log").read_text())
+        (chal / "remote.txt").write_text("")  # a local challenge must reproduce exactly
+        (chal / "flag.txt").write_text("FLAG{0ld_1nstanc3}\n")
+        self.assertFalse(native.verify_flag(chal, r"FLAG\{[^}]+\}", 30).ok)
+        (chal / "solve.py").write_text('print("<FLAG>")\n')
+        self.assertFalse(native.verify_flag(chal, "", 30).ok)
+
+    def test_rerun_against_a_closed_instance_waits_for_the_server(self):
+        chal = make_challenge(self.root, "pwn")
+        (chal / "remote.txt").write_text("nc host 1337\n")
+        write_solution(chal, reproduce=False)
+        checker = self.checker()
+        with patch.object(checker, "remote_state", return_value=("down", ["host:1337"])):
+            checker.job_check(chal, (chal / "flag.txt").stat().st_mtime_ns)
+        status = self.status("pwn")
+        self.assertTrue(status.get("remote_down"))
+        self.assertTrue(status["reason"].startswith(native.REMOTE_DOWN_REASON))
+
+    def test_crashed_checker_comes_back_but_q_ends_it(self):
+        import subprocess
+        runs = Path(self.temp.name) / "runs"
+        script = f'echo x >> {runs}; [ $(wc -l < {runs}) -ge 2 ]'  # crash once, then quit normally
+        subprocess.run(native.restart_loop(["sh", "-c", script], delay=0), stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30)
+        self.assertEqual(len(runs.read_text().split()), 2)
+        runs.unlink()
+        subprocess.run(native.restart_loop(["sh", "-c", f"echo x >> {runs}; exit 3"], delay=0),
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(len(runs.read_text().split()), 5)  # a checker that cannot start stops retrying
+
+    def test_skipped_category_is_held_and_report_counts_every_session(self):
+        chal = make_challenge(self.root, "geo")
+        (chal / "challenge.json").write_text(json.dumps({"name": "geo", "category": "OSINT", "points": 100}))
+        make_challenge(self.root, "heap")
+        checker = self.checker(skip_categories=("osint",))
+        checker.tick()
+        self.assertEqual(self.status("geo")["state"], "hold")
+        self.assertEqual(self.status("heap")["state"], "solving")
+        self.assertIn("--skip-category", checker.opts.to_args())
+        checker.spent = {"heap": {"a.jsonl": 1000, "b.jsonl": 500}}
+        checker.write_report()
+        report = (self.root / ".ctfh" / "report.md").read_text()
+        self.assertIn("| OSINT | 1 | 0 | 0 | - |", report)
+        self.assertIn("| heap | - | - | solving | 1,500 |", report)
+        checker.act("restart", "geo")
+        self.assertEqual(self.status("geo")["state"], "solving")
+
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")

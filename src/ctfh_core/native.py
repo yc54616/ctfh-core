@@ -54,6 +54,7 @@ class Options:
     effort: str | None = None
     rescan_model: str | None = RESCAN_MODEL  # periodic rescans only re-read the list; None: same as model
     rescan_effort: str | None = "low"  # None: same as effort
+    skip_categories: tuple[str, ...] = ()  # lowercase parts of category names left on hold
     submit_effort: str | None = "low"  # submitting is a few clicks; None: same as effort
     review_effort: str | None = "medium"  # writeup review; None: same as effort
     max_parallel: int = 0  # 0: every unsolved challenge at once
@@ -71,6 +72,8 @@ class Options:
                 "--rescan-minutes", str(self.rescan_seconds // 60),
                 "--idle-seconds", str(self.idle_seconds), "--nudge-limit", str(self.nudge_limit),
                 "--solve-timeout", str(self.solve_timeout), "--memory-max", self.memory_max]
+        if self.skip_categories:
+            args += ["--skip-category", ",".join(self.skip_categories)]
         if self.model:
             args += ["--model", self.model]
         if self.effort:
@@ -189,6 +192,7 @@ SOLVED_POLL_SECONDS = 60
 USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
 OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
+REPORT_SECONDS = 600  # .ctfh/report.md refresh
 OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
 OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
                             r"network error|connection (?:refused|reset)", re.I)
@@ -320,6 +324,8 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 ## 산출물 (검사기는 이 파일들만 본다)
 - `solve.py`: 이 폴더에서 `python3 solve.py`로 처음부터 다시 실행해도 flag를 얻어 출력하는 스크립트.
   flag 문자열을 코드에 직접 쓰지 않는다. 원격 문제면 원격에 접속해서 얻는다.
+  확률에 기대는 익스플로잇(ASLR 브루트포스 등)은 solve.py 안에서 성공할 때까지 다시 시도한다.
+  검사기는 solve.py를 한 번만 실행한다.
 - `flag.txt`: flag 한 줄. solve.py로 실제 flag를 확인한 뒤에만 쓴다. 추측한 값은 쓰지 않는다.
 - `writeup.md`: 한국어 풀이. 요약 / 취약점 / 풀이 단계 / solve.py 설명 / 막혔던 점.
 - `work/`: 작업 공간. 진행 상황을 `work/NOTES.md`에 계속 적는다. 세션이 다시 시작되면 이것을 읽고 이어 간다.
@@ -623,6 +629,8 @@ class CheckResult:
     ok: bool
     reason: str
     flag_sha256: str = ""
+    rerun: bool = False  # failed while re-running solve.py (the remote may have closed)
+    rewritten: bool = False  # flag.txt now holds the newer remote flag from the rerun
 
 
 def flag_hash(flag: str) -> str:
@@ -642,13 +650,16 @@ def run_solve(chal: Path, timeout: int) -> tuple[int | None, str]:
         return None, output or ""
 
 
+def _has_remote(chal: Path) -> bool:
+    try:
+        return bool((chal / "remote.txt").read_text().strip())
+    except OSError:
+        return False
+
+
 def fake_flag_reason(chal: Path, flag: str) -> str | None:
     """Why a remote challenge's flag looks like the local test one, which the server would reject as wrong."""
-    try:
-        remote = bool((chal / "remote.txt").read_text().strip())
-    except OSError:
-        remote = False
-    if not remote:  # file-only challenges: the real flag may well sit in the handed-out files
+    if not _has_remote(chal):  # file-only challenges: the real flag may well sit in the handed-out files
         return None
     if FAKE_FLAG_PATTERN.search(flag):
         return "flag가 로컬 테스트용 가짜 값으로 보입니다 (fake/dummy 등). 원격 서버에서 실제 flag를 받아 와라."
@@ -702,13 +713,22 @@ def verify_flag(chal: Path, flag_regex: str, timeout: int) -> CheckResult:
     if flag in solve.read_text(errors="replace"):
         return CheckResult(False, "solve.py에 flag 문자열이 그대로 들어 있습니다. 계산하거나 받아 와야 합니다.", digest)
     code, output = run_solve(chal, timeout)
-    check_dir = chal / ".ctfh-check"
-    _write_atomic(check_dir / "rerun.log", f"# exit={code}\n" + output.replace(flag, "<FLAG>"))
+    fresh, reproduced = None, flag in output
+    if code is not None and not reproduced and flag_regex and _has_remote(chal):
+        # Some remotes mint a new flag per instance or connection: the newest one is the one to submit.
+        found = [match.group(0) for match in re.finditer(flag_regex, output)]
+        fresh = next((other for other in reversed(found) if not fake_flag_reason(chal, other)), None)
+    output = output.replace(flag, "<FLAG>").replace(fresh or flag, "<FLAG>")
+    _write_atomic(chal / ".ctfh-check" / "rerun.log", f"# exit={code}\n" + output)
     if code is None:
-        return CheckResult(False, f"solve.py가 {timeout}초 안에 끝나지 않았습니다.", digest)
-    if flag not in output:
-        tail = output.replace(flag, "<FLAG>")[-400:].strip()
-        return CheckResult(False, f"solve.py를 다시 실행했지만 같은 flag가 나오지 않았습니다 (exit={code}). 출력 끝: {tail}", digest)
+        return CheckResult(False, f"solve.py가 {timeout}초 안에 끝나지 않았습니다.", digest, rerun=True)
+    if fresh:
+        _write_atomic(chal / "flag.txt", fresh + "\n")
+        return CheckResult(True, "원격 flag가 실행마다 바뀌는 문제라 방금 다시 받은 flag로 바꿨습니다.",
+                           flag_hash(fresh), rewritten=True)
+    if not reproduced:
+        return CheckResult(False, f"solve.py를 다시 실행했지만 같은 flag가 나오지 않았습니다 (exit={code}). "
+                                  f"출력 끝: {output[-400:].strip()}", digest, rerun=True)
     return CheckResult(True, "solve.py 재실행으로 같은 flag를 재현했습니다.", digest)
 
 
@@ -878,13 +898,14 @@ class Checker:
         self.last_scan = time.time()
         self.rollouts: dict[str, Path] = {}
         self.tokens: dict[str, int | None] = {}
+        self.spent: dict[str, dict[str, int]] = {}
         self.activity: dict[str, dict] = {}
         self.probes: dict[tuple[str, int], tuple[float, str]] = {}
         self.solved_probe = site_solved
         self.last_solved_poll = 0.0
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
         self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
-        self.last_outage_check = self.last_probe = 0.0
+        self.last_outage_check = self.last_probe = self.last_report = 0.0
         saved = _read_json(contest.state_dir / "checker.json", {})
         saved = saved if isinstance(saved, dict) else {}
         limit, self.base_parallel = saved.get("max_parallel") or {}, opts.max_parallel
@@ -920,6 +941,8 @@ class Checker:
     # -- heavy jobs (run in the pool)
     def job_check(self, chal: Path, mtime: int, solve_mtime: int = 0) -> None:
         result = verify_flag(chal, self.contest.flag_regex(), self.opts.solve_timeout)
+        if result.rewritten:  # our own rewrite is not a new answer to check again
+            mtime = (chal / "flag.txt").stat().st_mtime_ns
         status = load_status(chal)
         status.update(flag_mtime_ns=mtime, solve_mtime_ns=solve_mtime, flag_sha256=result.flag_sha256,
                       reason=result.reason)
@@ -931,6 +954,9 @@ class Checker:
             save_status(chal, status)
             return
         status.update(state="verified" if result.ok else "needs_fix", reason=result.reason)
+        if result.rerun and (remote := self.remote_state(chal))[0] == "down":
+            self.wait_remote(chal, status, remote[1])  # the instance closed under the rerun, not a wrong solve
+            return
         save_status(chal, status)
         if not result.ok:
             self.tell(chal, f"flag 검증 실패: {result.reason} status.json을 보고 고쳐라. "
@@ -1081,6 +1107,15 @@ class Checker:
                 return state, hits
         return "unknown", []
 
+    def wait_remote(self, chal: Path, status: dict, endpoints: list[str]) -> None:
+        status.update(remote_down=time.time(), nudged_ts=time.time(),
+                      reason=f"{REMOTE_DOWN_REASON}: {', '.join(endpoints)}")
+        save_status(chal, status)
+        self.tell(chal, f"서버가 닫혀 있다 ({', '.join(endpoints)}). 원격 재시도는 멈추고 기다려라. "
+                        "로컬에서 할 일이 남았으면 마치고 work/NOTES.md에 적어라. 인스턴스를 켜야 하는 "
+                        "문제면 사이트에서 이 문제의 인스턴스를 다시 켜고 remote.txt를 고쳐라. "
+                        "서버가 열리면 검사기가 알려 준다.")
+
     def watch_remote(self, chal: Path, status: dict) -> None:
         """While the service is down stay quiet; wake the solver as soon as it answers again."""
         state, endpoints = self.remote_state(chal)
@@ -1110,6 +1145,8 @@ class Checker:
         self.rollouts[chal.name] = path
         info = rollout_info(path)
         self.tokens[chal.name] = info["tokens"]
+        if info["tokens"]:  # every session's total, so a restarted solver still counts in the report
+            self.spent.setdefault(chal.name, {})[str(path)] = info["tokens"]
         self.activity[chal.name] = info
         return info
 
@@ -1160,13 +1197,7 @@ class Checker:
         if status.get("state") != "accepted":
             remote, endpoints = self.remote_state(chal)
             if remote == "down":  # nudging only burns tokens against a closed server
-                status.update(remote_down=time.time(), nudged_ts=time.time(),
-                              reason=f"{REMOTE_DOWN_REASON}: {', '.join(endpoints)}")
-                save_status(chal, status)
-                self.tell(chal, f"서버가 닫혀 있다 ({', '.join(endpoints)}). 원격 재시도는 멈추고 기다려라. "
-                                "로컬에서 할 일이 남았으면 마치고 work/NOTES.md에 적어라. 인스턴스를 켜야 하는 "
-                                "문제면 사이트에서 이 문제의 인스턴스를 다시 켜고 remote.txt를 고쳐라. "
-                                "서버가 열리면 검사기가 알려 준다.")
+                self.wait_remote(chal, status, endpoints)
                 return
         if status.get("state") != "accepted":
             stop = self.auto_stop(chal, status)
@@ -1208,6 +1239,11 @@ class Checker:
             return f"진전 없음: 재촉 {STALL_NUDGES}번 동안 NOTES.md 그대로, 직접 확인 필요"
         return None
 
+    def skipped(self, chal: Path) -> str:
+        info = _read_json(chal / "challenge.json", {})
+        category = str(info.get("category") or "") if isinstance(info, dict) else ""
+        return category if any(part in category.lower() for part in self.opts.skip_categories) else ""
+
     def fill_slots(self, windows: set[str]) -> None:
         """Start pending solvers and restart exited ones, up to max_parallel windows (0: no limit)."""
         challenges = self.contest.challenges()
@@ -1218,6 +1254,10 @@ class Checker:
                 continue
             status = load_status(chal)
             state = status.get("state")
+            if state == "pending" and (category := self.skipped(chal)):
+                status.update(state="hold", reason=f"건너뛰는 분야 ({category}): r로 시작")
+                save_status(chal, status)
+                continue
             if state == "pending" or (state == "blocked" and status.get("blocked_by")
                                       != f"{self.opts.binary}:{self.opts.model or '-'}"):
                 fresh.append((chal, status))
@@ -1401,6 +1441,34 @@ class Checker:
             self.close(chal)
             status.update(state="hold", reason="대회 종료: 자동 풀이를 멈춤 (r로 계속).")
             save_status(chal, status)
+        self.write_report()
+
+    def write_report(self) -> None:
+        """Tokens and outcome per challenge and category, to pick which categories pay off next time."""
+        self.last_report = time.time()
+        path = self.contest.state_dir / "tokens.json"
+        spent = _read_json(path, {})
+        spent = spent if isinstance(spent, dict) else {}
+        for name, sessions in self.spent.items():
+            spent[name] = {**(spent.get(name) if isinstance(spent.get(name), dict) else {}), **sessions}
+        _write_atomic(path, json.dumps(spent) + "\n")
+        rows, groups = [], {}
+        for chal in self.contest.challenges():
+            info = _read_json(chal / "challenge.json", {})
+            info = info if isinstance(info, dict) else {}
+            category, state = str(info.get("category") or "-"), load_status(chal).get("state", "-")
+            sessions = spent.get(chal.name)
+            tokens = sum(v for v in sessions.values() if isinstance(v, int)) if isinstance(sessions, dict) else 0
+            rows.append(f"| {chal.name} | {category} | {info.get('points') or '-'} | {state} | {tokens:,} |")
+            group = groups.setdefault(category, [0, 0, 0])
+            group[0], group[1], group[2] = group[0] + 1, group[1] + (state in FINISHED), group[2] + tokens
+        summary = [f"| {category} | {count} | {solved} | {tokens:,} | {f'{tokens // solved:,}' if solved else '-'} |"
+                   for category, (count, solved, tokens) in sorted(groups.items(), key=lambda item: -item[1][2])]
+        _write_atomic(self.contest.state_dir / "report.md", "\n".join([
+            f"# {self.contest.url} ({datetime.now():%Y-%m-%d %H:%M})", "",
+            "풀이 창 토큰만 셉니다 (수집·제출·검토 제외).", "", "## 분야별", "",
+            "| 분야 | 문제 | 푼 문제 | 토큰 | 푼 문제당 토큰 |", "|---|---|---|---|---|", *summary, "",
+            "## 문제별", "", "| 문제 | 분야 | 점수 | 상태 | 토큰 |", "|---|---|---|---|---|", *rows]) + "\n")
 
     def save_state(self) -> None:
         """What the checker must remember across restarts; a new --max-parallel replaces the live limit."""
@@ -1447,6 +1515,8 @@ class Checker:
             self.end_handled = ends.isoformat()
             self.save_state()
             self.stop_for_end()
+        if time.time() - self.last_report >= REPORT_SECONDS:
+            self.write_report()
         for key, future in list(self.jobs.items()):
             if not future.done():
                 continue
@@ -1528,6 +1598,16 @@ def secret_fill(root: Path, field: str, ref: str, session: str) -> None:
 
 # ---------------------------------------------------------------- entry points
 
+def restart_loop(argv: list[str], delay: int = 5) -> list[str]:
+    """Run argv again after a crash; q or Ctrl-C (exit 0/130) ends it, and so does crashing 5 times in a row."""
+    loop = ('fails=0; while :; do start=$(date +%s); "$@"; code=$?; case $code in 0|130) exit 0;; esac; '
+            'if [ $(( $(date +%s) - start )) -lt 60 ]; then fails=$((fails + 1)); else fails=1; fi; '
+            'if [ $fails -ge 5 ]; then echo "검사기가 계속 바로 멈춥니다 (exit $code). 위 오류를 확인하세요. '
+            'Enter로 창을 닫습니다."; read -r _; exit $code; fi; '
+            f'echo "검사기가 멈췄습니다 (exit $code). {delay}초 뒤 다시 켭니다 (Ctrl-C로 중단)."; sleep {delay}; done')
+    return ["sh", "-c", loop, "sh", *argv]
+
+
 def self_command(*args: str) -> list[str]:
     src = Path(__file__).resolve().parents[1]
     return ["env", f"PYTHONPATH={src}", sys.executable, "-m", "ctfh_core.cli", *args]
@@ -1587,9 +1667,9 @@ def go(site: str | None, directory: str | None, opts: Options, attach: bool = Tr
                 print(f"Chrome에서 {url} 에 로그인한 뒤 다시 실행하세요.")
                 return 3
             input(f"Chrome에서 {url} 에 로그인한 뒤 Enter를 누르세요 (2FA·캡차 포함)... ")
-        tmux.new_session("checker", root, self_command("checker", str(root), *opts.to_args()))
+        tmux.new_session("checker", root, restart_loop(self_command("checker", str(root), *opts.to_args())))
     elif "checker" not in tmux.windows():  # checker stopped (Ctrl-C): restart it with these options
-        tmux.new_window("checker", root, self_command("checker", str(root), *opts.to_args()))
+        tmux.new_window("checker", root, restart_loop(self_command("checker", str(root), *opts.to_args())))
     print(f"tmux 세션: {tmux.session}  (붙기: tmux attach -t {tmux.session})")
     if attach and sys.stdin.isatty() and sys.stdout.isatty():
         verb = "switch-client" if os.environ.get("TMUX") else "attach"
