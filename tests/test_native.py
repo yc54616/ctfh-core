@@ -674,6 +674,23 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("dfir")["state"], "solving")  # gave up waiting, starts with what arrived
         self.assertTrue(self.status("dfir")["files_failed"])
 
+    def test_board_tells_downloading_from_queued_attachments(self):
+        for slug in ("rev", "dfir", "web"):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({"name": slug, "attachments": [] if slug == "web" else [
+                {"name": "a", "url": "https://x/a", "size": None}]}))
+        (self.root / "challenges" / "rev" / "files" / "rev.bin").write_bytes(b"x" * 3000)
+        checker = self.checker(max_parallel=1)
+        checker.jobs["__download__"] = cf.Future()  # still running
+        checker.download_order = ["rev", "dfir"]
+        text = lambda slug: checker.activity_text(self.root / "challenges" / slug, self.status(slug) or {"state": "pending"}, set())
+        self.assertEqual(text("rev"), "첨부 받는 중 (2.9KB)")
+        self.assertEqual(text("dfir"), "첨부 차례 대기 (1개 뒤)")
+        self.assertEqual(text("web"), "시작 대기")
+        checker.jobs.pop("__download__")
+        native.save_status(self.root / "challenges" / "dfir", {"state": "pending", "download_tries": 1})
+        self.assertEqual(text("dfir"), "첨부 재시도 대기 (1회 실패)")
+
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")

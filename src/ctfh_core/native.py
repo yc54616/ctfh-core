@@ -609,6 +609,14 @@ def _download_size(chal: Path) -> float:
     return total
 
 
+def _size_text(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return ""
+
+
 def download(contest: Contest, opts: Options, chals: list[Path], runner=run_codex_json, show=None) -> dict:
     order = ", ".join(chal.name for chal in sorted(chals, key=_download_size))
     prompt = f"""너는 CTF 대회의 첨부 파일 다운로드 담당이다. 대상: {contest.url}
@@ -1080,6 +1088,7 @@ class Checker:
         """Fetch attachments in the background; each challenge starts as soon as its own files are in."""
         opts = replace(self.opts, model=self.opts.rescan_model or self.opts.model,
                        effort=self.opts.rescan_effort or self.opts.effort)
+        self.download_order = [chal.name for chal in sorted(chals, key=_download_size)]  # the order download() asks for
         result = {}
         try:
             result = download(self.contest, opts, chals, self.runner,
@@ -1224,9 +1233,26 @@ class Checker:
         self.activity[chal.name] = info
         return info
 
+    def files_text(self, chal: Path, status: dict) -> str:
+        """Board column for a challenge still waiting for its attachments."""
+        files = chal / "files"
+        got = sum(f.stat().st_size for f in files.rglob("*") if f.is_file()) if files.is_dir() else 0
+        job = self.jobs.get("__download__")
+        if job is not None and not job.done():
+            queue = [name for name in getattr(self, "download_order", [])
+                     if not files_ready(self.contest.challenges_dir / name, load_status(self.contest.challenges_dir / name))]
+            if queue[:1] == [chal.name]:  # downloads go one challenge at a time, in this order
+                return "첨부 받는 중" + (f" ({_size_text(got)})" if got else "")
+            if chal.name in queue:
+                return f"첨부 차례 대기 ({queue.index(chal.name)}개 뒤)"
+        tries = status.get("download_tries", 0)
+        return f"첨부 재시도 대기 ({tries}회 실패)" if tries else "첨부 대기"
+
     def activity_text(self, chal: Path, status: dict, windows: set[str]) -> str:
         """Board column: is this solver working, stalled, out of nudges, or gone?"""
         state = status.get("state")
+        if state == "pending" and window_name(chal.name) not in windows:
+            return "시작 대기" if files_ready(chal, status) else self.files_text(chal, status)
         if state not in ACTIVE | {"accepted"}:
             return "-"
         if state == "hold":
