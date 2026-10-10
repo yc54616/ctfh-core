@@ -1,0 +1,1411 @@
+"""Native Codex contest runner.
+
+One interactive ``codex`` per challenge runs in its own tmux window; a separate
+checker loop collects challenges, verifies flags by re-running ``solve.py``,
+submits through the logged-in browser, and reviews writeups.  The folder layout
+is the only contract between the solver sessions and the checker.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures as cf
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+from .live_config import codex_environment
+
+ACTIVE = frozenset({"solving", "needs_fix", "manual"})  # manual: auto nudging stopped, the user takes over
+STALL_NUDGES = 2  # nudges in a row without a new work/NOTES.md before handing the solver to the user
+FINISHED = frozenset({"done", "user_solved", "site_solved"})
+BOARD_ORDER = {"manual": 0, "unknown": 0, "blocked": 1, "pending": 3, **{state: 4 for state in FINISHED}}  # others 2
+DEFAULT_MODEL = "gpt-6-sol"
+RESCAN_MODEL = "gpt-6-luna"  # cheap model for periodic rescans; the cost is mostly input tokens
+SOLVE_SETTLE_SECONDS = 20  # recheck a changed solve.py only after it stopped changing
+# Text the Codex TUI shows when the provider's cyber-safety filter refuses a turn.
+REFUSAL_MARKERS = ("content can’t be shown", "content can't be shown", "Apply for Daybreak")
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+DEFAULT_BASE = Path.home() / "Desktop" / "CTF"
+CREDENTIALS = Path.home() / ".config" / "ctfh" / "credentials.toml"
+SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+
+@dataclass(frozen=True)
+class Options:
+    binary: str = "codex"
+    model: str | None = DEFAULT_MODEL
+    effort: str | None = None
+    rescan_model: str | None = RESCAN_MODEL  # periodic rescans only re-read the list; None: same as model
+    rescan_effort: str | None = "low"  # None: same as effort
+    max_parallel: int = 0  # 0: every unsolved challenge at once
+    submit: bool = True
+    rescan_seconds: int = 3600
+    idle_seconds: int = 180
+    nudge_limit: int = 3
+    solve_timeout: int = 300
+    memory_max: str = "auto"
+    tick: float = 5.0
+    plain: bool = False  # text board instead of the keyboard dashboard
+
+    def to_args(self) -> list[str]:
+        args = ["--codex", self.binary, "--max-parallel", str(self.max_parallel),
+                "--rescan-minutes", str(self.rescan_seconds // 60),
+                "--idle-seconds", str(self.idle_seconds), "--nudge-limit", str(self.nudge_limit),
+                "--solve-timeout", str(self.solve_timeout), "--memory-max", self.memory_max]
+        if self.model:
+            args += ["--model", self.model]
+        if self.effort:
+            args += ["--thinking", self.effort]
+        args += ["--rescan-model", self.rescan_model or "same", "--rescan-thinking", self.rescan_effort or "same"]
+        if not self.submit:
+            args.append("--no-submit")
+        if self.plain:
+            args.append("--plain")
+        return args
+
+
+# ---------------------------------------------------------------- memory
+
+MEMORY_SHARE = 0.98  # all solver windows together may use this much of RAM
+MEMORY_SLICE = "ctfh.slice"
+SWAP_PER_SOLVER = "512M"
+
+
+def _meminfo(key: str) -> int:
+    """Bytes for a /proc/meminfo field, or 0 when unknown."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith(key + ":"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def memory_limit(setting: str | None) -> str | None:
+    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (98% of RAM)."""
+    value = (setting or "auto").strip()
+    if value.lower() in ("off", "none", "0"):
+        return None
+    if value.lower() == "auto":
+        total = _meminfo("MemTotal")
+        return f"{int(total * MEMORY_SHARE) >> 20}M" if total else None
+    if not re.fullmatch(r"\d+[KMGT]?", value, re.I):
+        raise ValueError(f"메모리 상한 형식이 아닙니다: {value} (예: 28G, auto, off)")
+    return value.upper()
+
+
+def set_memory_slice(limit: str) -> None:
+    """Cap the slice every solver scope runs in (runtime only; gone after logout)."""
+    subprocess.run(["systemctl", "--user", "set-property", "--runtime", MEMORY_SLICE, f"MemoryMax={limit}"],
+                   capture_output=True, check=False, timeout=30)
+
+
+def memory_prefix(opts: Options, chal: Path) -> list[str]:
+    """Run one solver window in its own scope inside the shared slice.
+
+    When the slice is full the kernel kills the biggest process inside it (a runaway
+    fuzzer or VM), not the desktop, tmux or the checker; the window itself keeps running.
+    """
+    limit = memory_limit(opts.memory_max)
+    if limit is None or shutil.which("systemd-run") is None:
+        return []
+    set_memory_slice(limit)
+    unit = f"ctfh-{chal.parent.parent.name[:40]}-{chal.name}-{int(time.time())}"
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", f"--slice={MEMORY_SLICE}",
+            "-p", f"MemorySwapMax={SWAP_PER_SOLVER}", "-p", "OOMPolicy=continue"]
+
+
+# ---------------------------------------------------------------- remote services
+
+REMOTE_PROBE_SECONDS = 30
+REMOTE_DOWN_REASON = "서버 닫힘 대기"
+_HOST = r"(?:\d{1,3}(?:\.\d{1,3}){3}|(?:[a-z0-9-]+\.)+[a-z]{2,})"
+_HOST_PORT = re.compile(rf"\bnc\s+(?:-\S+\s+)*(?P<a>{_HOST})\s+(?P<b>\d{{2,5}})\b|(?P<c>{_HOST}):(?P<d>\d{{2,5}})\b", re.I)
+_URL = re.compile(rf"\b(?P<scheme>https?)://(?P<host>{_HOST})(?::(?P<port>\d{{2,5}}))?", re.I)
+
+
+def remote_endpoints(chal: Path, contest_host: str = "") -> list[tuple[str, int]]:
+    """Remote services of one challenge: remote.txt, plus host:port / nc in the challenge text and notes."""
+    found: list[tuple[str, int]] = []
+
+    def add(host: str, port) -> None:
+        host, port = host.lower(), int(port)
+        if host in (contest_host.lower(), "localhost") or host.startswith(("127.", "0.")) or not 0 < port < 65536:
+            return
+        if (host, port) not in found:
+            found.append((host, port))
+
+    for name in ("remote.txt", "challenge.md", "challenge.json", "work/NOTES.md"):
+        try:
+            text = (chal / name).read_text(errors="replace")
+        except OSError:
+            continue
+        for match in _HOST_PORT.finditer(text):
+            add(match["a"] or match["c"], match["b"] or match["d"])
+        if name == "remote.txt":  # plain URLs only count when the solver named them as the target
+            for match in _URL.finditer(text):
+                add(match["host"], match["port"] or (443 if match["scheme"].lower() == "https" else 80))
+    return found
+
+
+def probe_endpoint(endpoint: tuple[str, int], timeout: float = 3.0) -> str:
+    """'open', 'closed' (refused or no answer) or 'unknown' (name does not resolve)."""
+    host, port = endpoint
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return "unknown"
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return "open"
+    except OSError:
+        return "closed"
+
+
+# ---------------------------------------------------------------- site solved state
+
+SOLVED_POLL_SECONDS = 60
+SOLVED_JS = ("fetch({api!r},{{credentials:'include'}}).then(r=>r.json()).then(d=>JSON.stringify({{success:d.success,"
+             "solved:(d.data||[]).filter(c=>c.solved_by_me).map(c=>[String(c.id),c.name])}}))")
+
+
+def site_solved(contest: "Contest") -> list[tuple[str, str]] | None:
+    """(id, name) of challenges the site shows solved for this account, read in the logged-in Chrome.
+
+    Only CTFd has a stable API for this; other platforms rely on the periodic rescan.
+    """
+    if "ctfd" not in str(contest.site().get("platform", "")).lower() or not contest.url:
+        return None
+    session = f"ctfh-status-{contest.root.name[:40]}"
+    script = SOLVED_JS.format(api=urljoin(contest.url, "/api/v1/challenges"))
+    for attempt in range(2):
+        try:
+            out = subprocess.run(["chrome-use", "--session", session, "eval", script],
+                                 capture_output=True, text=True, timeout=60).stdout
+            for line in reversed(out.splitlines()):
+                if line.startswith("{"):
+                    data = json.loads(line)
+                    if data.get("success"):
+                        return [(str(i), str(n)) for i, n in data.get("solved", [])]
+                    break
+            if attempt == 0:  # our tab is not on the site yet (or was logged out): open it once
+                subprocess.run(["chrome-use", "--session", session, "open", contest.url],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+    return None
+
+
+def mark_site_solved(contest: "Contest", ids: set[str], names: set[str]) -> list[str]:
+    """Set challenge.json solved=true for matching challenges; the checker loop does the rest."""
+    wanted = {name.strip().lower() for name in names} | {slugify(name) for name in names}
+    changed = []
+    for chal in contest.challenges():
+        info = _read_json(chal / "challenge.json", {})
+        if not isinstance(info, dict) or info.get("solved"):
+            continue
+        name = str(info.get("name", "")).strip().lower()
+        if str(info.get("id", "")) in ids or chal.name in wanted or (name and name in wanted):
+            info["solved"] = True
+            _write_atomic(chal / "challenge.json", json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+            changed.append(chal.name)
+    return changed
+
+
+# ---------------------------------------------------------------- layout
+
+def slugify(text: str, fallback: str = "item") -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:48].strip("-")
+    return slug or fallback
+
+
+def contest_slug(url: str) -> str:
+    parsed = urlparse(url)
+    return slugify(f"{parsed.hostname or ''} {parsed.path}", "contest")
+
+
+def session_name(root: Path) -> str:
+    return "ctfh-" + slugify(root.name, "contest")
+
+
+def window_name(slug: str) -> str:
+    return "c" + slug if slug.isdigit() else slug
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}초"
+    if seconds < 3600:
+        return f"{seconds // 60}분"
+    return f"{seconds // 3600}시간 {seconds % 3600 // 60}분"
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def _toml_str(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+CONTEST_AGENTS = """# CTF 대회 폴더 ({url})
+
+이 폴더는 ctfh2 native가 관리한다.
+- `challenges/<문제>/`마다 Codex 풀이 세션 하나가 tmux 창에서 돈다.
+- 검사기 창(`checker`)이 문제 수집, flag 재현 검증, 사이트 제출, writeup 검토를 맡는다.
+- 사용자가 직접 푼 문제는 `ctfh2 done <문제>` 또는 그 폴더에 `USER_SOLVED` 파일을 만든다.
+"""
+
+CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
+
+대회: {url}
+너는 이 폴더의 문제 하나만 맡는다. 사용자가 정식으로 참가 중인 CTF다.
+(이 규칙은 풀이 세션용이다. 프롬프트가 `[검사기 작업]`으로 시작하면 그 지시가 우선한다.)
+- 공격 대상은 문제에서 주어진 파일과 서버뿐이다. 대회 플랫폼(로그인, 점수판, 다른 참가자)은 공격하지 않는다.
+- 호스트 도구(gdb, pwntools, qemu, 퍼저 등)를 자유롭게 쓴다. 오래 걸리는 명령에는 timeout을 건다.
+- 웹 확인이 필요하면 `chrome-use`를 쓰고 세션 이름은 `ctfh-{slug}`로 한다.
+- 사이트에서 VM/인스턴스를 켜거나 접속 정보를 읽기 전에, 열린 문제 창의 제목이 challenge.json의 name과 같은지
+  먼저 확인한다. 다른 문제의 창·인스턴스·서비스면 쓰지 않고 닫은 뒤 이 문제를 다시 연다.
+  받은 접속 정보는 어느 문제 창에서 얻었는지와 함께 `work/NOTES.md`에 적는다.
+- 원격 서버 주소를 알면 `remote.txt`에 한 줄에 하나씩 적는다 (`host:port`, `nc host port`, URL). 주소가 바뀌면 고친다.
+  서버가 닫혀 있으면 검사기가 이 주소를 지켜보다가 열리는 순간 알려 준다.
+- 다른 문제 폴더는 건드리지 않는다.
+
+## 산출물 (검사기는 이 파일들만 본다)
+- `solve.py`: 이 폴더에서 `python3 solve.py`로 처음부터 다시 실행해도 flag를 얻어 출력하는 스크립트.
+  flag 문자열을 코드에 직접 쓰지 않는다. 원격 문제면 원격에 접속해서 얻는다.
+- `flag.txt`: flag 한 줄. solve.py로 실제 flag를 확인한 뒤에만 쓴다. 추측한 값은 쓰지 않는다.
+- `writeup.md`: 한국어 풀이. 요약 / 취약점 / 풀이 단계 / solve.py 설명 / 막혔던 점.
+- `work/`: 작업 공간. 진행 상황을 `work/NOTES.md`에 계속 적는다. 세션이 다시 시작되면 이것을 읽고 이어 간다.
+
+## 검사기와의 약속
+- flag.txt나 solve.py가 바뀌면 검사기가 solve.py를 새로 실행해 같은 flag가 나오는지 확인하고, 통과하면 사이트에 제출한다. 너는 제출하지 않는다.
+- 결과와 거절 사유는 `status.json`에 적히고 이 창으로 `[검사기]` 메시지가 온다. 사유를 읽고 고친다.
+- 정답 처리되면 writeup.md를 마무리한다. writeup 검토를 통과하면 이 창은 닫힌다.
+- `status.json`은 읽기만 한다.
+"""
+
+SOLVER_PROMPT = ("AGENTS.md 규칙대로 이 문제를 풀어라. 문제 설명은 challenge.md, 첨부는 files/에 있다. "
+                 "work/NOTES.md가 있으면 이전 진행 기록이니 먼저 읽고 이어서 진행해라.")
+
+
+class Contest:
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.challenges_dir = self.root / "challenges"
+        self.state_dir = self.root / ".ctfh"
+
+    def config(self) -> dict:
+        path = self.root / "contest.toml"
+        return tomllib.loads(path.read_text()) if path.is_file() else {}
+
+    def site(self) -> dict:
+        return _read_json(self.state_dir / "site.json", {})
+
+    @property
+    def url(self) -> str:
+        return str(self.config().get("url", ""))
+
+    def flag_regex(self) -> str:
+        return str(self.config().get("flag_regex") or self.site().get("flag_regex") or "")
+
+    def challenges(self) -> list[Path]:
+        if not self.challenges_dir.is_dir():
+            return []
+        return sorted(p for p in self.challenges_dir.iterdir()
+                      if p.is_dir() and SLUG.fullmatch(p.name) and (p / "challenge.md").is_file())
+
+    def normalize(self) -> list[str]:
+        """Rename collector-made folders whose names are not plain slugs."""
+        renamed = []
+        for path in sorted(self.challenges_dir.iterdir()) if self.challenges_dir.is_dir() else []:
+            if path.is_dir() and not SLUG.fullmatch(path.name) and (path / "challenge.md").is_file():
+                target = self.challenges_dir / slugify(path.name, "challenge")
+                if not target.exists():
+                    path.rename(target)
+                    renamed.append(target.name)
+        return renamed
+
+
+def init_contest(url: str, root: Path) -> Contest:
+    contest = Contest(root)
+    contest.challenges_dir.mkdir(parents=True, exist_ok=True)
+    contest.state_dir.mkdir(exist_ok=True)
+    config = contest.root / "contest.toml"
+    if not config.exists():
+        _write_atomic(config, "# 사람이 고쳐도 되는 대회 설정. 비어 있으면 수집 결과(.ctfh/site.json)를 쓴다.\n"
+                      f"url = {_toml_str(url)}\n"
+                      "flag_regex = \"\"   # 예: \"DH\\\\{[^}]+\\\\}\"\n")
+    agents = contest.root / "AGENTS.md"
+    if not agents.exists():
+        _write_atomic(agents, CONTEST_AGENTS.format(url=url))
+    return contest
+
+
+def load_status(chal: Path) -> dict:
+    return _read_json(chal / "status.json", {})
+
+
+def save_status(chal: Path, status: dict) -> None:
+    status["updated_at"] = _now()
+    _write_atomic(chal / "status.json", json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def ensure_challenge(contest: Contest, chal: Path) -> dict:
+    status = load_status(chal)
+    if not status:
+        status = {"state": "pending", "nudges": 0, "submissions": []}
+        save_status(chal, status)
+    (chal / "work").mkdir(exist_ok=True)
+    agents, rules = chal / "AGENTS.md", CHALLENGE_AGENTS.format(url=contest.url, slug=chal.name)
+    current = agents.read_text() if agents.exists() else None
+    # Refresh our own generated rules when the template changes; leave a user-written file alone.
+    if current is None or (current != rules and current.startswith(CHALLENGE_AGENTS.split("\n", 1)[0])):
+        _write_atomic(agents, rules)
+    return status
+
+
+# ---------------------------------------------------------------- codex
+
+def env_prefix(binary: str) -> list[str]:
+    """tmux windows inherit the tmux server environment, so pin the account explicitly."""
+    if Path(binary).name == "codex":
+        return ["env", "-u", "CODEX_SQLITE_HOME", f"CODEX_HOME={codex_home(binary)}"]
+    return []
+
+
+def codex_argv(opts: Options, cwd: Path, prompt: str, *, interactive: bool,
+               schema: Path | None = None, output: Path | None = None) -> list[str]:
+    # The TUI's shared background server may demand a restart that would interrupt the
+    # user's other sessions; each solver window runs standalone (codex-secondary already does).
+    standalone = ["--no-daemon"] if Path(opts.binary).name == "codex" else []
+    argv = [opts.binary] + (standalone if interactive else ["exec", "--skip-git-repo-check", "--json"])
+    argv += ["--dangerously-bypass-approvals-and-sandbox", "-C", str(cwd)]
+    if opts.model:
+        argv += ["-m", opts.model]
+    if opts.effort:
+        argv += ["-c", f"model_reasoning_effort={_toml_str(opts.effort)}"]
+    if schema is not None:
+        argv += ["--output-schema", str(schema)]
+    if output is not None:
+        argv += ["-o", str(output)]
+    return argv + [prompt]
+
+
+def _strict(properties: dict) -> dict:
+    return {"type": "object", "additionalProperties": False,
+            "required": list(properties), "properties": properties}
+
+
+COLLECT_SCHEMA = _strict({
+    "login": {"type": "string", "enum": ["ok", "needs_user"]},
+    "platform": {"type": "string"},
+    "flag_regex": {"type": "string"},
+    "submit_hint": {"type": "string"},
+    "challenges": {"type": "array", "items": _strict({
+        "slug": {"type": "string"}, "name": {"type": "string"}, "solved": {"type": "boolean"}})},
+    "notes": {"type": "string"},
+})
+SUBMIT_SCHEMA = _strict({
+    "result": {"type": "string", "enum": ["accepted", "wrong", "already_solved", "unknown", "needs_user"]},
+    "message": {"type": "string"},
+})
+REVIEW_SCHEMA = _strict({
+    "expected_approach": {"type": "string"},
+    "writeup_ok": {"type": "boolean"},
+    "matches_solve": {"type": "boolean"},
+    "stage": {"type": "string", "enum": ["discovery", "leak", "primitive", "goal", "n/a"]},
+    "issues": {"type": "array", "items": {"type": "string"}},
+})
+
+
+def _short(text, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def describe_event(event: dict) -> str | None:
+    """One readable line for a ``codex exec --json`` event, or None to stay quiet."""
+    kind, item = event.get("type"), event.get("item") or {}
+    itype = item.get("type")
+    if kind == "turn.completed":
+        usage = event.get("usage") or {}
+        return (f"토큰: 입력 {usage.get('input_tokens', 0):,} (캐시 {usage.get('cached_input_tokens', 0):,})"
+                f" · 출력 {usage.get('output_tokens', 0):,}")
+    if kind in ("error", "turn.failed"):
+        return "오류: " + _short(event.get("message") or (event.get("error") or {}).get("message"), 300)
+    if kind == "item.started" and itype == "command_execution":
+        command = re.sub(r"^\S*/(?:ba|z)?sh -lc ", "", str(item.get("command", "")))
+        command = re.sub(r"^([\"'])(.*)\1$", r"\2", command).replace("rtk proxy ", "")
+        return "$ " + _short(command, 160)
+    if kind != "item.completed":
+        return None
+    if itype == "command_execution":
+        lines = len(str(item.get("aggregated_output") or "").splitlines())
+        return f"  └ exit {item.get('exit_code')} · {lines}줄"
+    if itype == "agent_message" and not str(item.get("text", "")).lstrip().startswith(("{", "[")):
+        return "› " + _short(item.get("text"), 300)
+    if itype == "reasoning":
+        return "· " + _short(item.get("text"), 200)
+    if itype == "file_change":
+        return "파일: " + _short(", ".join(str(c.get("path", "")) for c in item.get("changes") or []), 200)
+    if itype == "web_search":
+        return "검색: " + _short(item.get("query"), 160)
+    if itype == "mcp_tool_call":
+        return f"도구: {item.get('server')}/{item.get('tool')}"
+    return None
+
+
+def run_codex_json(opts: Options, cwd: Path, prompt: str, schema: dict, work: Path,
+                   name: str, timeout: int = 3600, show=None, redact: tuple[str, ...] = ()) -> dict:
+    """Run one ``codex exec`` turn, stream readable progress, return its schema-shaped final message.
+
+    ``{name}.log`` holds the readable progress (also passed to ``show``) and
+    ``{name}.jsonl`` the raw events; strings in ``redact`` never reach either.
+    """
+    work.mkdir(parents=True, exist_ok=True)
+    schema_path, output = work / f"{name}.schema.json", work / f"{name}.json"
+    _write_atomic(schema_path, json.dumps(schema))
+    output.unlink(missing_ok=True)
+    argv = codex_argv(opts, cwd, prompt, interactive=False, schema=schema_path, output=output)
+
+    def hide(text: str) -> str:
+        for secret in redact:
+            if secret:
+                text = text.replace(secret, "<FLAG>")
+        return text
+
+    expired = threading.Event()
+    with open(work / f"{name}.log", "w") as log, open(work / f"{name}.jsonl", "w") as raw:
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, errors="replace",
+                                env=codex_environment(opts.binary), start_new_session=True)
+        timer = threading.Timer(timeout, lambda: (expired.set(), os.killpg(proc.pid, signal.SIGKILL)))
+        timer.start()
+        try:
+            for line in proc.stdout:
+                line = hide(line)
+                raw.write(line)
+                try:
+                    event = json.loads(line)
+                    text = describe_event(event) if isinstance(event, dict) else None
+                except ValueError:
+                    text = _short(line, 200) if line.strip() and not line.startswith("Reading additional input") else None
+                if text:
+                    log.write(f"{datetime.now():%H:%M:%S} {text}\n")
+                    log.flush()
+                    if show is not None:
+                        show(text)
+            proc.wait()
+        finally:
+            timer.cancel()
+    if expired.is_set():
+        raise RuntimeError(f"{name}: codex exec가 {timeout}초 안에 끝나지 않았습니다")
+    if proc.returncode:
+        raise RuntimeError(f"{name}: codex exec 종료 코드 {proc.returncode} (로그 {work / (name + '.log')})")
+    result = _read_json(output, None)
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{name}: 구조화된 최종 응답이 없습니다 ({output})")
+    return result
+
+
+def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -> dict:
+    existing = ", ".join(p.name for p in contest.challenges()) or "(없음)"
+    login = ("로그인되어 있지 않거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고 login=\"needs_user\"로 바로 끝낸다.")
+    if credential(urlparse(contest.url).hostname or "") is not None:
+        helper = shlex.join(self_command("secret-fill", str(contest.root), "<username|password>", "<@ref>",
+                                         "--session", "ctfh-collect"))
+        login = ("로그인되어 있지 않으면 로그인 폼에서 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
+                 f"(값은 너에게 보이지 않는다): `{helper}`. 그다음 로그인 버튼을 누른다. "
+                 "2FA·캡차가 나오거나 실패하면 login=\"needs_user\"로 바로 끝낸다. 비밀번호를 직접 입력하거나 출력하지 마라.")
+    prompt = f"""너는 CTF 대회의 문제 수집 담당이다. 대상: {contest.url}
+문제를 풀지 마라. 현재 폴더가 대회 폴더다.
+1. 먼저 `chrome-use skills get core`로 사용법을 읽고, 사용자의 로그인된 Chrome을 세션 이름 `ctfh-collect`로 쓴다.
+2. {login}
+3. 사이트 구조를 지금 분석해 보이는 문제 전부를 찾는다 (카테고리, 탭, 페이지네이션 포함).
+4. 문제마다 `challenges/<slug>/`를 만든다. slug는 소문자·숫자·하이픈. 이미 있는 폴더는 내용을 덮어쓰지 말고
+   challenge.json의 solved 값만 갱신한다. 새 폴더에는:
+   - challenge.md: 제목, 카테고리, 점수, 설명 원문, 접속 정보(nc/URL), 첨부 목록, 문제 페이지 URL,
+     그리고 이 문제 창만 정확히 여는 방법(고유 링크, 또는 카드의 고유 CSS 선택자/data 속성)
+   - challenge.json: {{"id": 사이트 id, "name", "category", "points", "url": 문제 페이지, "solved": 내 계정 기준 해결 여부}}
+   - files/: 첨부 파일 다운로드 (압축은 풀지 않아도 된다)
+   인스턴스를 켜야 하는 문제는 켜지 말고 challenge.md에 그 사실과 방법만 적는다.
+5. flag 형식(정규식)과 제출 방법(어느 페이지의 어떤 입력창/버튼인지)을 알아낸다.
+이미 있는 폴더: {existing}
+최종 응답은 주어진 스키마의 JSON으로만 한다."""
+    result = runner(opts, contest.root, prompt, COLLECT_SCHEMA, contest.state_dir, "collect", show=show)
+    site = {k: result.get(k, "") for k in ("platform", "flag_regex", "submit_hint", "notes")}
+    site.update(login=result.get("login"), collected_at=_now())
+    _write_atomic(contest.state_dir / "site.json", json.dumps(site, ensure_ascii=False, indent=2) + "\n")
+    contest.normalize()
+    solved = [item for item in result.get("challenges", []) if isinstance(item, dict) and item.get("solved")]
+    mark_site_solved(contest, set(), {str(item.get(key, "")) for item in solved for key in ("slug", "name")} - {""})
+    for chal in contest.challenges():
+        ensure_challenge(contest, chal)
+    return result
+
+
+# ---------------------------------------------------------------- checks
+
+@dataclass(frozen=True)
+class CheckResult:
+    ok: bool
+    reason: str
+    flag_sha256: str = ""
+
+
+def flag_hash(flag: str) -> str:
+    return hashlib.sha256(flag.encode()).hexdigest()
+
+
+def run_solve(chal: Path, timeout: int) -> tuple[int | None, str]:
+    proc = subprocess.Popen([sys.executable, "solve.py"], cwd=chal, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            errors="replace", start_new_session=True)
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, output
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        output, _ = proc.communicate()
+        return None, output or ""
+
+
+def verify_flag(chal: Path, flag_regex: str, timeout: int) -> CheckResult:
+    """Deterministic gate: format, provenance (no literal flag), independent re-run."""
+    try:
+        lines = [line.strip() for line in (chal / "flag.txt").read_text().splitlines() if line.strip()]
+    except OSError:
+        return CheckResult(False, "flag.txt가 없습니다.")
+    if len(lines) != 1:
+        return CheckResult(False, "flag.txt에는 flag 한 줄만 있어야 합니다.")
+    flag = lines[0]
+    digest = flag_hash(flag)
+    if flag_regex and not re.fullmatch(flag_regex, flag):
+        return CheckResult(False, f"flag 형식이 대회 정규식 {flag_regex!r}과 맞지 않습니다.", digest)
+    solve = chal / "solve.py"
+    if not solve.is_file():
+        return CheckResult(False, "solve.py가 없습니다. flag를 다시 얻는 스크립트가 필요합니다.", digest)
+    if flag in solve.read_text(errors="replace"):
+        return CheckResult(False, "solve.py에 flag 문자열이 그대로 들어 있습니다. 계산하거나 받아 와야 합니다.", digest)
+    code, output = run_solve(chal, timeout)
+    check_dir = chal / ".ctfh-check"
+    _write_atomic(check_dir / "rerun.log", f"# exit={code}\n" + output.replace(flag, "<FLAG>"))
+    if code is None:
+        return CheckResult(False, f"solve.py가 {timeout}초 안에 끝나지 않았습니다.", digest)
+    if flag not in output:
+        tail = output.replace(flag, "<FLAG>")[-400:].strip()
+        return CheckResult(False, f"solve.py를 다시 실행했지만 같은 flag가 나오지 않았습니다 (exit={code}). 출력 끝: {tail}", digest)
+    return CheckResult(True, "solve.py 재실행으로 같은 flag를 재현했습니다.", digest)
+
+
+def submit(contest: Contest, chal: Path, opts: Options, runner=run_codex_json) -> dict:
+    meta = _read_json(chal / "challenge.json", {})
+    prompt = f"""[검사기 작업] 너는 flag 제출 담당이다. 대회: {contest.url}
+문제: {meta.get('name', chal.name)} (문제 페이지: {meta.get('url', '../challenge.md 참고')})
+flag는 ../flag.txt에 있다. `chrome-use skills get core`로 사용법을 읽고 세션 이름 `ctfh-submit`으로
+사용자의 로그인된 Chrome에서 이 문제에 flag를 정확히 한 번 제출하고 사이트의 응답을 읽어라.
+제출 방법 힌트: {contest.site().get('submit_hint') or '(없음)'}
+- 이미 해결됨으로 표시되어 있으면 제출하지 말고 already_solved.
+- 응답이 애매하면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 제출하지 말고 needs_user.
+- message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라. 최종 응답은 스키마 JSON으로만 한다."""
+    work = chal / ".ctfh-check"
+    flag = (chal / "flag.txt").read_text().strip()
+    return runner(opts, work, prompt, SUBMIT_SCHEMA, work, "submit", 900, redact=(flag,))
+
+
+def review(chal: Path, opts: Options, runner=run_codex_json) -> dict:
+    prompt = """[검사기 작업] 너는 풀이 검토자다. 문제 폴더는 상위 폴더(..)다. 순서를 지켜라.
+1. ../challenge.md와 ../files/만 보고 예상 풀이 방향을 expected_approach에 먼저 정리한다 (solve.py, writeup.md를 보기 전에).
+2. 그다음 ../solve.py, ../writeup.md, ./rerun.log를 읽는다.
+3. writeup이 solve.py의 실제 동작과 맞는지, 취약점·단계·근거가 구체적인지 판단한다.
+   문장이 그럴듯한지는 기준이 아니다. 코드와 실행 기록이 기준이다.
+writeup_ok가 false면 issues에 고칠 점을 구체적으로 적는다. 파일은 수정하지 마라.
+최종 응답은 스키마 JSON으로만 한다."""
+    work = chal / ".ctfh-check"
+    return runner(opts, work, prompt, REVIEW_SCHEMA, work, "review", 1800)
+
+
+# ---------------------------------------------------------------- rollouts
+
+def codex_home(binary: str) -> Path:
+    """Where the selected account writes its session rollouts."""
+    if Path(binary).name == "codex-secondary":
+        return Path.home() / ".codex-secondary"
+    return Path(codex_environment(binary).get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def rollout_homes(binary: str) -> list[Path]:
+    """Folders whose sessions/ may hold this account's rollouts.
+
+    ``codex-secondary`` keeps auth in ~/.codex-secondary but shares history
+    (sqlite_home) with ~/.codex, so its rollouts land in ~/.codex/sessions.
+    """
+    homes = [codex_home(binary), Path.home() / ".codex"]
+    return list(dict.fromkeys(homes))
+
+
+def find_rollout(cwd: Path, home: Path, since: float) -> Path | None:
+    """Newest Codex session file whose session_meta cwd is ``cwd``."""
+    best: tuple[float, Path] | None = None
+    day = date.fromtimestamp(since) - timedelta(days=1)
+    while day <= date.today():
+        folder = home / "sessions" / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}"
+        for path in folder.glob("rollout-*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+                if mtime < since - 60:
+                    continue
+                with open(path) as handle:
+                    meta = json.loads(handle.readline())
+            except (OSError, ValueError):
+                continue
+            payload = meta.get("payload") or {}
+            if payload.get("source") == "cli" and str(payload.get("cwd", "")) == str(cwd) \
+                    and (best is None or mtime > best[0]):
+                best = (mtime, path)
+        day += timedelta(days=1)
+    return best[1] if best else None
+
+
+def rollout_info(path: Path) -> dict:
+    """Total tokens and whether the last turn finished (idle) from a rollout tail."""
+    info = {"tokens": None, "idle": False, "mtime": 0.0}
+    try:
+        stat = path.stat()
+        info["mtime"] = stat.st_mtime
+        with open(path, "rb") as handle:
+            handle.seek(max(0, stat.st_size - 512_000))
+            lines = handle.read().decode(errors="replace").splitlines()
+    except OSError:
+        return info
+    for line in reversed(lines):
+        try:
+            payload = json.loads(line).get("payload") or {}
+        except ValueError:
+            continue
+        kind = payload.get("type")
+        if info["tokens"] is None and kind == "token_count":
+            usage = (payload.get("info") or {}).get("total_token_usage") or {}
+            info["tokens"] = usage.get("total_tokens")
+        primary = (payload.get("rate_limits") or {}).get("primary") or {} if kind == "token_count" else {}
+        if "limits" not in info and primary.get("used_percent") is not None:
+            info["limits"] = {"used": primary["used_percent"], "resets": primary.get("resets_at")}
+        if kind in ("task_started", "task_complete", "turn_aborted") and "turn" not in info:
+            info["turn"] = kind
+            info["idle"] = kind != "task_started"
+        if info["tokens"] is not None and "turn" in info:
+            break
+    return info
+
+
+# ---------------------------------------------------------------- tmux
+
+class Tmux:
+    def __init__(self, session: str):
+        self.session = session
+
+    def _run(self, *args: str, stdin: str | None = None, check: bool = True):
+        return subprocess.run(["tmux", *args], input=stdin, text=True, capture_output=True, check=check)
+
+    def exists(self) -> bool:
+        return self._run("has-session", "-t", f"={self.session}", check=False).returncode == 0
+
+    def windows(self) -> set[str]:
+        done = self._run("list-windows", "-t", f"={self.session}", "-F", "#{window_name}", check=False)
+        return set(done.stdout.split()) if done.returncode == 0 else set()
+
+    def new_session(self, name: str, cwd: Path, argv: list[str]) -> None:
+        self._run("new-session", "-d", "-s", self.session, "-n", name, "-c", str(cwd), shlex.join(argv))
+
+    def new_window(self, name: str, cwd: Path, argv: list[str]) -> None:
+        self._run("new-window", "-d", "-t", f"={self.session}:", "-n", name, "-c", str(cwd), shlex.join(argv))
+
+    def capture(self, name: str) -> str:
+        done = self._run("capture-pane", "-p", "-t", f"={self.session}:={name}", check=False)
+        return done.stdout if done.returncode == 0 else ""
+
+    def select(self, name: str) -> bool:
+        return self._run("select-window", "-t", f"={self.session}:={name}", check=False).returncode == 0
+
+    def kill(self, name: str) -> None:
+        self._run("kill-window", "-t", f"={self.session}:={name}", check=False)
+
+    def send(self, name: str, text: str) -> None:
+        target, buffer = f"={self.session}:={name}", f"ctfh-{os.getpid()}-{threading.get_ident()}"
+        self._run("load-buffer", "-b", buffer, "-", stdin=text)
+        self._run("paste-buffer", "-p", "-d", "-b", buffer, "-t", target)
+        time.sleep(0.3)
+        self._run("send-keys", "-t", target, "Enter")
+
+
+# ---------------------------------------------------------------- checker loop
+
+class Checker:
+    def __init__(self, contest: Contest, opts: Options, tmux: Tmux, runner=run_codex_json):
+        self.contest, self.opts, self.tmux, self.runner = contest, opts, tmux, runner
+        self.pool = cf.ThreadPoolExecutor(max_workers=4)
+        self.jobs: dict[str, cf.Future] = {}
+        self.submit_lock = threading.Lock()
+        self.last_scan = time.time()
+        self.rollouts: dict[str, Path] = {}
+        self.tokens: dict[str, int | None] = {}
+        self.activity: dict[str, dict] = {}
+        self.probes: dict[tuple[str, int], tuple[float, str]] = {}
+        self.solved_probe = site_solved
+        self.last_solved_poll = 0.0
+        self.lock = threading.RLock()  # one tick or one dashboard action at a time
+        self.last_view: tuple[list[str], list[dict]] = ([], [])
+
+    # -- solver windows
+    def launch(self, chal: Path, status: dict, resume: bool = False, count: bool = True) -> None:
+        prompt = SOLVER_PROMPT + (" 세션이 다시 시작됐다. status.json도 확인해라." if resume else "")
+        argv = memory_prefix(self.opts, chal) + env_prefix(self.opts.binary) \
+            + codex_argv(self.opts, chal, prompt, interactive=True)
+        self.tmux.new_window(window_name(chal.name), chal, argv)
+        self.rollouts.pop(chal.name, None)
+        if status.get("state", "pending") in ("pending", "blocked"):
+            for key in ("reason", "blocked_by", "nudges", "nudged_ts", "stalled", "stale_nudges", "notes_sig"):
+                status.pop(key, None)
+            status["state"] = "solving"
+        if resume and count:
+            status["nudges"] = status.get("nudges", 0) + 1
+        status.update(launched_at=_now(), launched_ts=time.time())
+        save_status(chal, status)
+
+    def tell(self, chal: Path, text: str) -> None:
+        if window_name(chal.name) in self.tmux.windows():
+            self.tmux.send(window_name(chal.name), f"[검사기] {text}")
+
+    def close(self, chal: Path) -> None:
+        if window_name(chal.name) in self.tmux.windows():
+            self.tmux.kill(window_name(chal.name))
+
+    # -- heavy jobs (run in the pool)
+    def job_check(self, chal: Path, mtime: int, solve_mtime: int = 0) -> None:
+        result = verify_flag(chal, self.contest.flag_regex(), self.opts.solve_timeout)
+        status = load_status(chal)
+        status.update(flag_mtime_ns=mtime, solve_mtime_ns=solve_mtime, flag_sha256=result.flag_sha256,
+                      reason=result.reason)
+        tried = {s.get("sha256"): s.get("result") for s in status.get("submissions", [])}
+        if result.ok and tried.get(result.flag_sha256) == "wrong":
+            result = CheckResult(False, "이미 제출해서 오답 처리된 flag입니다.", result.flag_sha256)
+        elif result.ok and result.flag_sha256 in tried and self.opts.submit:
+            status.update(state="unknown", reason="이미 제출했던 flag입니다. 결과를 사이트에서 확인하세요.")
+            save_status(chal, status)
+            return
+        status.update(state="verified" if result.ok else "needs_fix", reason=result.reason)
+        save_status(chal, status)
+        if not result.ok:
+            self.tell(chal, f"flag 검증 실패: {result.reason} status.json을 보고 고쳐라. "
+                            "flag.txt나 solve.py를 고치면 다시 검사한다.")
+        elif not self.opts.submit:
+            self.tell(chal, "flag 재현 확인됨 (자동 제출 꺼짐). writeup.md를 마무리해라.")
+
+    def job_submit(self, chal: Path) -> None:
+        status = load_status(chal)
+        digest = status.get("flag_sha256")
+        # Record the attempt before the browser acts: a crash must never lead to a blind replay.
+        status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
+        status.pop("approved_sha256", None)
+        status.setdefault("submissions", []).append({"sha256": digest, "result": "pending", "at": _now()})
+        save_status(chal, status)
+        try:
+            with self.submit_lock:
+                result = submit(self.contest, chal, self.opts, self.runner)
+        except Exception as exc:  # noqa: BLE001 - the outcome is unknown, never retried blindly
+            result = {"result": "unknown", "message": f"제출 작업 오류: {exc}"}
+        status = load_status(chal)
+        outcome = result.get("result", "unknown")
+        entry = status["submissions"][-1]
+        entry.update(result=outcome, message=str(result.get("message", ""))[:300], at=_now())
+        if outcome in ("accepted", "already_solved"):
+            status.update(state="accepted", reason="사이트가 정답 처리했습니다.")
+            self.tell(chal, "정답 처리됨. writeup.md를 마무리해라.")
+        elif outcome == "wrong":
+            status.update(state="needs_fix", reason="사이트가 오답 처리했습니다. 다른 flag를 찾아야 합니다.")
+            self.tell(chal, "사이트가 오답 처리했다. 풀이를 다시 확인해라.")
+        elif outcome == "needs_user":
+            status["submissions"].pop()  # nothing was submitted
+            status.update(state="verified", retry_after=time.time() + 300,
+                          reason="제출하려면 로그인이 필요합니다. Chrome에서 로그인하세요.")
+        else:
+            status.update(state="unknown", reason="제출 결과를 확정하지 못했습니다. 사이트에서 확인한 뒤 "
+                                                  "`ctfh2 done` 또는 `ctfh2 approve`를 쓰세요.")
+        save_status(chal, status)
+
+    def job_review(self, chal: Path, mtime: int) -> None:
+        result = review(chal, self.opts, self.runner)
+        status = load_status(chal)
+        status.update(writeup_mtime_ns=mtime, review=result)
+        if result.get("writeup_ok") and result.get("matches_solve"):
+            status.update(state="done", reason="writeup 검토 통과.")
+            save_status(chal, status)
+            self.close(chal)
+            return
+        save_status(chal, status)
+        issues = "; ".join(result.get("issues") or ["writeup이 solve.py와 맞지 않습니다."])
+        self.tell(chal, f"writeup 보완 필요: {issues}")
+
+    def job_solved(self) -> None:
+        solved = self.solved_probe(self.contest)
+        if solved:
+            mark_site_solved(self.contest, {i for i, _ in solved}, {n for _, n in solved})
+
+    def job_collect(self) -> None:
+        opts = self.opts
+        if self.contest.challenges():  # until the first list exists, keep the full model for login
+            opts = replace(opts, model=opts.rescan_model or opts.model, effort=opts.rescan_effort or opts.effort)
+        result = collect(self.contest, opts, self.runner, show=lambda text: setattr(self, "collect_line", text))
+        if result.get("login") == "needs_user":
+            _write_atomic(self.contest.state_dir / "needs_user.txt",
+                          f"{_now()} Chrome에서 {self.contest.url} 에 다시 로그인하세요.\n")
+        else:
+            (self.contest.state_dir / "needs_user.txt").unlink(missing_ok=True)
+
+    # -- one decision per challenge per tick
+    def step(self, chal: Path, windows: set[str]):
+        status = ensure_challenge(self.contest, chal)
+        state = status.get("state", "pending")
+        if (chal / "USER_SOLVED").exists() and state != "user_solved":
+            status.update(state="user_solved", reason="사용자가 직접 해결 표시.")
+            save_status(chal, status)
+            self.close(chal)
+            return None
+        if state not in FINISHED | {"accepted", "submitting"} \
+                and _read_json(chal / "challenge.json", {}).get("solved"):
+            if status.get("submissions"):  # our own earlier submission went through
+                status.update(state="accepted", reason="사이트에 해결됨으로 표시됨.")
+            else:
+                status.update(state="site_solved", reason="사이트에 해결됨으로 표시됨.")
+                self.close(chal)
+            save_status(chal, status)
+            return None
+        if state in FINISHED:
+            if window_name(chal.name) in windows:
+                self.close(chal)
+            return None
+        if state == "checking":  # interrupted by a checker restart
+            status["state"] = "needs_fix"
+            status.pop("flag_mtime_ns", None)
+            save_status(chal, status)
+            return None
+        if state == "submitting":  # interrupted mid-submit: do not replay
+            status.update(state="unknown", reason="제출 도중 검사기가 멈췄습니다. 사이트에서 결과를 확인하세요.")
+            save_status(chal, status)
+            return None
+        flag, solve = chal / "flag.txt", chal / "solve.py"
+        if state in ACTIVE and flag.exists():
+            mtime = flag.stat().st_mtime_ns
+            solve_mtime = solve.stat().st_mtime_ns if solve.exists() else 0
+            # A fixed solve.py is rechecked too, once it has stopped changing for a moment.
+            fixed = "flag_mtime_ns" in status and solve_mtime != status.get("solve_mtime_ns") \
+                and time.time() - solve_mtime / 1e9 >= SOLVE_SETTLE_SECONDS
+            if mtime != status.get("flag_mtime_ns") or fixed:
+                status.pop("remote_down", None)
+                status["state"] = "checking"
+                save_status(chal, status)
+                return lambda: self.job_check(chal, mtime, solve_mtime)
+        if state == "verified" and self.opts.submit:
+            submitted = {s.get("sha256") for s in status.get("submissions", [])}
+            if status.get("flag_sha256") in submitted and status.get("approved_sha256") != status.get("flag_sha256"):
+                status.update(state="unknown", reason="이미 제출했던 flag입니다. 결과를 사이트에서 확인하세요.")
+                save_status(chal, status)
+                return None
+            if time.time() >= status.get("retry_after", 0):
+                return lambda: self.job_submit(chal)
+            return None
+        writeup = chal / "writeup.md"
+        if (state == "accepted" or (state == "verified" and not self.opts.submit)) and writeup.exists() \
+                and writeup.stat().st_mtime_ns != status.get("writeup_mtime_ns"):
+            mtime = writeup.stat().st_mtime_ns
+            return lambda: self.job_review(chal, mtime)
+        if state in ACTIVE and status.get("remote_down"):
+            if window_name(chal.name) in windows:
+                self.track(chal, status)
+            self.watch_remote(chal, status)
+        elif state in ACTIVE | {"accepted"} and window_name(chal.name) in windows:
+            self.nudge_if_idle(chal, status)
+        return None
+
+    def remote_state(self, chal: Path) -> tuple[str, list[str]]:
+        """'down' when every known remote endpoint refuses or times out, 'up' when one answers, else 'unknown'."""
+        endpoints = remote_endpoints(chal, urlparse(self.contest.url).hostname or "")
+        now = time.time()
+        stale = [e for e in endpoints if now - self.probes.get(e, (0.0, ""))[0] >= REMOTE_PROBE_SECONDS]
+        if stale:
+            with cf.ThreadPoolExecutor(max_workers=min(16, len(stale))) as pool:
+                for endpoint, result in zip(stale, pool.map(probe_endpoint, stale)):
+                    self.probes[endpoint] = (now, result)
+        results = {f"{h}:{p}": self.probes[(h, p)][1] for h, p in endpoints}
+        for state, wanted in (("up", "open"), ("down", "closed")):
+            hits = [label for label, result in results.items() if result == wanted]
+            if hits:
+                return state, hits
+        return "unknown", []
+
+    def watch_remote(self, chal: Path, status: dict) -> None:
+        """While the service is down stay quiet; wake the solver as soon as it answers again."""
+        state, endpoints = self.remote_state(chal)
+        if state == "down":
+            return
+        status.pop("remote_down", None)
+        if str(status.get("reason", "")).startswith(REMOTE_DOWN_REASON):
+            status.pop("reason")
+        # Attempts made while the server was down do not count against the nudge limit.
+        for key in ("stalled", "stale_nudges", "notes_sig"):
+            status.pop(key, None)
+        status.update(nudges=0, nudged_ts=time.time())
+        save_status(chal, status)
+        if state == "up":
+            self.tell(chal, f"서버가 다시 열렸다: {', '.join(endpoints)}. "
+                            "python3 solve.py로 원격에서 flag를 얻고, 나오면 flag.txt를 써라.")
+
+    def track(self, chal: Path, status: dict) -> dict | None:
+        """Read the solver's Codex rollout: tokens, and whether/since when it sits idle."""
+        path = self.rollouts.get(chal.name)
+        for home in ([] if path else rollout_homes(self.opts.binary)):
+            path = find_rollout(chal, home, status.get("launched_ts", time.time()))
+            if path:
+                break
+        if path is None:
+            return None
+        self.rollouts[chal.name] = path
+        info = rollout_info(path)
+        self.tokens[chal.name] = info["tokens"]
+        self.activity[chal.name] = info
+        return info
+
+    def activity_text(self, chal: Path, status: dict, windows: set[str]) -> str:
+        """Board column: is this solver working, stalled, out of nudges, or gone?"""
+        state = status.get("state")
+        if state not in ACTIVE | {"accepted"}:
+            return "-"
+        nudges, limit = status.get("nudges", 0), self.opts.nudge_limit
+        if window_name(chal.name) not in windows:
+            if status.get("remote_down"):
+                return "창 없음 (서버 대기)"
+            if state == "manual" or status.get("stalled"):
+                return "창 없음 (수동 대기)"
+            return "창 없음 (재시작 한도)" if nudges >= limit else "창 없음 (곧 재시작)"
+        info = self.activity.get(chal.name)
+        if info is None:
+            return "시작 중"
+        quiet = _ago(time.time() - info["mtime"])
+        if not info["idle"]:
+            return "진행 중" if time.time() - info["mtime"] < self.opts.idle_seconds else f"진행 중 ({quiet}째 기록 없음)"
+        if status.get("remote_down"):
+            return f"{quiet}째 멈춤 · 서버 대기"
+        if state == "manual":
+            return f"{quiet}째 멈춤 · 수동 대기"
+        if nudges >= limit:
+            return f"{quiet}째 멈춤 · 재촉 한도 소진"
+        return f"{quiet}째 멈춤 (재촉 {nudges}/{limit})"
+
+    def nudge_if_idle(self, chal: Path, status: dict) -> None:
+        info = self.track(chal, status)
+        if info is None:
+            return
+        if status.get("state") == "manual":
+            if not info["idle"]:  # the user typed into the window: it is solving again until it stops
+                status["state"] = "solving"
+                save_status(chal, status)
+            return
+        if not info["idle"] or time.time() - info["mtime"] < self.opts.idle_seconds \
+                or time.time() - status.get("nudged_ts", 0) < self.opts.idle_seconds:
+            return
+        if status.get("state") != "accepted":
+            remote, endpoints = self.remote_state(chal)
+            if remote == "down":  # nudging only burns tokens against a closed server
+                status.update(remote_down=time.time(), nudged_ts=time.time(),
+                              reason=f"{REMOTE_DOWN_REASON}: {', '.join(endpoints)}")
+                save_status(chal, status)
+                self.tell(chal, f"서버가 닫혀 있다 ({', '.join(endpoints)}). 원격 재시도는 멈추고 기다려라. "
+                                "로컬에서 할 일이 남았으면 마치고 work/NOTES.md에 적어라. 인스턴스를 켜야 하는 "
+                                "문제면 사이트에서 이 문제의 인스턴스를 다시 켜고 remote.txt를 고쳐라. "
+                                "서버가 열리면 검사기가 알려 준다.")
+                return
+        if status.get("state") != "accepted":
+            stop = self.auto_stop(chal, status)
+            if stop:
+                status.update(state="manual", reason=stop)
+                save_status(chal, status)
+                return
+        elif status.get("nudges", 0) >= self.opts.nudge_limit:
+            return
+        screen = self.tmux.capture(window_name(chal.name))
+        if any(marker in screen for marker in REFUSAL_MARKERS):
+            # Nudging a refused session only repeats the refusal; stop and tell the user.
+            status.update(state="blocked", blocked_by=f"{self.opts.binary}:{self.opts.model or '-'}",
+                          reason=f"모델이 보안 정책으로 거부함 ({self.opts.model or '기본 모델'}). "
+                                 "다른 모델/계정으로 다시 실행하면 재시도합니다.")
+            save_status(chal, status)
+            self.close(chal)
+            return
+        status.update(nudges=status.get("nudges", 0) + 1, nudged_ts=time.time())
+        save_status(chal, status)
+        if status.get("state") == "accepted":
+            self.tell(chal, "정답 처리됐다. writeup.md를 AGENTS.md 형식대로 마무리해라.")
+        else:
+            self.tell(chal, "아직 검증된 flag가 없다. work/NOTES.md와 status.json을 보고 "
+                            "다른 접근을 시도해 계속 진행해라.")
+
+    def auto_stop(self, chal: Path, status: dict) -> str | None:
+        """Why automatic nudging should end and the user take over this challenge, if it should."""
+        limit = self.opts.nudge_limit
+        if status.get("nudges", 0) >= limit:
+            return f"재촉 한도 {limit}회 도달: 직접 확인 필요"
+        notes = chal / "work" / "NOTES.md"
+        sig = hashlib.sha1(notes.read_bytes()).hexdigest() if notes.exists() else ""
+        if "notes_sig" in status:  # compare with the notes at the previous nudge
+            status["stale_nudges"] = 0 if sig != status["notes_sig"] else status.get("stale_nudges", 0) + 1
+        status["notes_sig"] = sig
+        if status.get("stalled") or status.get("stale_nudges", 0) >= STALL_NUDGES:
+            status["stalled"] = True
+            return f"진전 없음: 재촉 {STALL_NUDGES}번 동안 NOTES.md 그대로, 직접 확인 필요"
+        return None
+
+    def fill_slots(self, windows: set[str]) -> None:
+        """Start pending solvers and restart exited ones, up to max_parallel windows (0: no limit)."""
+        challenges = self.contest.challenges()
+        running = sum(1 for chal in challenges if window_name(chal.name) in windows)
+        restart, fresh = [], []
+        for chal in challenges:
+            if window_name(chal.name) in windows or chal.name in self.jobs:
+                continue
+            status = load_status(chal)
+            state = status.get("state")
+            if state == "pending" or (state == "blocked" and status.get("blocked_by")
+                                      != f"{self.opts.binary}:{self.opts.model or '-'}"):
+                fresh.append((chal, status))
+            elif state in ACTIVE | {"accepted"} and not status.get("remote_down") \
+                    and time.time() - status.get("launched_ts", 0) > 60:
+                if state != "manual" and not status.get("stalled") \
+                        and status.get("nudges", 0) < self.opts.nudge_limit:
+                    restart.append((chal, status))
+                elif state in ("solving", "needs_fix"):
+                    status.update(state="manual", reason=f"창 종료, 자동 재시작 {self.opts.nudge_limit}회 다 씀: 직접 확인 필요")
+                    save_status(chal, status)
+        self.memory_wait = False
+        for chal, status in restart + fresh:
+            if self.opts.max_parallel and running >= self.opts.max_parallel:
+                return
+            total, available = _meminfo("MemTotal"), _meminfo("MemAvailable")
+            if total and available and available < total * (1 - MEMORY_SHARE):
+                self.memory_wait = True
+                return
+            self.launch(chal, status, resume=status.get("state") not in ("pending", "blocked"))
+            running += 1
+
+    def view(self) -> tuple[list[str], list[dict]]:
+        """Head lines and one row per challenge; challenges waiting for the user come first."""
+        rows, total = [], 0
+        windows = self.tmux.windows()
+        for chal in self.contest.challenges():
+            status = load_status(chal)
+            tokens = self.tokens.get(chal.name)
+            total += tokens or 0
+            rows.append({"name": chal.name, "state": status.get("state", "-"),
+                         "tokens": f"{tokens:,}" if tokens else "-",
+                         "activity": self.activity_text(chal, status, windows),
+                         "reason": str(status.get("reason", ""))})
+        rows.sort(key=lambda row: BOARD_ORDER.get(row["state"], 2))  # stable: name order within a group
+        manual = [row["name"] for row in rows if row["state"] == "manual"]
+        busy = ", ".join(sorted(k for k, f in self.jobs.items() if not f.done() and k != "__solved__")) or "-"
+        alert = self.contest.state_dir / "needs_user.txt"
+        head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 합계 {total:,}  검사 중: {busy}"]
+        if alert.exists():
+            head.append("!! " + alert.read_text().strip())
+        limits = max((i for i in self.activity.values() if i.get("limits")), key=lambda i: i["mtime"], default=None)
+        if limits:
+            resets = limits["limits"]["resets"]
+            head.append(f"Codex 주간 사용량 {limits['limits']['used']:.0f}%"
+                        + (f" ({datetime.fromtimestamp(resets):%m/%d %H:%M} 초기화)" if resets else ""))
+        if manual:
+            head.append(f"직접 확인 필요 (manual {len(manual)}개): {', '.join(manual)}")
+        if getattr(self, "memory_wait", False):
+            used = 1 - _meminfo("MemAvailable") / max(1, _meminfo("MemTotal"))
+            head.append(f"메모리 부족: {used:.0%} 사용 중, 새 풀이 창은 여유가 생기면 연다")
+        if "__collect__" in self.jobs and not self.jobs["__collect__"].done():
+            head.append("문제 재수집 중: " + getattr(self, "collect_line", "시작"))
+        return head, rows
+
+    def board(self) -> str:
+        head, rows = self.last_view = self.view()
+        lines = [f"{'문제':<28} {'상태':<12} {'토큰':>12}  {'활동':<24} 메모"]
+        lines += [f"{row['name'][:28]:<28} {row['state']:<12} {row['tokens']:>12}  {row['activity']:<24} "
+                  f"{row['reason'][:60]}" for row in rows]
+        return "\n".join(head + lines) + "\n"
+
+    def act(self, action: str, name: str) -> str:
+        """A dashboard key on one challenge: 'nudge' its window now, 'restart' a closed one,
+        or mark it 'done' (solved by a teammate) and close its window.
+
+        The user's own nudges and restarts do not count against the automatic nudge limit.
+        """
+        with self.lock:
+            chal = self.contest.challenges_dir / name
+            if not chal.is_dir():
+                return f"{name}: 문제 폴더가 없습니다."
+            if name in self.jobs and not self.jobs[name].done():
+                return f"{name}: 검사·제출 작업 중입니다. 끝난 뒤 다시 시도하세요."
+            status = load_status(chal)
+            state = status.get("state", "pending")
+            if action == "done":
+                if state in FINISHED:
+                    return f"{name}: 이미 끝난 문제입니다 ({state})."
+                (chal / "USER_SOLVED").write_text(_now() + "\n")
+                status.update(state="user_solved", reason="사용자가 해결로 표시 (팀원 풀이 등).")
+                save_status(chal, status)
+                self.close(chal)
+                return f"{name}: 해결로 표시하고 풀이 창을 닫았습니다."
+            if state not in ACTIVE | {"accepted", "pending", "blocked"}:
+                return f"{name}: {state} 상태라 할 수 없습니다."
+            opened = window_name(name) in self.tmux.windows()
+            if state == "manual":  # the user takes it from here; it returns to manual once it stops again
+                status["state"] = "solving"
+                status.pop("reason", None)
+            if action == "restart":
+                if opened:
+                    return f"{name}: 창이 이미 열려 있습니다. Enter로 이동하세요."
+                self.launch(chal, status, resume=state not in ("pending", "blocked"), count=False)
+                return f"{name}: 풀이 창을 다시 열었습니다."
+            if not opened:
+                return f"{name}: 열린 창이 없습니다. r로 다시 여세요."
+            status["nudged_ts"] = time.time()
+            save_status(chal, status)
+            if state == "accepted":
+                self.tell(chal, "정답 처리됐다. writeup.md를 AGENTS.md 형식대로 마무리해라.")
+            else:
+                self.tell(chal, "아직 검증된 flag가 없다. work/NOTES.md와 status.json을 보고 "
+                                "다른 접근을 시도해 계속 진행해라.")
+            return f"{name}: 재촉했습니다."
+
+    def rescan_now(self) -> str:
+        """Dashboard key: re-collect the site now (new challenges, solved marks); restarts the rescan timer."""
+        with self.lock:
+            if "__collect__" in self.jobs and not self.jobs["__collect__"].done():
+                return "이미 재수집 중입니다."
+            self.last_scan = time.time()
+            self.jobs["__collect__"] = self.pool.submit(self.job_collect)
+            model = (self.opts.rescan_model if self.contest.challenges() else None) or self.opts.model or "기본 모델"
+            return f"재수집을 시작했습니다 ({model}). 화면 위쪽에 진행이 보입니다."
+
+    def tick(self) -> str:
+        with self.lock:
+            return self._tick()
+
+    def _tick(self) -> str:
+        windows = self.tmux.windows()
+        for key, future in list(self.jobs.items()):
+            if not future.done():
+                continue
+            self.jobs.pop(key)
+            error = future.exception()
+            if error is not None:
+                if key.startswith("__"):
+                    _write_atomic(self.contest.state_dir / f"{key.strip('_')}.error", f"{_now()} {error}\n")
+                    continue
+                chal = self.contest.challenges_dir / key
+                status = load_status(chal)
+                status["reason"] = f"검사기 오류: {error}"
+                if status.get("state") == "checking":
+                    status["state"] = "needs_fix"
+                save_status(chal, status)
+        for chal in self.contest.challenges():
+            if chal.name in self.jobs:
+                continue
+            job = self.step(chal, windows)
+            if job is not None:
+                self.jobs[chal.name] = self.pool.submit(job)
+        self.fill_slots(self.tmux.windows())
+        if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
+            self.last_solved_poll = time.time()
+            self.jobs["__solved__"] = self.pool.submit(self.job_solved)
+        if self.opts.rescan_seconds and "__collect__" not in self.jobs \
+                and time.time() - self.last_scan > self.opts.rescan_seconds:
+            self.last_scan = time.time()
+            self.jobs["__collect__"] = self.pool.submit(self.job_collect)
+        text = self.board()
+        _write_atomic(self.contest.state_dir / "board.txt", text)
+        return text
+
+    def run(self) -> None:
+        while True:
+            try:
+                text = self.tick()
+            except Exception as exc:  # noqa: BLE001 - keep supervising; solver windows keep running
+                text = f"검사기 오류 (다음 주기에 다시 시도): {exc!r}\n"
+            sys.stdout.write("\x1b[H\x1b[2J" + text + "\n(Ctrl-C로 검사기만 멈춤 · 풀이 창은 계속 돈다)\n")
+            sys.stdout.flush()
+            time.sleep(self.opts.tick)
+
+
+# ---------------------------------------------------------------- login helper
+
+def credential(host: str) -> dict | None:
+    """Optional ``~/.config/ctfh/credentials.toml`` entry: ``["host"] username/password``."""
+    if not host or not CREDENTIALS.is_file():
+        return None
+    if CREDENTIALS.stat().st_mode & 0o077:
+        raise ValueError(f"{CREDENTIALS} 권한이 너무 넓습니다. chmod 600 으로 바꾸세요.")
+    entry = tomllib.loads(CREDENTIALS.read_text()).get(host)
+    return entry if isinstance(entry, dict) else None
+
+
+def secret_fill(root: Path, field: str, ref: str, session: str) -> None:
+    """Fill a login field from the credentials file without the value reaching the model."""
+    if field not in ("username", "password"):
+        raise ValueError("field는 username 또는 password입니다.")
+    host = urlparse(Contest(root).url).hostname or ""
+    entry = credential(host)
+    if not entry or not isinstance(entry.get(field), str):
+        raise ValueError(f"{CREDENTIALS}에 {host}의 {field}가 없습니다.")
+    allowed = {host, *entry.get("login_hosts", [])}
+    page = subprocess.run(["chrome-use", "get", "url", "--session", session],
+                          capture_output=True, text=True, timeout=60)
+    found = re.search(r"https?://[^\s\"']+", page.stdout)
+    page_host = urlparse(found.group(0)).hostname if found else None
+    if page_host not in allowed:
+        raise ValueError(f"현재 탭 주소({page_host})가 {sorted(allowed)}가 아니라서 채우지 않습니다.")
+    done = subprocess.run(["chrome-use", "fill", ref, "--from-env", "CTFH_SECRET", "--session", session],
+                          env={**os.environ, "CTFH_SECRET": entry[field]},
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode:
+        raise RuntimeError(f"chrome-use fill 실패 (exit {done.returncode})")
+
+
+# ---------------------------------------------------------------- entry points
+
+def self_command(*args: str) -> list[str]:
+    src = Path(__file__).resolve().parents[1]
+    return ["env", f"PYTHONPATH={src}", sys.executable, "-m", "ctfh_core.cli", *args]
+
+
+LAST_CONTEST = Path.home() / ".cache" / "ctfh" / "last_contest"
+
+
+def find_root(directory: str | None, required: bool = True) -> Path | None:
+    """--dir, else the contest folder containing cwd, else the last started contest."""
+    if directory:
+        return Path(directory).expanduser().resolve()
+    here = Path.cwd().resolve()
+    for folder in (here, *here.parents[:3]):
+        if (folder / "contest.toml").is_file():
+            return folder
+    try:
+        last = Path(LAST_CONTEST.read_text().strip())
+        if (last / "contest.toml").is_file():
+            return last
+    except OSError:
+        pass
+    if required:
+        raise ValueError("대회 폴더를 찾지 못했습니다. --dir를 주거나 대회 폴더 안에서 실행하세요.")
+    return None
+
+
+def resolve_root(site: str | None, directory: str | None) -> tuple[Path, str]:
+    if directory:
+        root = Path(directory).expanduser()
+    elif site:
+        root = DEFAULT_BASE / contest_slug(site)
+    else:
+        root = find_root(None)
+    url = site or Contest(root).url
+    if not url:
+        raise ValueError(f"{root}/contest.toml에 url이 없습니다.")
+    return root.resolve(), url
+
+
+def go(site: str | None, directory: str | None, opts: Options, attach: bool = True,
+       runner=run_codex_json) -> int:
+    root, url = resolve_root(site, directory)
+    contest = init_contest(url, root)
+    tmux = Tmux(session_name(root))
+    _write_atomic(LAST_CONTEST, f"{root}\n")
+    print(f"대회 폴더: {root}")
+    if not tmux.exists():
+        while not contest.challenges():
+            print("문제를 수집하는 중입니다 (Codex + chrome-use, 몇 분 걸릴 수 있음)...", flush=True)
+            result = collect(contest, opts, runner, show=lambda text: print("  " + text, flush=True))
+            if result.get("login") != "needs_user":
+                if not contest.challenges():
+                    print("수집된 문제가 없습니다. 검사기가 주기적으로 다시 수집합니다.")
+                break
+            if not sys.stdin.isatty():
+                print(f"Chrome에서 {url} 에 로그인한 뒤 다시 실행하세요.")
+                return 3
+            input(f"Chrome에서 {url} 에 로그인한 뒤 Enter를 누르세요 (2FA·캡차 포함)... ")
+        tmux.new_session("checker", root, self_command("checker", str(root), *opts.to_args()))
+    elif "checker" not in tmux.windows():  # checker stopped (Ctrl-C): restart it with these options
+        tmux.new_window("checker", root, self_command("checker", str(root), *opts.to_args()))
+    print(f"tmux 세션: {tmux.session}  (붙기: tmux attach -t {tmux.session})")
+    if attach and sys.stdin.isatty() and sys.stdout.isatty():
+        verb = "switch-client" if os.environ.get("TMUX") else "attach"
+        os.execvp("tmux", ["tmux", verb, "-t", f"={tmux.session}"])
+    return 0
+
+
+def mark_done(root: Path, names: list[str]) -> list[str]:
+    known = {chal.name: chal for chal in Contest(root).challenges()}
+    unknown = [name for name in names if name not in known]
+    if unknown:
+        raise ValueError("모르는 문제: " + ", ".join(unknown))
+    for name in names:
+        (known[name] / "USER_SOLVED").write_text(_now() + "\n")
+    return names
+
+
+def approve(root: Path, name: str) -> dict:
+    """User override: trust the current flag.txt and (re)submit it once."""
+    known = {chal.name: chal for chal in Contest(root).challenges()}
+    if name not in known:
+        raise ValueError(f"모르는 문제: {name}")
+    chal = known[name]
+    digest = flag_hash((chal / "flag.txt").read_text().strip())
+    status = load_status(chal)
+    status.update(state="verified", flag_sha256=digest, approved_sha256=digest,
+                  flag_mtime_ns=(chal / "flag.txt").stat().st_mtime_ns, reason="사용자가 직접 승인했습니다.")
+    status.pop("retry_after", None)
+    save_status(chal, status)
+    return status
+
+
+def status_board(root: Path) -> str:
+    rows = []
+    for chal in Contest(root).challenges():
+        status = load_status(chal)
+        rows.append(f"{chal.name:<28} {status.get('state', '-'):<12} {status.get('reason', '')}")
+    return "\n".join(rows) or "(문제 없음)"

@@ -87,6 +87,7 @@ async def run_direct(
         sandbox=sandbox,
         deadline_seconds=task.deadline_seconds,
         prompt=effective_prompt,
+        base_prompt=prompt,
         admitted_capabilities=admitted_capabilities,
         memory_mode=memory_mode,
         knowledge_snapshot_digest=knowledge_digest,

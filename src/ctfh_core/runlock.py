@@ -242,6 +242,7 @@ def build_runlock(
     sandbox: str,
     deadline_seconds: float,
     prompt: str,
+    base_prompt: str | None = None,
     admitted_capabilities: tuple[str, ...] = ("native-shell", "workspace-files"),
     skill_mode: str | None = None,
     memory_mode: str = "off",
@@ -256,6 +257,35 @@ def build_runlock(
         raise ValueError("memory=off cannot include a knowledge snapshot")
     if memory_mode == "frozen" and not knowledge_snapshot_digest:
         raise ValueError("memory=frozen requires a knowledge snapshot digest")
+
+    if base_prompt is None:
+        if (
+            memory_mode == "frozen"
+            and prompt.endswith(FROZEN_KNOWLEDGE_GUIDANCE)
+        ):
+            base_prompt_value = prompt[: -len(FROZEN_KNOWLEDGE_GUIDANCE)]
+        else:
+            base_prompt_value = prompt
+    else:
+        base_prompt_value = base_prompt
+
+    if memory_mode == "off":
+        if prompt != base_prompt_value:
+            raise ValueError(
+                "memory=off effective prompt must equal the base prompt"
+            )
+        prompt_policy = "none"
+    else:
+        expected_prompt = apply_knowledge_prompt(
+            base_prompt_value,
+            memory_mode,
+        )
+        if prompt != expected_prompt:
+            raise ValueError(
+                "frozen knowledge prompt does not match the fixed guidance policy"
+            )
+        prompt_policy = "frozen-knowledge-guidance-v1"
+
     services = dict(sorted((environment_services or {
         "interactive-session": "disabled",
         "browser": "disabled",
@@ -293,6 +323,10 @@ def build_runlock(
         },
         "environment_services": services,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "prompt_base_sha256": hashlib.sha256(
+            base_prompt_value.encode()
+        ).hexdigest(),
+        "prompt_policy": prompt_policy,
         "web_search": adapter_profile["web_search"],
         "browser": services.get("browser", "disabled"),
         "browser_policy": {
@@ -322,7 +356,10 @@ def build_runlock(
 
 def write_runlock(path: Path, lock: RunLock) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    if path.exists():
+        raise FileExistsError(f"runlock is write-once: {path}")
+
+    payload = (
         json.dumps(
             {
                 "treatment": lock.treatment,
@@ -334,4 +371,19 @@ def write_runlock(path: Path, lock: RunLock) -> None:
             sort_keys=True,
         )
         + "\n"
-    )
+    ).encode()
+    temp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        with temp.open("xb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        temp.chmod(0o444)
+        os.replace(temp, path)
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        temp.unlink(missing_ok=True)

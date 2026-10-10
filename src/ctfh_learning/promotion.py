@@ -8,6 +8,13 @@ from statistics import mean
 from typing import Iterable
 
 from .evidence import VerifiedTraceEvidence
+from .runlock import (
+    VerifiedRunLock,
+    assert_baseline_excludes_candidate,
+    assert_candidate_is_pinned,
+    normalized_profile,
+    verify_runlock,
+)
 from .util import (
     LearningError,
     atomic_json,
@@ -36,6 +43,7 @@ class EvaluationRecord:
     authoritative_result_s: float
     evaluator_version: str
     runlock_base_hash: str = ""
+    runlock_path: str = ""
     candidate_artifact_digest: str | None = None
     split: str = "promotion"
 
@@ -64,6 +72,10 @@ class EvaluationRecord:
             self.runlock_base_hash,
             f"evaluation runlock_base_hash for {self.task_id}",
         )
+        if not isinstance(self.runlock_path, str) or not self.runlock_path:
+            raise LearningError(
+                f"evaluation runlock_path is required: {self.task_id}"
+            )
         if self.variant == "candidate":
             require_sha256(
                 self.candidate_artifact_digest,
@@ -75,7 +87,16 @@ class EvaluationRecord:
             )
 
 
-def _load_candidate(path: Path) -> dict[str, object]:
+def _candidate_root(manifest: Path) -> Path:
+    candidates_dir = manifest.parent.parent
+    if candidates_dir.name != "candidates":
+        raise LearningError(
+            "candidate manifest must live under <learning-root>/candidates"
+        )
+    return candidates_dir.parent.resolve()
+
+
+def _read_candidate_core(path: Path) -> tuple[Path, dict[str, object]]:
     manifest = path.resolve(strict=True)
     if manifest.stat().st_mode & 0o222:
         raise LearningError("candidate manifest must be sealed read-only")
@@ -89,10 +110,7 @@ def _load_candidate(path: Path) -> dict[str, object]:
     kind = data.get("kind")
     if kind not in {"knowledge", "skill"}:
         raise LearningError("candidate kind must be knowledge or skill")
-    digest = require_sha256(
-        data.get("content_digest"),
-        "content_digest",
-    )
+    digest = require_sha256(data.get("content_digest"), "content_digest")
 
     source_task_ids = data.get("source_task_ids")
     if not isinstance(source_task_ids, list) or not source_task_ids:
@@ -158,6 +176,128 @@ def _load_candidate(path: Path) -> dict[str, object]:
         raise LearningError("candidate content is not a directory")
     if tree_snapshot_digest(content) != digest:
         raise LearningError("candidate content digest mismatch")
+    return manifest, data
+
+
+def _wiki_reference_provenance(
+    root: Path,
+    wiki_event_hashes: Iterable[str],
+) -> tuple[set[str], set[str]]:
+    requested = {
+        require_sha256(value, "wiki_event_hash")
+        for value in wiki_event_hashes
+    }
+    if not requested:
+        return set(), set()
+
+    events = {
+        str(event["event_hash"]): event
+        for event in replay_wiki(root)
+    }
+    missing = sorted(requested - set(events))
+    if missing:
+        raise LearningError(
+            "unresolved wiki event reference(s): " + ", ".join(missing)
+        )
+
+    tasks: set[str] = set()
+    traces: set[str] = set()
+    for event_hash in requested:
+        event = events[event_hash]
+        task_ids = event.get("task_ids")
+        source_hashes = event.get("source_trace_hashes")
+        if not isinstance(task_ids, list) or not all(
+            isinstance(value, str) and value for value in task_ids
+        ):
+            raise LearningError(
+                f"wiki event {event_hash} has invalid task provenance"
+            )
+        if not isinstance(source_hashes, list):
+            raise LearningError(
+                f"wiki event {event_hash} has invalid trace provenance"
+            )
+        tasks.update(task_ids)
+        traces.update(
+            require_sha256(value, "wiki source_trace_hash")
+            for value in source_hashes
+        )
+    return tasks, traces
+
+
+def _find_parent_candidate(root: Path, parent_digest: str) -> Path:
+    candidates_dir = root / "candidates"
+    matches: list[Path] = []
+    if candidates_dir.is_dir():
+        for manifest in sorted(candidates_dir.glob("*/candidate.json")):
+            _, data = _read_candidate_core(manifest)
+            if data.get("content_digest") == parent_digest:
+                matches.append(manifest)
+    if not matches:
+        raise LearningError(
+            f"unresolved parent candidate digest: {parent_digest}"
+        )
+    if len(matches) > 1:
+        raise LearningError(
+            f"ambiguous parent candidate digest: {parent_digest}"
+        )
+    return matches[0]
+
+
+def _referenced_provenance(
+    root: Path,
+    *,
+    wiki_event_hashes: Iterable[str],
+    parent_digest: str | None,
+    visited_candidate_ids: frozenset[str] = frozenset(),
+) -> tuple[set[str], set[str]]:
+    tasks, traces = _wiki_reference_provenance(root, wiki_event_hashes)
+    if parent_digest is None:
+        return tasks, traces
+
+    parent_manifest = _find_parent_candidate(root, parent_digest)
+    _, parent_core = _read_candidate_core(parent_manifest)
+    parent_id = str(parent_core["candidate_id"])
+    if parent_id in visited_candidate_ids:
+        raise LearningError("candidate parent provenance cycle detected")
+    parent = _load_candidate(
+        parent_manifest,
+        _visited_candidate_ids=visited_candidate_ids,
+    )
+    tasks.update(str(value) for value in parent["source_task_ids"])
+    traces.update(str(value) for value in parent["source_trace_hashes"])
+    return tasks, traces
+
+
+def _load_candidate(
+    path: Path,
+    *,
+    _visited_candidate_ids: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    manifest, data = _read_candidate_core(path)
+    candidate_id = str(data["candidate_id"])
+    if candidate_id in _visited_candidate_ids:
+        raise LearningError("candidate parent provenance cycle detected")
+    root = _candidate_root(manifest)
+    inherited_tasks, inherited_traces = _referenced_provenance(
+        root,
+        wiki_event_hashes=data["wiki_event_hashes"],
+        parent_digest=data["parent_digest"],
+        visited_candidate_ids=_visited_candidate_ids | {candidate_id},
+    )
+    declared_tasks = {str(value) for value in data["source_task_ids"]}
+    declared_traces = {str(value) for value in data["source_trace_hashes"]}
+    missing_tasks = inherited_tasks - declared_tasks
+    missing_traces = inherited_traces - declared_traces
+    if missing_tasks:
+        raise LearningError(
+            "candidate omits inherited task provenance: "
+            + ", ".join(sorted(missing_tasks))
+        )
+    if missing_traces:
+        raise LearningError(
+            "candidate omits inherited trace provenance: "
+            + ", ".join(sorted(missing_traces))
+        )
     return data
 
 
@@ -174,11 +314,12 @@ def create_candidate(
     if kind not in {"knowledge", "skill"}:
         raise LearningError("candidate kind must be knowledge or skill")
 
+    root = root.resolve()
     evidence = tuple(source_evidence)
     if not evidence:
         raise LearningError("candidate requires at least one source trace")
-    source_tasks = sorted({item.task_id for item in evidence})
-    source_hashes = sorted({item.manifest_sha256 for item in evidence})
+    direct_tasks = {item.task_id for item in evidence}
+    direct_hashes = {item.manifest_sha256 for item in evidence}
     wiki_hashes = sorted(
         {
             require_sha256(value, "wiki_event_hash")
@@ -187,6 +328,14 @@ def create_candidate(
     )
     if parent_digest is not None:
         parent_digest = require_sha256(parent_digest, "parent_digest")
+
+    inherited_tasks, inherited_hashes = _referenced_provenance(
+        root,
+        wiki_event_hashes=wiki_hashes,
+        parent_digest=parent_digest,
+    )
+    source_tasks = sorted(direct_tasks | inherited_tasks)
+    source_hashes = sorted(direct_hashes | inherited_hashes)
 
     source = content_dir.resolve()
     if kind == "skill":
@@ -209,7 +358,7 @@ def create_candidate(
     candidate_hash = sha256_bytes(canonical_json(core))
     candidate_id = f"{kind}-{candidate_hash[:16]}"
 
-    candidate_dir = root.resolve() / "candidates" / candidate_id
+    candidate_dir = root / "candidates" / candidate_id
     content_out = candidate_dir / "content"
     manifest_path = candidate_dir / "candidate.json"
 
@@ -233,6 +382,62 @@ def create_candidate(
     }
     atomic_json(manifest_path, record, read_only=True)
     return manifest_path
+
+
+def _verified_evaluation_runlock(
+    record: EvaluationRecord,
+) -> VerifiedRunLock:
+    record.validate()
+    runlock = verify_runlock(Path(record.runlock_path))
+    if runlock.base_hash != record.runlock_base_hash:
+        raise LearningError(
+            f"evaluation RunLock hash mismatch: {record.task_id}"
+        )
+    if runlock.base_config.get("task_id") != record.task_id:
+        raise LearningError(
+            f"evaluation RunLock task_id mismatch: {record.task_id}"
+        )
+    return runlock
+
+
+def _validate_runlock_treatment_pair(
+    candidate: dict[str, object],
+    baseline: VerifiedRunLock,
+    proposed: VerifiedRunLock,
+    *,
+    task_id: str,
+) -> None:
+    if baseline.treatment != proposed.treatment:
+        raise LearningError(
+            f"RunLock treatment mismatch for task {task_id}"
+        )
+
+    kind = str(candidate["kind"])
+    digest = str(candidate["content_digest"])
+    assert_baseline_excludes_candidate(
+        baseline,
+        candidate_kind=kind,
+        candidate_digest=digest,
+    )
+    assert_candidate_is_pinned(
+        proposed,
+        candidate_kind=kind,
+        candidate_digest=digest,
+    )
+
+    baseline_profile = normalized_profile(
+        baseline.base_config,
+        candidate_kind=kind,
+    )
+    proposed_profile = normalized_profile(
+        proposed.base_config,
+        candidate_kind=kind,
+    )
+    if baseline_profile != proposed_profile:
+        raise LearningError(
+            f"baseline/candidate RunLock profiles differ outside "
+            f"the candidate treatment: {task_id}"
+        )
 
 
 def _records_by_task(
@@ -388,6 +593,7 @@ def evaluate_candidate(
         )
 
     evaluator_versions: set[str] = set()
+    verified_runlocks: dict[str, dict[str, object]] = {}
     for task_id in sorted(promotion_tasks):
         left = baseline[task_id]
         right = proposed[task_id]
@@ -399,6 +605,71 @@ def evaluate_candidate(
             raise LearningError(
                 f"candidate evaluation is bound to the wrong artifact: {task_id}"
             )
+
+        baseline_runlock = verify_runlock(Path(left.runlock_path))
+        candidate_runlock = verify_runlock(Path(right.runlock_path))
+        if baseline_runlock.base_hash != left.runlock_base_hash:
+            raise LearningError(
+                f"baseline evaluation RunLock hash mismatch: {task_id}"
+            )
+        if candidate_runlock.base_hash != right.runlock_base_hash:
+            raise LearningError(
+                f"candidate evaluation RunLock hash mismatch: {task_id}"
+            )
+        if baseline_runlock.base_config.get("task_id") != task_id:
+            raise LearningError(
+                f"baseline evaluation RunLock task_id mismatch: {task_id}"
+            )
+        if candidate_runlock.base_config.get("task_id") != task_id:
+            raise LearningError(
+                f"candidate evaluation RunLock task_id mismatch: {task_id}"
+            )
+        if baseline_runlock.treatment != candidate_runlock.treatment:
+            raise LearningError(
+                f"baseline/candidate treatment mismatch: {task_id}"
+            )
+
+        candidate_kind = str(candidate["kind"])
+        candidate_digest = str(candidate["content_digest"])
+        assert_baseline_excludes_candidate(
+            baseline_runlock,
+            candidate_kind=candidate_kind,
+            candidate_digest=candidate_digest,
+        )
+        assert_candidate_is_pinned(
+            candidate_runlock,
+            candidate_kind=candidate_kind,
+            candidate_digest=candidate_digest,
+        )
+        baseline_profile = normalized_profile(
+            baseline_runlock.base_config,
+            candidate_kind=candidate_kind,
+        )
+        candidate_profile = normalized_profile(
+            candidate_runlock.base_config,
+            candidate_kind=candidate_kind,
+        )
+        if baseline_profile != candidate_profile:
+            raise LearningError(
+                f"non-treatment RunLock settings differ for task {task_id}"
+            )
+
+        verified_runlocks[task_id] = {
+            "baseline": {
+                "path": str(baseline_runlock.path),
+                "treatment": baseline_runlock.treatment,
+                "base_hash": baseline_runlock.base_hash,
+                "full_hash": baseline_runlock.full_hash,
+                "base_config": baseline_runlock.base_config,
+            },
+            "candidate": {
+                "path": str(candidate_runlock.path),
+                "treatment": candidate_runlock.treatment,
+                "base_hash": candidate_runlock.base_hash,
+                "full_hash": candidate_runlock.full_hash,
+                "base_config": candidate_runlock.base_config,
+            },
+        }
         evaluator_versions.add(left.evaluator_version)
 
     baseline_rate = mean(
@@ -446,6 +717,7 @@ def evaluate_candidate(
         "promotion_task_ids": sorted(promotion_tasks),
         "final_reserved_task_ids": sorted(final_reserved),
         "evaluator_versions": sorted(evaluator_versions),
+        "runlocks": verified_runlocks,
         "thresholds": {
             "min_solve_rate_delta": min_solve_rate_delta,
             "max_latency_regression_ratio": max_latency_regression_ratio,

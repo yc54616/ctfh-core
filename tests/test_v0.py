@@ -20,6 +20,7 @@ from ctfh_core.runlock import (
     apply_knowledge_prompt,
     build_runlock,
     resolve_knowledge_snapshot,
+    write_runlock,
 )
 from ctfh_core.store import StateStore
 from ctfh_core.target import LocalTargetProvider
@@ -77,6 +78,60 @@ class V0Tests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNone(proc.returncode)
             await provider.kill(env, grace_s=0.05)
+            self.assertIsNotNone(proc.returncode)
+            self.assertFalse(env.processes)
+        finally:
+            devnull.close()
+            await provider.destroy(owner)
+
+    async def test_concurrent_kill_callers_share_one_teardown(self):
+        provider = LocalWorkerEnvironmentProvider(self.root / "envs")
+        owner = WorkerOwnerTag("r", 1, self.task.task_id, "kill-singleflight")
+        env = await provider.create(self.task, owner, CancelToken())
+        devnull = open("/dev/null", "wb")
+        proc = await provider.spawn(
+            env,
+            ["python3", "-c", "import time; time.sleep(60)"],
+            stdout=devnull,
+            stderr=devnull,
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        original = provider._kill_once
+
+        async def delayed_kill_once(target_env, *, grace_s=1.0):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            await original(target_env, grace_s=grace_s)
+
+        try:
+            with patch.object(provider, "_kill_once", new=delayed_kill_once):
+                first = asyncio.create_task(
+                    provider.kill(env, grace_s=0.05)
+                )
+                await asyncio.wait_for(started.wait(), timeout=1.0)
+                second = asyncio.create_task(
+                    provider.kill(env, grace_s=0.05)
+                )
+                first.cancel()
+                await asyncio.sleep(0.02)
+                self.assertEqual(calls, 1)
+                release.set()
+                results = await asyncio.gather(
+                    first,
+                    second,
+                    return_exceptions=True,
+                )
+                self.assertIsInstance(results[0], asyncio.CancelledError)
+                self.assertIsNone(results[1])
+
+                await provider.kill(env, grace_s=0.05)
+                self.assertEqual(calls, 1)
+
             self.assertIsNotNone(proc.returncode)
             self.assertFalse(env.processes)
         finally:

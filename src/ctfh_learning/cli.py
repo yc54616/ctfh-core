@@ -18,6 +18,7 @@ _EVAL_KEYS = {
     "authoritative_result_s",
     "evaluator_version",
     "runlock_base_hash",
+    "runlock_path",
     "candidate_artifact_digest",
     "split",
 }
@@ -99,6 +100,7 @@ def _record(raw: object, variant: str) -> EvaluationRecord:
         "authoritative_result_s",
         "evaluator_version",
         "runlock_base_hash",
+        "runlock_path",
     }
     missing = required - set(raw)
     if missing:
@@ -118,6 +120,7 @@ def _record(raw: object, variant: str) -> EvaluationRecord:
         authoritative_result_s=float(raw["authoritative_result_s"]),
         evaluator_version=str(raw["evaluator_version"]),
         runlock_base_hash=str(raw["runlock_base_hash"]),
+        runlock_path=str(raw["runlock_path"]),
         candidate_artifact_digest=(
             None
             if raw.get("candidate_artifact_digest") is None

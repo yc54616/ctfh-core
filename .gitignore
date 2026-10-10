@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 *.egg-info/
 .ctfh-runs/
+.ctfh-live/
 .intent/generated/
 .intent/.lock
 

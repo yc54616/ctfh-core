@@ -1583,7 +1583,7 @@ class LocalWorkerEnvironmentProvider:
     ) -> None:
         label = env.owner.label()
         teardown = self._kill_tasks.get(label)
-        if teardown is None or teardown.done():
+        if teardown is None:
             teardown = asyncio.create_task(
                 self._kill_once(env, grace_s=grace_s)
             )
@@ -1753,6 +1753,7 @@ class LocalWorkerEnvironmentProvider:
         self._browsers.pop(label, None)
         self._browser_rpc_tasks.pop(label, None)
         self._browser_start_locks.pop(label, None)
+        self._kill_tasks.pop(label, None)
         root = self._env_root(owner)
         await asyncio.to_thread(self._remove_owned_tree_sync, root)
 

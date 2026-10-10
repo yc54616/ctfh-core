@@ -16,7 +16,7 @@ from ctfh_learning import (
     replay_wiki,
     verify_trace_manifest,
 )
-from ctfh_learning.util import tree_snapshot_digest
+from ctfh_learning.util import canonical_json, sha256_bytes, tree_snapshot_digest
 
 
 RUNLOCK_HASH = "d" * 64
@@ -76,6 +76,105 @@ class LearningTests(unittest.TestCase):
     def _candidate_digest(candidate: Path) -> str:
         return str(json.loads(candidate.read_text())["content_digest"])
 
+    def _write_runlock(
+        self,
+        *,
+        task_id: str,
+        variant: str,
+        candidate: Path | None,
+        treatment: str = "learning-eval",
+        mutate: dict[str, object] | None = None,
+        candidate_digest_override: str | None = None,
+    ) -> tuple[Path, str]:
+        base: dict[str, object] = {
+            "task_id": task_id,
+            "worker_environment": "local-bwrap-pidns-v0",
+            "agent": {
+                "adapter": "codex-cli",
+                "model": "gpt-6-sol",
+                "reasoning_effort": "high",
+            },
+            "capabilities": {
+                "policy": "static-narrow-only-v3",
+                "admitted": ["native-shell", "workspace-files"],
+            },
+            "environment_services": {
+                "browser": "disabled",
+                "interactive-session": "disabled",
+            },
+            "skills": {
+                "mode": "host-pinned",
+                "digest": "b" * 64,
+                "read_only": True,
+                "materializer": "codex-native-copy-v1",
+            },
+            "memory": {
+                "mode": "off",
+                "knowledge_snapshot_digest": None,
+                "native_memory_isolated": True,
+                "read_only": True,
+                "materializer": "none",
+            },
+            "prompt_sha256": "0" * 64,
+            "prompt_base_sha256": "0" * 64,
+            "prompt_policy": "none",
+            "browser_policy": {
+                "allowed_domains": [],
+                "profile": "disposable-attempt-local",
+                "cross_attempt_reuse": False,
+            },
+            "outcome_authority": "local-exact-candidate-v0",
+        }
+        if variant == "candidate":
+            if candidate is None:
+                raise AssertionError("candidate runlock requires candidate manifest")
+            data = json.loads(candidate.read_text())
+            digest = str(data["content_digest"])
+            actual_digest = candidate_digest_override or digest
+            if data["kind"] == "knowledge":
+                base["memory"] = {
+                    "mode": "frozen",
+                    "knowledge_snapshot_digest": actual_digest,
+                    "native_memory_isolated": True,
+                    "read_only": True,
+                    "materializer": "snapshot-copy-v1",
+                }
+                base["prompt_sha256"] = "1" * 64
+                base["prompt_policy"] = "frozen-knowledge-guidance-v1"
+            else:
+                base["skills"] = {
+                    "mode": "candidate",
+                    "digest": actual_digest,
+                    "read_only": True,
+                    "materializer": "candidate-copy-v1",
+                }
+
+        def merge(dst: dict[str, object], patch: dict[str, object]) -> None:
+            for key, value in patch.items():
+                current = dst.get(key)
+                if isinstance(current, dict) and isinstance(value, dict):
+                    merge(current, value)
+                else:
+                    dst[key] = value
+
+        if mutate:
+            merge(base, mutate)
+        base_hash = sha256_bytes(canonical_json(base))
+        payload: dict[str, object] = {
+            "treatment": treatment,
+            "base_config": base,
+            "base_hash": base_hash,
+        }
+        payload["full_hash"] = sha256_bytes(
+            canonical_json({"treatment": treatment, "base": base})
+        )
+        root = self.root / "runlocks"
+        root.mkdir(exist_ok=True)
+        path = root / f"{task_id}-{variant}-{len(list(root.glob('*.json'))):04d}.json"
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        path.chmod(0o444)
+        return path, base_hash
+
     def _record(
         self,
         *,
@@ -87,15 +186,27 @@ class LearningTests(unittest.TestCase):
         authoritative: bool = True,
         evaluator_version: str = "eval-v1",
         artifact_digest: str | None = None,
+        runlock_mutate: dict[str, object] | None = None,
+        runlock_candidate_digest: str | None = None,
+        treatment: str = "learning-eval",
     ) -> EvaluationRecord:
-        if variant == "candidate":
-            digest = (
-                artifact_digest
-                if artifact_digest is not None
-                else self._candidate_digest(candidate)  # type: ignore[arg-type]
+        digest = (
+            artifact_digest
+            if variant == "candidate" and artifact_digest is not None
+            else (
+                self._candidate_digest(candidate)
+                if variant == "candidate"
+                else None
             )
-        else:
-            digest = None
+        )
+        runlock_path, runlock_hash = self._write_runlock(
+            task_id=task_id,
+            variant=variant,
+            candidate=candidate,
+            treatment=treatment,
+            mutate=runlock_mutate,
+            candidate_digest_override=runlock_candidate_digest,
+        )
         return EvaluationRecord(
             task_id=task_id,
             variant=variant,
@@ -103,7 +214,8 @@ class LearningTests(unittest.TestCase):
             authoritative=authoritative,
             authoritative_result_s=latency,
             evaluator_version=evaluator_version,
-            runlock_base_hash=RUNLOCK_HASH,
+            runlock_base_hash=runlock_hash,
+            runlock_path=str(runlock_path),
             candidate_artifact_digest=digest,
         )
 
@@ -599,6 +711,217 @@ class LearningTests(unittest.TestCase):
                 final_reserved_task_ids=("final-a",),
             )
 
+    def test_tampered_runlock_file_is_rejected(self):
+        evidence = self._sealed_evidence(task_id="source-a")
+        candidate = self._candidate(evidence)
+        baseline = self._record(
+            task_id="promotion-a", variant="baseline", passed=True, latency=1.0
+        )
+        proposed = self._record(
+            task_id="promotion-a", variant="candidate", passed=True, latency=1.0, candidate=candidate
+        )
+        path = Path(proposed.runlock_path)
+        data = json.loads(path.read_text())
+        data["base_config"]["agent"]["model"] = "tampered-model"
+        path.chmod(0o644)
+        path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        path.chmod(0o444)
+        with self.assertRaisesRegex(LearningError, "runlock base_hash mismatch"):
+            promote_or_reject(
+                self.root, candidate,
+                baseline_records=(baseline,), candidate_records=(proposed,),
+                final_reserved_task_ids=("final-a",),
+            )
+
+    def test_non_treatment_runlock_mismatch_is_rejected(self):
+        evidence = self._sealed_evidence(task_id="source-a")
+        candidate = self._candidate(evidence)
+        baseline = self._record(
+            task_id="promotion-a", variant="baseline", passed=True, latency=1.0
+        )
+        proposed = self._record(
+            task_id="promotion-a", variant="candidate", passed=True, latency=1.0, candidate=candidate,
+            runlock_mutate={"agent": {"model": "different-model"}},
+        )
+        with self.assertRaisesRegex(LearningError, "non-treatment RunLock settings differ"):
+            promote_or_reject(
+                self.root, candidate,
+                baseline_records=(baseline,), candidate_records=(proposed,),
+                final_reserved_task_ids=("final-a",),
+            )
+
+    def test_candidate_runlock_must_pin_exact_candidate_digest(self):
+        evidence = self._sealed_evidence(task_id="source-a")
+        candidate = self._candidate(evidence)
+        baseline = self._record(
+            task_id="promotion-a", variant="baseline", passed=True, latency=1.0
+        )
+        proposed = self._record(
+            task_id="promotion-a", variant="candidate", passed=True, latency=1.0, candidate=candidate,
+            runlock_candidate_digest="e" * 64,
+        )
+        with self.assertRaisesRegex(LearningError, "wrong knowledge digest"):
+            promote_or_reject(
+                self.root, candidate,
+                baseline_records=(baseline,), candidate_records=(proposed,),
+                final_reserved_task_ids=("final-a",),
+            )
+
+    def test_wiki_reference_inherits_final_reserved_provenance(self):
+        direct = self._sealed_evidence(task_id="source-direct")
+        reserved = self._sealed_evidence(task_id="final-from-wiki")
+        event = append_wiki_event(
+            self.root,
+            kind="hypothesis",
+            body={"claim": "reserved-derived hypothesis"},
+            evidence=(reserved,),
+            tags=("inherited",),
+        )
+        content = self.root / "wiki-inherited-content"
+        content.mkdir()
+        (content / "knowledge.md").write_text("WIKI-INHERITED\n")
+        candidate = create_candidate(
+            self.root,
+            kind="knowledge",
+            content_dir=content,
+            source_evidence=(direct,),
+            wiki_event_hashes=(str(event["event_hash"]),),
+        )
+        data = json.loads(candidate.read_text())
+        self.assertEqual(
+            data["source_task_ids"],
+            ["final-from-wiki", "source-direct"],
+        )
+        self.assertIn(
+            reserved.manifest_sha256,
+            data["source_trace_hashes"],
+        )
+
+        baseline = (
+            self._record(
+                task_id="promotion-wiki",
+                variant="baseline",
+                passed=True,
+                latency=1.0,
+            ),
+        )
+        proposed = (
+            self._record(
+                task_id="promotion-wiki",
+                variant="candidate",
+                passed=True,
+                latency=1.0,
+                candidate=candidate,
+            ),
+        )
+        with self.assertRaisesRegex(
+            LearningError,
+            "source-trace tasks overlap final untouched",
+        ):
+            promote_or_reject(
+                self.root,
+                candidate,
+                baseline_records=baseline,
+                candidate_records=proposed,
+                final_reserved_task_ids=("final-from-wiki",),
+            )
+
+    def test_parent_candidate_inherits_final_reserved_provenance(self):
+        parent_evidence = self._sealed_evidence(task_id="final-from-parent")
+        parent_content = self.root / "parent-content"
+        parent_content.mkdir()
+        (parent_content / "knowledge.md").write_text("PARENT\n")
+        parent = create_candidate(
+            self.root,
+            kind="knowledge",
+            content_dir=parent_content,
+            source_evidence=(parent_evidence,),
+        )
+        parent_data = json.loads(parent.read_text())
+
+        child_evidence = self._sealed_evidence(task_id="source-child")
+        child_content = self.root / "child-content"
+        child_content.mkdir()
+        (child_content / "knowledge.md").write_text("CHILD\n")
+        child = create_candidate(
+            self.root,
+            kind="knowledge",
+            content_dir=child_content,
+            source_evidence=(child_evidence,),
+            parent_digest=str(parent_data["content_digest"]),
+        )
+        child_data = json.loads(child.read_text())
+        self.assertEqual(
+            child_data["source_task_ids"],
+            ["final-from-parent", "source-child"],
+        )
+        self.assertIn(
+            parent_evidence.manifest_sha256,
+            child_data["source_trace_hashes"],
+        )
+
+        baseline = (
+            self._record(
+                task_id="promotion-parent",
+                variant="baseline",
+                passed=True,
+                latency=1.0,
+            ),
+        )
+        proposed = (
+            self._record(
+                task_id="promotion-parent",
+                variant="candidate",
+                passed=True,
+                latency=1.0,
+                candidate=child,
+            ),
+        )
+        with self.assertRaisesRegex(
+            LearningError,
+            "source-trace tasks overlap final untouched",
+        ):
+            promote_or_reject(
+                self.root,
+                child,
+                baseline_records=baseline,
+                candidate_records=proposed,
+                final_reserved_task_ids=("final-from-parent",),
+            )
+
+    def test_unresolved_provenance_references_fail_closed(self):
+        evidence = self._sealed_evidence(task_id="source-a")
+
+        wiki_content = self.root / "bad-wiki-content"
+        wiki_content.mkdir()
+        (wiki_content / "knowledge.md").write_text("BAD-WIKI\n")
+        with self.assertRaisesRegex(
+            LearningError,
+            "unresolved wiki event reference",
+        ):
+            create_candidate(
+                self.root,
+                kind="knowledge",
+                content_dir=wiki_content,
+                source_evidence=(evidence,),
+                wiki_event_hashes=("e" * 64,),
+            )
+
+        parent_content = self.root / "bad-parent-content"
+        parent_content.mkdir()
+        (parent_content / "knowledge.md").write_text("BAD-PARENT\n")
+        with self.assertRaisesRegex(
+            LearningError,
+            "unresolved parent candidate digest",
+        ):
+            create_candidate(
+                self.root,
+                kind="knowledge",
+                content_dir=parent_content,
+                source_evidence=(evidence,),
+                parent_digest="f" * 64,
+            )
+
     def test_skill_candidate_requires_exactly_one_root_skill_md(self):
         evidence = self._sealed_evidence(task_id="source-skill")
 
@@ -646,7 +969,7 @@ class LearningTests(unittest.TestCase):
                             "authoritative": True,
                             "authoritative_result_s": 1.0,
                             "evaluator_version": "eval-v1",
-                            "runlock_base_hash": RUNLOCK_HASH,
+                            "runlock_base_hash": "d" * 64,
                             "expected_candidate": "SECRET",
                         }
                     ],
@@ -657,7 +980,7 @@ class LearningTests(unittest.TestCase):
                             "authoritative": True,
                             "authoritative_result_s": 1.0,
                             "evaluator_version": "eval-v1",
-                            "runlock_base_hash": RUNLOCK_HASH,
+                            "runlock_base_hash": "d" * 64,
                             "candidate_artifact_digest": "e" * 64,
                         }
                     ],
