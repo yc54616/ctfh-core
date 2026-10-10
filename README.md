@@ -190,8 +190,9 @@ rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it
    (`--max-parallel`, default 0 = every challenge at once). Attach with `tmux attach -t ctfh-<contest>` and
    type into any window as usual.
 3. The checker re-runs `solve.py` and requires the same flag. It submits each
-   flag hash through Chrome (`ctfh-submit`) on a queue of its own, so checks keep
-   running; flags queued together go out in one Codex run (up to 8). A wrong flag is never resent; an unclear
+   flag hash through Chrome, every ready flag at once, each from its own
+   chrome-use session (`ctfh-submit-<slug>`) that the checker closes when the run
+   ends; checks keep running meanwhile. A wrong flag is never resent; an unclear
    outcome (error, timeout, interrupted run) is resent up to 3 times, 2 minutes
    apart, before it is left `unknown` for you. It reviews `writeup.md`
    blind-first, sends `[검사기] …` feedback into the solver window, and closes it
@@ -234,8 +235,9 @@ Checker safeguards:
   closed, the challenge waits for the server instead of counting as a wrong solve.
 - **Attachments download in the background**: collecting only lists
   challenges and their attachments, so web/remote challenges start right away.
-  A separate cheap Codex run (rescan model) fetches attachments smallest first,
-  big forensics images last; each challenge opens as soon as its own files are
+  Cheap Codex runs (rescan model) fetch the attachments of every challenge at
+  once, each in its own chrome-use session (`ctfh-download-<slug>`, closed when
+  the run ends); each challenge opens as soon as its own files are
   complete (`files/.ctfh-done`). After 3 failed tries it starts with whatever
   arrived.
 - **Checker restarts itself** after a crash (5 s later); `q`/Ctrl-C ends it, and

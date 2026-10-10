@@ -8,7 +8,6 @@ is the only contract between the solver sessions and the checker.
 
 from __future__ import annotations
 
-import collections
 import concurrent.futures as cf
 import hashlib
 import json
@@ -196,7 +195,6 @@ USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
 SUBMIT_RETRIES = 3  # resend a flag whose submit outcome stayed unclear this many times
 SUBMIT_RETRY_SECONDS = 120
-SUBMIT_BATCH = 8  # flags one submit run sends in a row
 OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
 OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
 OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
@@ -476,11 +474,8 @@ COLLECT_SCHEMA = _strict({
     "notes": {"type": "string"},
 })
 SUBMIT_SCHEMA = _strict({
-    "results": {"type": "array", "items": _strict({
-        "slug": {"type": "string"},
-        "result": {"type": "string", "enum": ["accepted", "wrong", "already_solved", "unknown", "needs_user"]},
-        "message": {"type": "string"},
-    })},
+    "result": {"type": "string", "enum": ["accepted", "wrong", "already_solved", "unknown", "needs_user"]},
+    "message": {"type": "string"},
 })
 REVIEW_SCHEMA = _strict({
     "expected_approach": {"type": "string"},
@@ -600,22 +595,6 @@ def files_ready(chal: Path, status: dict) -> bool:
     return not attachments or (chal / "files" / FILES_DONE).exists() or bool(status.get("files_failed"))
 
 
-def _download_size(chal: Path) -> float:
-    """Rough attachment size for ordering; an unknown size counts as big for forensics."""
-    info = _read_json(chal / "challenge.json", {})
-    info = info if isinstance(info, dict) else {}
-    total = 0.0
-    for item in info.get("attachments") or []:
-        size = str(item.get("size") or "") if isinstance(item, dict) else ""
-        match = re.search(r"(\d+(?:\.\d+)?)\s*([KMGT]?)i?B", size, re.I)
-        if match:
-            unit = match.group(2).upper()
-            total += float(match.group(1)) * (1024 ** ("KMGT".index(unit) + 1) if unit else 1)
-        else:
-            total += 1e9 if "forens" in str(info.get("category", "")).lower() else 1e6
-    return total
-
-
 def _size_text(size: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024 or unit == "GB":
@@ -624,20 +603,40 @@ def _size_text(size: float) -> str:
     return ""
 
 
-def download(contest: Contest, opts: Options, chals: list[Path], runner=run_codex_json, show=None) -> dict:
-    order = ", ".join(chal.name for chal in sorted(chals, key=_download_size))
+def browser_rules(session: str) -> str:
+    """The few chrome-use commands a checker job needs, so it does not spend a turn reading the manual."""
+    browser = f"env AGENT_BROWSER_SESSION={session} chrome-use"
+    return f"""chrome-use는 아래 명령으로 쓴다. 이것으로 안 될 때만 `chrome-use skills get core`를 읽는다.
+- 열기: `{browser} open <URL>`
+- 요소 보기: `{browser} snapshot -i -c` (클릭·입력할 요소의 @ref를 얻는다)
+- 클릭: `{browser} click @eN --observe`
+- 파일 받기: `{browser} download @eN <저장 경로>` 또는 `{browser} download-url <URL> <저장 경로>`
+다른 작업도 각자 다른 세션으로 동시에 Chrome을 쓰고 있다. 이 세션 `{session}`만 쓰고 다른 탭은 건드리지 마라."""
+
+
+def close_browser(session: str) -> None:
+    """Close what a checker job's own chrome-use session opened; the user's Chrome and other sessions stay."""
+    try:
+        subprocess.run(["chrome-use", "--session", session, "close"], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json) -> dict:
+    slug = chal.name
     prompt = f"""너는 CTF 대회의 첨부 파일 다운로드 담당이다. 대상: {contest.url}
-문제를 풀지 마라. 현재 폴더가 대회 폴더다.
-1. 먼저 `chrome-use skills get core`로 사용법을 읽고, 사용자의 로그인된 Chrome을 세션 이름 `ctfh-download`로 쓴다.
-2. 아래 순서대로 문제마다 challenges/<slug>/challenge.json의 attachments를 challenges/<slug>/files/에 내려받는다
-   (압축은 풀지 않는다). 작은 것부터 받도록 이미 정렬해 두었다: {order}
-3. 한 문제의 첨부를 끝까지 다 받았으면 (크기가 사이트에 보인 크기와 맞는지 확인) 다음 문제로 넘어가기 전에 바로
-   challenges/<slug>/files/{FILES_DONE} 빈 파일을 만든다. 검사기는 이 파일을 보는 즉시 그 문제의 풀이를 시작한다.
-   덜 받은 파일이 있으면 만들지 마라.
-4. 받지 못한 문제는 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고
-   남은 문제를 모두 failed로 적고 끝낸다.
+문제를 풀지 마라. 현재 폴더가 대회 폴더다. 사용자의 로그인된 Chrome을 쓴다.
+{browser_rules(session)}
+1. challenges/{slug}/challenge.json의 attachments를 challenges/{slug}/files/에 내려받는다 (압축은 풀지 않는다).
+   다른 문제의 첨부는 다른 작업이 받고 있으니 이 문제만 다룬다.
+2. 끝까지 다 받았으면 (크기가 사이트에 보인 크기와 맞는지 확인) challenges/{slug}/files/{FILES_DONE} 빈 파일을 만든다.
+   검사기는 이 파일을 보는 즉시 풀이를 시작한다. 덜 받은 파일이 있으면 만들지 마라.
+3. 받지 못했으면 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고
+   failed로 적고 끝낸다.
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
-    return runner(opts, contest.root, prompt, DOWNLOAD_SCHEMA, contest.state_dir, "download", DOWNLOAD_TIMEOUT, show=show)
+    work = chal / ".ctfh-check"
+    work.mkdir(parents=True, exist_ok=True)
+    return runner(opts, contest.root, prompt, DOWNLOAD_SCHEMA, work, "download", DOWNLOAD_TIMEOUT)
 
 
 def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -> dict:
@@ -794,30 +793,21 @@ def verify_flag(chal: Path, flag_regex: str, timeout: int) -> CheckResult:
     return CheckResult(True, "solve.py 재실행으로 같은 flag를 재현했습니다.", digest)
 
 
-def submit(contest: Contest, chals: list[Path], opts: Options, runner=run_codex_json) -> dict[str, dict]:
-    """Send the flags of `chals` in a row from one Codex run: {challenge folder name: {result, message}}."""
-    browser = "env AGENT_BROWSER_SESSION=ctfh-submit chrome-use"
-    items = "\n".join(f"- slug: {chal.name} | 문제: {_read_json(chal / 'challenge.json', {}).get('name', chal.name)}"
-                      f" | 페이지: {_read_json(chal / 'challenge.json', {}).get('url') or '목록에서 찾기'}"
-                      f" | flag 파일: {chal / 'flag.txt'}" for chal in chals)
+def submit(contest: Contest, chal: Path, opts: Options, runner=run_codex_json, session="ctfh-submit") -> dict:
+    meta = _read_json(chal / "challenge.json", {})
     prompt = f"""[검사기 작업] 너는 flag 제출 담당이다. 대회: {contest.url}
-사용자의 로그인된 Chrome에서 아래 문제마다 flag를 정확히 한 번씩, 차례로 제출하고 사이트의 응답을 읽어라.
-{items}
+문제: {meta.get('name', chal.name)} (문제 페이지: {meta.get('url', '../challenge.md 참고')})
+flag는 ../flag.txt에 있다. 사용자의 로그인된 Chrome에서 이 문제에 flag를 정확히 한 번 제출하고 사이트의 응답을 읽어라.
+{browser_rules(session)}
+- flag 입력: `printf %s "$(cat ../flag.txt)" | env AGENT_BROWSER_SESSION={session} chrome-use fill @eN --stdin`
+  (flag를 명령줄에 직접 쓰지 마라)
 제출 방법 힌트: {contest.site().get('submit_hint') or '(없음)'}
-chrome-use 사용법은 아래가 전부다. 설명서(`skills get`, `--help`)를 읽지 말고 바로 써라.
-- 열기: `{browser} open <URL>`
-- 요소 보기: `{browser} snapshot -i -c` (클릭·입력할 요소의 @ref를 얻는다)
-- 클릭: `{browser} click @eN --observe`
-- flag 입력: `printf %s "$(cat '<flag 파일>')" | {browser} fill @eN --stdin` (flag를 명령줄에 직접 쓰지 마라)
 - 이미 해결됨으로 표시되어 있으면 제출하지 말고 already_solved.
-- 응답이 애매하면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 제출하지 말고 needs_user.
-- results에 위 slug마다 한 줄씩 적는다. message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라.
-최종 응답은 스키마 JSON으로만 한다."""
-    work = contest.state_dir / "submit"
-    work.mkdir(parents=True, exist_ok=True)
-    flags = tuple((chal / "flag.txt").read_text().strip() for chal in chals)
-    answer = runner(opts, work, prompt, SUBMIT_SCHEMA, work, "submit", 900 + 120 * (len(chals) - 1), redact=flags)
-    return {row.get("slug"): row for row in answer.get("results", [])}
+- 응답이 애매하거나 제출이 너무 잦다고 막히면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 제출하지 말고 needs_user.
+- message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라. 최종 응답은 스키마 JSON으로만 한다."""
+    work = chal / ".ctfh-check"
+    flag = (chal / "flag.txt").read_text().strip()
+    return runner(opts, work, prompt, SUBMIT_SCHEMA, work, "submit", 900, redact=(flag,))
 
 
 def review(chal: Path, opts: Options, runner=run_codex_json) -> dict:
@@ -967,8 +957,8 @@ class Checker:
         self.contest, self.opts, self.tmux, self.runner = contest, opts, tmux, runner
         self.pool = cf.ThreadPoolExecutor(max_workers=6)  # collect and download may run for long
         self.jobs: dict[str, cf.Future] = {}
-        self.submit_pool = cf.ThreadPoolExecutor(max_workers=1)  # one browser submit run at a time, off the check pool
-        self.submit_queue: collections.deque[Path] = collections.deque()  # verified, waiting for the next run
+        # Downloads and submits, all at once and off the check pool: each runs in a Chrome session of its own.
+        self.browser_pool = cf.ThreadPoolExecutor(max_workers=256)
         self.last_scan = time.time()
         self.rollouts: dict[str, Path] = {}
         self.tokens: dict[str, int | None] = {}
@@ -978,7 +968,7 @@ class Checker:
         self.last_solved_poll = 0.0
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
         self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
-        self.last_outage_check = self.last_probe = self.last_download = 0.0
+        self.last_outage_check = self.last_probe = 0.0
         saved = _read_json(contest.state_dir / "checker.json", {})
         saved = saved if isinstance(saved, dict) else {}
         limit, self.base_parallel = saved.get("max_parallel") or {}, opts.max_parallel
@@ -1037,38 +1027,23 @@ class Checker:
         elif not self.opts.submit:
             self.tell(chal, "flag 재현 확인됨 (자동 제출 꺼짐). writeup.md를 마무리해라.")
 
-    def job_submit(self) -> None:
-        # Runs on submit_pool. The first run to get its turn also takes the challenges queued behind it;
-        # until then they stay verified, so a restart resubmits them.
-        batch = []
-        while self.submit_queue and len(batch) < SUBMIT_BATCH:
-            batch.append(self.submit_queue.popleft())
-        if batch:
-            self.submit_batch(batch)
-
-    def submit_batch(self, chals: list[Path]) -> None:
-        sending = []
-        for chal in chals:
-            status = load_status(chal)
-            if status.get("state") != "verified":  # held or marked done while it waited
-                continue
-            # Record the attempt before the browser acts, so a restart knows it may have gone out.
-            status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
-            status.pop("approved_sha256", None)
-            status.setdefault("submissions", []).append({"sha256": status.get("flag_sha256"), "result": "pending",
-                                                         "at": _now()})
-            save_status(chal, status)
-            sending.append(chal)
-        if not sending:
-            return
+    def job_submit(self, chal: Path) -> None:
+        status = load_status(chal)
+        # Record the attempt before the browser acts, so a restart knows it may have gone out.
+        status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
+        status.pop("approved_sha256", None)
+        status.setdefault("submissions", []).append({"sha256": status.get("flag_sha256"), "result": "pending",
+                                                     "at": _now()})
+        save_status(chal, status)
+        session = f"ctfh-submit-{chal.name}"
         try:
-            results = submit(self.contest, sending,
-                             replace(self.opts, effort=self.opts.submit_effort or self.opts.effort), self.runner)
+            result = submit(self.contest, chal, replace(self.opts, effort=self.opts.submit_effort or self.opts.effort),
+                            self.runner, session=session)
         except Exception as exc:  # noqa: BLE001 - the outcome is unknown
-            results = {chal.name: {"result": "unknown", "message": f"제출 작업 오류: {exc}"} for chal in sending}
-        for chal in sending:
-            self.record_submit(chal, results.get(chal.name) or {"result": "unknown",
-                                                                "message": "제출 응답에 이 문제가 없습니다."})
+            result = {"result": "unknown", "message": f"제출 작업 오류: {exc}"}
+        finally:
+            close_browser(session)
+        self.record_submit(chal, result)
 
     def record_submit(self, chal: Path, result: dict) -> None:
         status = load_status(chal)
@@ -1122,32 +1097,30 @@ class Checker:
         return [chal for chal in self.contest.challenges()
                 if (status := load_status(chal)).get("state") not in FINISHED and not files_ready(chal, status)]
 
-    def job_download(self, chals: list[Path]) -> None:
-        """Fetch attachments in the background; each challenge starts as soon as its own files are in."""
+    def job_download(self, chal: Path) -> None:
+        """Fetch one challenge's attachments in its own Chrome session; it starts as soon as they are in."""
         opts = replace(self.opts, model=self.opts.rescan_model or self.opts.model,
                        effort=self.opts.rescan_effort or self.opts.effort)
-        self.download_order = [chal.name for chal in sorted(chals, key=_download_size)]  # the order download() asks for
-        result = {}
+        session, result = f"ctfh-download-{chal.name}", {}
         try:
-            result = download(self.contest, opts, chals, self.runner,
-                              show=lambda text: setattr(self, "download_line", text))
+            result = download(self.contest, opts, chal, session, self.runner)
         finally:  # a crashed or timed-out run counts as a try too
-            self.last_download = time.time()
-            self.count_download_tries(chals, result)
+            close_browser(session)
+            self.count_download_try(chal, result)
 
-    def count_download_tries(self, chals: list[Path], result: dict) -> None:
-        reasons = {str(item.get("slug")): str(item.get("reason", "")) for item in result.get("failed", [])
-                   if isinstance(item, dict)}
+    def count_download_try(self, chal: Path, result: dict) -> None:
+        reason = next((str(item.get("reason", "")) for item in result.get("failed", [])
+                       if isinstance(item, dict)), "")
         with self.lock:
-            for chal in chals:
-                status = load_status(chal)
-                if files_ready(chal, status):
-                    continue
-                status["download_tries"] = tries = status.get("download_tries", 0) + 1
-                if tries >= DOWNLOAD_TRIES:  # better to start with what arrived than to wait forever
-                    status.update(files_failed=True, reason=f"첨부를 {tries}번 받지 못함, 받은 것만으로 시작: "
-                                                            + (reasons.get(chal.name) or "files/ 확인"))
-                save_status(chal, status)
+            status = load_status(chal)
+            if files_ready(chal, status):
+                return
+            status["download_tries"] = tries = status.get("download_tries", 0) + 1
+            status["download_after"] = time.time() + DOWNLOAD_RETRY_SECONDS
+            if tries >= DOWNLOAD_TRIES:  # better to start with what arrived than to wait forever
+                status.update(files_failed=True, reason=f"첨부를 {tries}번 받지 못함, 받은 것만으로 시작: "
+                                                        + (reason or "files/ 확인"))
+            save_status(chal, status)
 
     # -- one decision per challenge per tick
     def step(self, chal: Path, windows: set[str]):
@@ -1202,10 +1175,7 @@ class Checker:
                 save_status(chal, status)
                 return None
             if time.time() >= status.get("retry_after", 0):
-                status["reason"] = "제출 차례를 기다리는 중입니다."
-                save_status(chal, status)
-                self.submit_queue.append(chal)
-                return self.submit_pool.submit(self.job_submit)
+                return self.browser_pool.submit(self.job_submit, chal)
             return None
         writeup = chal / "writeup.md"
         if (state == "accepted" or (state == "verified" and not self.opts.submit)) and writeup.exists() \
@@ -1281,14 +1251,9 @@ class Checker:
         """Board column for a challenge still waiting for its attachments."""
         files = chal / "files"
         got = sum(f.stat().st_size for f in files.rglob("*") if f.is_file()) if files.is_dir() else 0
-        job = self.jobs.get("__download__")
+        job = self.jobs.get(f"__download_{chal.name}__")
         if job is not None and not job.done():
-            queue = [name for name in getattr(self, "download_order", [])
-                     if not files_ready(self.contest.challenges_dir / name, load_status(self.contest.challenges_dir / name))]
-            if queue[:1] == [chal.name]:  # downloads go one challenge at a time, in this order
-                return "첨부 받는 중" + (f" ({_size_text(got)})" if got else "")
-            if chal.name in queue:
-                return f"첨부 차례 대기 ({queue.index(chal.name)}개 뒤)"
+            return "첨부 받는 중" + (f" ({_size_text(got)})" if got else "")
         tries = status.get("download_tries", 0)
         return f"첨부 재시도 대기 ({tries}회 실패)" if tries else "첨부 대기"
 
@@ -1432,7 +1397,8 @@ class Checker:
                              FILES_WAIT if status.get("state") == "pending" and not files_ready(chal, status) else "")})
         rows.sort(key=lambda row: BOARD_ORDER.get(row["state"], 2))  # stable: name order within a group
         manual = [row["name"] for row in rows if row["state"] == "manual"]
-        busy = ", ".join(sorted(k for k, f in self.jobs.items() if not f.done() and k != "__solved__")) or "-"
+        busy = ", ".join(sorted(k for k, f in self.jobs.items() if not f.done() and k != "__solved__"
+                                and not k.startswith("__download_"))) or "-"
         alert = self.contest.state_dir / "needs_user.txt"
         solved = sum(row["state"] in FINISHED | {"accepted"} for row in rows)
         head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  푼 문제 {solved}/{len(rows)}  토큰 합계 {total:,}  검사 중: {busy}"
@@ -1464,8 +1430,9 @@ class Checker:
             head.append(f"메모리 부족: {used:.0%} 사용 중, 새 풀이 창은 여유가 생기면 연다")
         if "__collect__" in self.jobs and not self.jobs["__collect__"].done():
             head.append("문제 재수집 중: " + getattr(self, "collect_line", "시작"))
-        if "__download__" in self.jobs and not self.jobs["__download__"].done():
-            head.append(f"첨부 받는 중 ({len(self.waiting_files())}개 남음): " + getattr(self, "download_line", "시작"))
+        downloading = sum(k.startswith("__download_") and not f.done() for k, f in self.jobs.items())
+        if downloading:
+            head.append(f"첨부 받는 중: {downloading}개 동시에")
         return head, rows
 
     def board(self) -> str:
@@ -1649,12 +1616,11 @@ class Checker:
                 self.jobs[chal.name] = job if isinstance(job, cf.Future) else self.pool.submit(job)
         if not self.outage:
             self.fill_slots(self.tmux.windows())
-        if not self.outage and not ended and "__download__" not in self.jobs:
-            waiting = self.waiting_files()
-            # a newly listed challenge starts at once; one that failed waits before the next try
-            if waiting and (any(not load_status(chal).get("download_tries") for chal in waiting)
-                            or time.time() - self.last_download > DOWNLOAD_RETRY_SECONDS):
-                self.jobs["__download__"] = self.pool.submit(self.job_download, waiting)
+        if not self.outage and not ended:
+            for chal in self.waiting_files():  # every challenge at once; one that failed waits before the next try
+                key = f"__download_{chal.name}__"
+                if key not in self.jobs and time.time() >= load_status(chal).get("download_after", 0):
+                    self.jobs[key] = self.browser_pool.submit(self.job_download, chal)
         if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
             self.last_solved_poll = time.time()
             self.jobs["__solved__"] = self.pool.submit(self.job_solved)

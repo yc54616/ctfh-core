@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import re
 import time
 import unittest
 import uuid
@@ -57,10 +56,7 @@ class FakeRunner:
         if show is not None:
             show(f"{name} 진행")
         value = self.answers[name].pop(0)
-        value = value(cwd) if callable(value) else value
-        if name == "submit" and "results" not in value:  # one answer for every flag in the run
-            value = {"results": [dict(value, slug=slug) for slug in re.findall(r"^- slug: (\S+)", prompt, re.M)]}
-        return value
+        return value(cwd) if callable(value) else value
 
 
 def make_challenge(root: Path, slug: str, solved=False) -> Path:
@@ -82,6 +78,10 @@ class Base(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "contest"
         self.contest = native.init_contest("https://ctf.example/", self.root)
+        self.closed = []  # chrome-use sessions the checker closed
+        patcher = patch("ctfh_core.native.close_browser", side_effect=self.closed.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.home = Path(self.temp.name) / "codex-home"
         for target, value in (("codex_home", self.home), ("rollout_homes", [self.home]),
                               ("_meminfo", 32 << 30), ("set_memory_slice", None),
@@ -99,7 +99,7 @@ class Base(unittest.TestCase):
         opts = native.Options(**options)
         checker = native.Checker(self.contest, opts, FakeTmux(), runner or FakeRunner())
         self.addCleanup(checker.pool.shutdown, wait=True)
-        self.addCleanup(checker.submit_pool.shutdown, wait=True)
+        self.addCleanup(checker.browser_pool.shutdown, wait=True)
         return checker
 
     def settle(self, checker, rounds=6):
@@ -325,7 +325,7 @@ class CheckerFlowTests(Base):
         status = self.status("web")
         self.assertEqual(status["state"], "done")
         self.assertEqual([c[0] for c in runner.calls], ["submit", "review"])
-        self.assertEqual(runner.calls[0][1], self.root / ".ctfh" / "submit")
+        self.assertEqual(runner.calls[0][1], chal / ".ctfh-check")
         self.assertEqual(status["submissions"][0]["result"], "accepted")
         self.assertNotIn("FLAG{abc}", json.dumps(status))
         self.assertNotIn("web", checker.tmux.windows())
@@ -676,24 +676,28 @@ class CheckerFlowTests(Base):
         prompts = []
         def downloader(opts, cwd, prompt, *rest, **kw):
             prompts.append((opts.model, prompt))
-            (cwd / "challenges" / "rev" / "files" / native.FILES_DONE).touch()  # dfir never arrives
-            return {"downloaded": ["rev"], "failed": [{"slug": "dfir", "reason": "too slow"}]}
+            if "challenges/rev/" in prompt:
+                (cwd / "challenges" / "rev" / "files" / native.FILES_DONE).touch()
+                return {"downloaded": ["rev"], "failed": []}
+            return {"downloaded": [], "failed": [{"slug": "dfir", "reason": "too slow"}]}  # dfir never arrives
         checker = self.checker(runner=downloader)
         def run_now(fn, *args):  # run background jobs inline so the test sees their effect
             future = cf.Future()
             future.set_result(fn(*args))
             return future
-        with patch.object(checker.pool, "submit", side_effect=run_now):
+        with patch.object(checker.browser_pool, "submit", side_effect=run_now):
             checker.tick()
         self.assertEqual(self.status("web")["state"], "solving")  # nothing to download: starts at once
-        self.assertLess(prompts[0][1].index("rev"), prompts[0][1].index("dfir"))  # small first, big image last
-        self.assertEqual(prompts[0][0], "gpt-6-luna")
+        self.assertEqual(len(prompts), 2)  # one run per challenge, side by side
+        self.assertEqual({model for model, _ in prompts}, {"gpt-6-luna"})
+        self.assertEqual(sorted(self.closed), ["ctfh-download-dfir", "ctfh-download-rev"])
         checker.tick()
         self.assertEqual(self.status("rev")["state"], "solving")
         self.assertEqual(self.status("dfir")["state"], "pending")
         self.assertIn(native.FILES_WAIT, checker.board())
+        self.assertNotIn("__download_dfir__", checker.jobs)  # a failed one waits before the next try
         for _ in range(native.DOWNLOAD_TRIES - 1):
-            checker.job_download([self.root / "challenges" / "dfir"])
+            checker.job_download(self.root / "challenges" / "dfir")
         checker.fill_slots(checker.tmux.windows())
         self.assertEqual(self.status("dfir")["state"], "solving")  # gave up waiting, starts with what arrived
         self.assertTrue(self.status("dfir")["files_failed"])
@@ -705,39 +709,35 @@ class CheckerFlowTests(Base):
                 {"name": "a", "url": "https://x/a", "size": None}]}))
         (self.root / "challenges" / "rev" / "files" / "rev.bin").write_bytes(b"x" * 3000)
         checker = self.checker(max_parallel=1)
-        checker.jobs["__download__"] = cf.Future()  # still running
-        checker.download_order = ["rev", "dfir"]
+        checker.jobs["__download_rev__"] = cf.Future()  # still running
         text = lambda slug: checker.activity_text(self.root / "challenges" / slug, self.status(slug) or {"state": "pending"}, set())
         self.assertEqual(text("rev"), "첨부 받는 중 (2.9KB)")
-        self.assertEqual(text("dfir"), "첨부 차례 대기 (1개 뒤)")
+        self.assertEqual(text("dfir"), "첨부 대기")
         self.assertEqual(text("web"), "시작 대기")
-        checker.jobs.pop("__download__")
+        checker.jobs.pop("__download_rev__")
         native.save_status(self.root / "challenges" / "dfir", {"state": "pending", "download_tries": 1})
         self.assertEqual(text("dfir"), "첨부 재시도 대기 (1회 실패)")
 
-    def test_queued_flags_wait_unrecorded_then_go_out_in_one_run(self):
+    def test_flags_go_out_at_once_each_from_its_own_closed_session(self):
         import threading
         slugs = ("heap", "rsa")
-        runner = FakeRunner(submit=[{"result": "accepted", "message": ""}])
+        together = threading.Barrier(2, timeout=10)
+        def answer(cwd):
+            together.wait()  # both submits run at the same time
+            return {"result": "accepted", "message": ""}
+        runner = FakeRunner(submit=[answer, answer])
         checker = self.checker(runner)
-        busy = threading.Event()
-        checker.submit_pool.submit(busy.wait, 30)  # another submit run is busy
         for slug in slugs:
-            write_solution(make_challenge(self.root, slug))
+            make_challenge(self.root, slug)
         checker.tick()
-        deadline = time.time() + 10
-        while not all("제출 차례" in self.status(s).get("reason", "") for s in slugs) and time.time() < deadline:
-            checker.tick()
-            cf.wait(list(checker.jobs.values()), timeout=0.5)
-        for slug in slugs:  # a restart now would resubmit them
-            self.assertEqual((self.status(slug)["state"], self.status(slug).get("submissions")), ("verified", []))
-        self.assertEqual(checker.pool.submit(lambda: "free").result(5), "free")  # checks are not held up
-        busy.set()
+        for slug in slugs:
+            write_solution(self.root / "challenges" / slug)
         self.settle(checker)
         self.assertEqual([self.status(s)["state"] for s in slugs], ["accepted", "accepted"])
-        self.assertEqual([c[0] for c in runner.calls], ["submit"])
-        self.assertNotIn("skills get core`로", runner.calls[0][2])
-        self.assertIn("--stdin", runner.calls[0][2])
+        self.assertEqual(sorted(self.closed), ["ctfh-submit-heap", "ctfh-submit-rsa"])
+        prompt = runner.calls[0][2]
+        self.assertIn("AGENT_BROWSER_SESSION=ctfh-submit-", prompt)
+        self.assertIn("--stdin", prompt)
 
     def test_board_counts_solved_challenges(self):
         for slug, state in (("a", "accepted"), ("b", "site_solved"), ("c", "solving")):
@@ -748,12 +748,11 @@ class CheckerFlowTests(Base):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")
         seen = []
-        native.save_status(chal, {"state": "verified", "flag_sha256": "d"})
-        with patch("ctfh_core.native.submit", side_effect=lambda contest, chals, opts, runner:
-                   seen.append(("submit", opts.model, opts.effort)) or {}), \
+        with patch("ctfh_core.native.submit", side_effect=lambda contest, chal, opts, runner, session:
+                   seen.append(("submit", opts.model, opts.effort)) or {"result": "unknown", "message": ""}), \
              patch("ctfh_core.native.review", side_effect=lambda chal, opts, runner:
                    seen.append(("review", opts.model, opts.effort)) or {}):
-            checker.submit_batch([chal])
+            checker.job_submit(chal)
             checker.job_review(chal, 0)
         self.assertEqual(seen, [("submit", "gpt-6-sol", "low"), ("review", "gpt-6-sol", "medium")])
 
