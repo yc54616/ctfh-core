@@ -95,6 +95,7 @@ class Base(unittest.TestCase):
         opts = native.Options(**options)
         checker = native.Checker(self.contest, opts, FakeTmux(), runner or FakeRunner())
         self.addCleanup(checker.pool.shutdown, wait=True)
+        self.addCleanup(checker.submit_pool.shutdown, wait=True)
         return checker
 
     def settle(self, checker, rounds=6):
@@ -343,7 +344,7 @@ class CheckerFlowTests(Base):
         self.assertIn("오답 처리된 flag", self.status("rev")["reason"])
         self.assertEqual([c[0] for c in runner.calls], ["submit"])
 
-    def test_interrupted_submit_is_not_replayed_until_user_approves(self):
+    def test_interrupted_submit_is_resent_later(self):
         chal = make_challenge(self.root, "misc")
         write_solution(chal)
         native.save_status(chal, {"state": "submitting", "flag_sha256": native.flag_hash("FLAG{abc}"),
@@ -351,12 +352,31 @@ class CheckerFlowTests(Base):
         runner = FakeRunner(submit=[{"result": "accepted", "message": ""}])
         checker = self.checker(runner)
         self.settle(checker)
-        self.assertEqual(self.status("misc")["state"], "unknown")
-        self.assertEqual(runner.calls, [])
-        native.approve(self.root, "misc")
+        status = self.status("misc")
+        self.assertEqual((status["state"], status["submissions"][-1]["result"]), ("verified", "unknown"))
+        self.assertEqual(runner.calls, [])  # not before the retry delay
+        status["retry_after"] = 0
+        native.save_status(chal, status)
         self.settle(checker)
         self.assertEqual(self.status("misc")["state"], "accepted")
         self.assertEqual(len(self.status("misc")["submissions"]), 2)
+
+    def test_unclear_submit_is_resent_three_times_then_left_to_the_user(self):
+        chal = make_challenge(self.root, "pwn")
+        runner = FakeRunner(submit=[{"result": "unknown", "message": "timeout"}] * 4)
+        checker = self.checker(runner)
+        checker.tick()
+        write_solution(chal)
+        self.settle(checker)
+        for tries in (1, 2, 3):
+            status = self.status("pwn")
+            self.assertEqual(status["state"], "verified")
+            self.assertIn(f"({tries}/3)", status["reason"])
+            status["retry_after"] = 0
+            native.save_status(chal, status)
+            self.settle(checker)
+        self.assertEqual(self.status("pwn")["state"], "unknown")
+        self.assertEqual([c[0] for c in runner.calls], ["submit"] * 4)
 
     def test_login_lost_during_submit_retries_later(self):
         chal = make_challenge(self.root, "crypto")
@@ -694,18 +714,22 @@ class CheckerFlowTests(Base):
     def test_submit_waiting_for_its_turn_is_not_recorded_as_sent(self):
         import threading
         chal = make_challenge(self.root, "heap")
-        native.save_status(chal, {"state": "verified", "flag_sha256": "d", "submissions": []})
-        checker = self.checker()
-        with patch("ctfh_core.native.submit", return_value={"result": "unknown", "message": ""}):
-            checker.submit_lock.acquire()  # another challenge is being submitted
-            waiting = threading.Thread(target=checker.job_submit, args=(chal,))
-            waiting.start()
-            time.sleep(0.2)
-            self.assertEqual(self.status("heap")["state"], "verified")  # a restart now would resubmit it
-            self.assertEqual(self.status("heap")["submissions"], [])
-            checker.submit_lock.release()
-            waiting.join(5)
-        self.assertEqual([s["result"] for s in self.status("heap")["submissions"]], ["unknown"])
+        runner = FakeRunner(submit=[{"result": "accepted", "message": ""}])
+        checker = self.checker(runner)
+        busy = threading.Event()
+        checker.submit_pool.submit(busy.wait, 30)  # another challenge is being submitted
+        checker.tick()
+        write_solution(chal)
+        deadline = time.time() + 10
+        while "제출 차례" not in self.status("heap").get("reason", "") and time.time() < deadline:
+            checker.tick()
+            cf.wait(list(checker.jobs.values()), timeout=0.5)
+        self.assertEqual(self.status("heap")["state"], "verified")  # a restart now would resubmit it
+        self.assertEqual(self.status("heap")["submissions"], [])
+        self.assertEqual(checker.pool.submit(lambda: "free").result(5), "free")  # checks are not held up
+        busy.set()
+        self.settle(checker)
+        self.assertEqual(self.status("heap")["state"], "accepted")
 
     def test_board_counts_solved_challenges(self):
         for slug, state in (("a", "accepted"), ("b", "site_solved"), ("c", "solving")):

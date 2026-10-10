@@ -193,6 +193,8 @@ def probe_endpoint(endpoint: tuple[str, int], timeout: float = 3.0) -> str:
 SOLVED_POLL_SECONDS = 60
 USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
+SUBMIT_RETRIES = 3  # resend a flag whose submit outcome stayed unclear this many times
+SUBMIT_RETRY_SECONDS = 120
 OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
 OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
 OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
@@ -949,7 +951,7 @@ class Checker:
         self.contest, self.opts, self.tmux, self.runner = contest, opts, tmux, runner
         self.pool = cf.ThreadPoolExecutor(max_workers=6)  # collect and download may run for long
         self.jobs: dict[str, cf.Future] = {}
-        self.submit_lock = threading.Lock()
+        self.submit_pool = cf.ThreadPoolExecutor(max_workers=1)  # one browser submit at a time, off the check pool
         self.last_scan = time.time()
         self.rollouts: dict[str, Path] = {}
         self.tokens: dict[str, int | None] = {}
@@ -1019,14 +1021,7 @@ class Checker:
             self.tell(chal, "flag 재현 확인됨 (자동 제출 꺼짐). writeup.md를 마무리해라.")
 
     def job_submit(self, chal: Path) -> None:
-        status = load_status(chal)
-        status["reason"] = "제출 차례를 기다리는 중입니다."
-        save_status(chal, status)
-        # One browser submit at a time. A waiting challenge stays verified, so a restart resubmits it.
-        with self.submit_lock:
-            self.submit_now(chal)
-
-    def submit_now(self, chal: Path) -> None:
+        # Runs on submit_pool when its turn comes; until then the challenge stays verified.
         status = load_status(chal)
         digest = status.get("flag_sha256")
         # Record the attempt before the browser acts: a crash must never lead to a blind replay.
@@ -1054,8 +1049,7 @@ class Checker:
             status.update(state="verified", retry_after=time.time() + 300,
                           reason="제출하려면 로그인이 필요합니다. Chrome에서 로그인하세요.")
         else:
-            status.update(state="unknown", reason="제출 결과를 확정하지 못했습니다. 사이트에서 확인한 뒤 "
-                                                  "`ctfh2 done` 또는 `ctfh2 approve`를 쓰세요.")
+            submit_unclear(status)
         save_status(chal, status)
 
     def job_review(self, chal: Path, mtime: int) -> None:
@@ -1145,8 +1139,11 @@ class Checker:
             status.pop("flag_mtime_ns", None)
             save_status(chal, status)
             return None
-        if state == "submitting":  # interrupted mid-submit: do not replay
-            status.update(state="unknown", reason="제출 도중 검사기가 멈췄습니다. 사이트에서 결과를 확인하세요.")
+        if state == "submitting":  # interrupted mid-submit
+            entry = (status.get("submissions") or [{}])[-1]
+            if entry.get("result") == "pending":
+                entry.update(result="unknown", message="제출 도중 검사기가 멈췄습니다.", at=_now())
+            submit_unclear(status)
             save_status(chal, status)
             return None
         flag, solve = chal / "flag.txt", chal / "solve.py"
@@ -1168,7 +1165,9 @@ class Checker:
                 save_status(chal, status)
                 return None
             if time.time() >= status.get("retry_after", 0):
-                return lambda: self.job_submit(chal)
+                status["reason"] = "제출 차례를 기다리는 중입니다."
+                save_status(chal, status)
+                return self.submit_pool.submit(self.job_submit, chal)
             return None
         writeup = chal / "writeup.md"
         if (state == "accepted" or (state == "verified" and not self.opts.submit)) and writeup.exists() \
@@ -1609,7 +1608,7 @@ class Checker:
                 continue
             job = self.step(chal, windows)
             if job is not None:
-                self.jobs[chal.name] = self.pool.submit(job)
+                self.jobs[chal.name] = job if isinstance(job, cf.Future) else self.pool.submit(job)
         if not self.outage:
             self.fill_slots(self.tmux.windows())
         if not self.outage and not ended and "__download__" not in self.jobs:
@@ -1763,6 +1762,19 @@ def mark_done(root: Path, names: list[str]) -> list[str]:
     for name in names:
         (known[name] / "USER_SOLVED").write_text(_now() + "\n")
     return names
+
+
+def submit_unclear(status: dict) -> None:
+    """The site's answer is unknown: resend the same, already reproduced flag a few times before asking the user.
+    A resent correct flag at worst comes back as already solved."""
+    digest = status.get("flag_sha256")
+    tries = sum(s.get("sha256") == digest and s.get("result") == "unknown" for s in status.get("submissions", []))
+    if tries <= SUBMIT_RETRIES:
+        status.update(state="verified", approved_sha256=digest, retry_after=time.time() + SUBMIT_RETRY_SECONDS,
+                      reason=f"제출 결과를 확정하지 못해 잠시 뒤 다시 보냅니다 ({tries}/{SUBMIT_RETRIES}).")
+    else:
+        status.update(state="unknown", reason=f"{tries}번 보냈지만 제출 결과를 확정하지 못했습니다. 사이트에서 확인한 뒤 "
+                                              "`ctfh2 done` 또는 `ctfh2 approve`를 쓰세요.")
 
 
 def approve(root: Path, name: str) -> dict:

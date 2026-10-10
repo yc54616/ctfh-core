@@ -190,7 +190,10 @@ rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it
    (`--max-parallel`, default 0 = every challenge at once). Attach with `tmux attach -t ctfh-<contest>` and
    type into any window as usual.
 3. The checker re-runs `solve.py` and requires the same flag. It submits each
-   flag hash at most once through Chrome (`ctfh-submit`), reviews `writeup.md`
+   flag hash through Chrome (`ctfh-submit`), one challenge at a time on its own
+   queue so checks keep running. A wrong flag is never resent; an unclear
+   outcome (error, timeout, interrupted run) is resent up to 3 times, 2 minutes
+   apart, before it is left `unknown` for you. It reviews `writeup.md`
    blind-first, sends `[검사기] …` feedback into the solver window, and closes it
    when done.
 4. The checker window is a keyboard dashboard (`--plain` or `plain = true` in
