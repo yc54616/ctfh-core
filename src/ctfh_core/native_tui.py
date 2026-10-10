@@ -13,7 +13,7 @@ from textual.widgets import DataTable, Footer, Static
 
 from .native import Checker, window_name
 
-STYLES = {"manual": "bold yellow", "unknown": "bold red", "blocked": "red", "needs_fix": "magenta",
+STYLES = {"manual": "bold yellow", "hold": "blue", "unknown": "bold red", "blocked": "red", "needs_fix": "magenta",
           "checking": "cyan", "verified": "cyan", "submitting": "cyan", "accepted": "green",
           "done": "green", "user_solved": "green", "site_solved": "green", "pending": "dim"}
 
@@ -71,7 +71,10 @@ class CheckerApp(App):
         Binding("r", "restart", "다시 열기"),
         Binding("o", "notes", "노트"),
         Binding("d", "done", "해결 표시"),
+        Binding("p", "hold", "보류"),
         Binding("s", "rescan", "지금 재스캔"),
+        Binding("plus,equals_sign", "parallel(1)", "창 +1"),
+        Binding("minus", "parallel(-1)", "창 -1"),
         Binding("q", "quit", "검사기 종료"),
         Binding("ctrl+c", "quit", "검사기 종료", show=False, priority=True),
     ]
@@ -139,7 +142,7 @@ class CheckerApp(App):
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         # Row actions belong to the table; leave keys to the notes view while it is open.
-        if action in ("jump", "nudge", "restart", "notes", "done", "rescan") and len(self.screen_stack) > 1:
+        if action in ("jump", "nudge", "restart", "notes", "done", "hold", "rescan") and len(self.screen_stack) > 1:
             return False
         return True
 
@@ -159,6 +162,19 @@ class CheckerApp(App):
         if name is not None:  # closing a working solver is not undone by a key, so ask first
             self.push_screen(ConfirmScreen(f"{name}: 팀원이 풀었다고 해결로 표시하고 풀이 창을 닫을까요?"),
                              lambda yes: self.request("done", name) if yes else None)
+
+    def action_hold(self) -> None:
+        name = self.selected()
+        if name is not None:
+            self.push_screen(ConfirmScreen(f"{name}: 풀이 창을 닫고 보류할까요? (r로 재개)"),
+                             lambda yes: self.request("hold", name) if yes else None)
+
+    def action_parallel(self, delta: int) -> None:
+        def work() -> None:
+            message = self.checker.set_parallel(delta)
+            self.call_from_thread(self.notify, message)
+            self.wake.set()
+        threading.Thread(target=work, daemon=True).start()
 
     def action_rescan(self) -> None:
         self.request("rescan", "")

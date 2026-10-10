@@ -480,6 +480,7 @@ class CheckerFlowTests(Base):
         self.assertEqual(status["state"], "manual")
         self.assertIn("재촉 한도 3회", status["reason"])
         self.assertIn("Codex 주간 사용량 42%", checker.board())
+        self.assertNotIn("!! Codex", checker.board())
         self.assertRegex(checker.board(), r"heap +manual .*수동 대기")
         self.append_rollout(chal, {"type": "task_started"})  # the user typed into the window
         checker.tick()
@@ -507,6 +508,38 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("heap")["nudges"], 3)
         self.assertIn("이미 열려", checker.act("restart", "heap"))
         self.assertIn("할 수 없습니다", checker.act("restart", "done-one"))
+        self.assertIn("보류했습니다", checker.act("hold", "heap"))
+        self.assertNotIn(native.window_name("heap"), checker.tmux.windows())
+        checker.tick()  # a held challenge is not reopened automatically
+        self.assertNotIn(native.window_name("heap"), checker.tmux.windows())
+        self.assertRegex(checker.board(), r"heap +hold .*보류 \(r로 재개\)")
+        self.assertIn("풀이 창을 다시 열었습니다", checker.act("restart", "heap"))
+        self.assertEqual(self.status("heap")["state"], "solving")
+
+    def test_limited_slots_open_easiest_first_and_limit_changes_live(self):
+        for slug, solves in (("hard", 5), ("easy", 50), ("unknown", None)):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({"name": slug, "solved": False, "solves": solves}))
+        checker = self.checker(max_parallel=1)
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {native.window_name("easy")})
+        self.assertIn("동시 창 1", checker.board())
+        self.assertEqual(checker.set_parallel(1), "동시 풀이 창: 2")
+        checker.tick()
+        self.assertIn(native.window_name("hard"), checker.tmux.windows())
+        self.assertEqual(checker.set_parallel(-5), "동시 풀이 창: 전체")
+        checker.tick()
+        self.assertEqual(len(checker.tmux.windows()), 3)
+
+    def test_contest_rules_reach_solver_rules_and_board(self):
+        chal = make_challenge(self.root, "heap")
+        native.ensure_challenge(self.contest, chal)
+        self.assertIn("(규칙 페이지를 찾지 못함)", (chal / "AGENTS.md").read_text())
+        self.contest.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.contest.state_dir / "site.json").write_text(json.dumps({"rules": "[금지] AI 사용 금지"}))
+        native.ensure_challenge(self.contest, chal)  # generated rules refresh when the site rules change
+        self.assertIn("[금지] AI 사용 금지", (chal / "AGENTS.md").read_text())
+        self.assertIn("!! 대회 규칙: [금지] AI 사용 금지", self.checker().board())
 
     def test_rescan_key_starts_one_collect_now(self):
         make_challenge(self.root, "heap")

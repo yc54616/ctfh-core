@@ -10,7 +10,7 @@ dangerously_bypass_approvals_and_sandbox = true
 # ctfh2 <URL> (네이티브 풀이기 + 검사기) 기본값. 명령줄 옵션이 우선한다.
 # model = "gpt-6-sol"
 # thinking = "xhigh"
-# max_parallel = 0       # 동시에 여는 풀이 창 수 (0 = 전체 문제)
+# max_parallel = 0       # 동시에 여는 풀이 창 수 (0 = 전체 문제, 검사기 화면에서 +/- 로 바로 조절)
 # submit = true
 # rescan_model = "gpt-6-luna"  # 주기적 재스캔 모델 ("same" = model과 같음; 첫 수집은 항상 model)
 # rescan_thinking = "low" # 주기적 재스캔 추론 강도 ("same" = thinking과 같음)
