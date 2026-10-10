@@ -165,6 +165,20 @@ class LayoutTests(Base):
         self.assertNotIn("secret-fill", prompt)
 
 
+    def test_a_rescan_keeps_the_urls_of_fetched_attachments(self):
+        chal = make_challenge(self.root, "art")
+        real = [{"name": "file download", "url": "https://drive.google.com/file/d/1iW2iseW82LOwZC4Iw/view", "size": None}]
+        (chal / "challenge.json").write_text(json.dumps({"name": "art", "solved": False, "attachments": real}))
+        (chal / "files" / native.FILES_DONE).touch()
+        def collector(cwd):  # a rescan rewrote the whole file and mistyped the Drive ID
+            (cwd / "challenges" / "art" / "challenge.json").write_text(json.dumps({"name": "art", "solved": True,
+                "attachments": [dict(real[0], url="https://drive.google.com/file/d/1iW2iseW82wmT94F/view")]}))
+            return {"login": "ok", "platform": "CTFd", "flag_regex": "", "submit_hint": "", "challenges": [], "notes": ""}
+        native.collect(self.contest, native.Options(), FakeRunner(collect=[collector]))
+        info = json.loads((chal / "challenge.json").read_text())
+        self.assertEqual((info["attachments"], info["solved"]), (real, True))
+
+
 class VerifyTests(Base):
     def setUp(self):
         super().setUp()

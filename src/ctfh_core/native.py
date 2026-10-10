@@ -742,7 +742,14 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
 7. 대회 종료 시각을 찾으면 ends_at에 시간대를 넣은 ISO 8601로 적는다 (예: 2026-10-12T18:00:00+09:00). 못 찾으면 빈 문자열.
 이미 있는 폴더: {existing}
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
+    fetched = {chal: info["attachments"] for chal in contest.challenges() if (chal / "files" / FILES_DONE).exists()
+               and isinstance(info := _read_json(chal / "challenge.json", {}), dict) and info.get("attachments")}
     result = runner(opts, contest.root, prompt, COLLECT_SCHEMA, contest.state_dir, "collect", show=show)
+    for chal, attachments in fetched.items():  # a rescan that retyped a fetched file's URL can only get it wrong
+        info = _read_json(chal / "challenge.json", None)
+        if isinstance(info, dict) and info.get("attachments") != attachments:
+            info["attachments"] = attachments
+            _write_atomic(chal / "challenge.json", json.dumps(info, ensure_ascii=False, indent=2) + "\n")
     site = {k: result.get(k, "") for k in ("platform", "flag_regex", "submit_hint", "notes")}
     site["rules"] = result.get("rules") or contest.site().get("rules", "")
     site["ends_at"] = result.get("ends_at") or contest.site().get("ends_at", "")  # a rescan that missed them keeps the old
