@@ -638,6 +638,9 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
 {browser_rules(session)}
 1. challenges/{slug}/challenge.json의 attachments를 challenges/{slug}/files/에 내려받는다 (압축은 풀지 않는다).
    다른 문제의 첨부는 다른 작업이 받고 있으니 이 문제만 다룬다.
+   Google Drive 링크(drive.google.com/file/d/<ID>/...)는 브라우저로 받지 마라 (큰 파일은 경고 페이지만 받아진다).
+   `curl -fL --retry 5 -C - -o <저장 경로> 'https://drive.usercontent.google.com/download?id=<ID>&export=download&confirm=t'`로
+   받고, `curl -sL -r 0-0 -o /dev/null -D - '<같은 URL>'`의 content-range `/` 뒤 숫자(전체 크기)와 받은 크기를 대조한다.
 2. 다 받았으면 challenges/{slug}/files/{FILES_DONE} 빈 파일을 만든다. 검사기는 이 파일을 보는 즉시 풀이를 시작한다.
    사이트나 challenge.json에 크기가 있으면 맞는지 대조한다. 크기가 없으면 다운로드가 오류 없이 끝났고 파일이 비어 있지
    않을 때 다 받은 것으로 본다 (크기를 확인할 수 없다는 이유로 멈추지 마라). 덜 받았거나 빈 파일이면 만들지 마라.

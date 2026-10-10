@@ -690,6 +690,7 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("web")["state"], "solving")  # nothing to download: starts at once
         self.assertEqual(len(prompts), 2)  # one run per challenge, side by side
         self.assertIn("크기가 없으면", prompts[0][1])  # a site that shows no sizes must not block the marker
+        self.assertIn("drive.usercontent.google.com", prompts[0][1])  # Drive files skip the browser
         self.assertEqual({model for model, _ in prompts}, {"gpt-6-luna"})
         self.assertEqual(sorted(self.closed), ["ctfh-download-dfir", "ctfh-download-rev"])
         checker.tick()
