@@ -691,6 +691,22 @@ class CheckerFlowTests(Base):
         native.save_status(self.root / "challenges" / "dfir", {"state": "pending", "download_tries": 1})
         self.assertEqual(text("dfir"), "첨부 재시도 대기 (1회 실패)")
 
+    def test_submit_waiting_for_its_turn_is_not_recorded_as_sent(self):
+        import threading
+        chal = make_challenge(self.root, "heap")
+        native.save_status(chal, {"state": "verified", "flag_sha256": "d", "submissions": []})
+        checker = self.checker()
+        with patch("ctfh_core.native.submit", return_value={"result": "unknown", "message": ""}):
+            checker.submit_lock.acquire()  # another challenge is being submitted
+            waiting = threading.Thread(target=checker.job_submit, args=(chal,))
+            waiting.start()
+            time.sleep(0.2)
+            self.assertEqual(self.status("heap")["state"], "verified")  # a restart now would resubmit it
+            self.assertEqual(self.status("heap")["submissions"], [])
+            checker.submit_lock.release()
+            waiting.join(5)
+        self.assertEqual([s["result"] for s in self.status("heap")["submissions"]], ["unknown"])
+
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(effort="xhigh")

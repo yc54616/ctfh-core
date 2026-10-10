@@ -1020,6 +1020,14 @@ class Checker:
 
     def job_submit(self, chal: Path) -> None:
         status = load_status(chal)
+        status["reason"] = "제출 차례를 기다리는 중입니다."
+        save_status(chal, status)
+        # One browser submit at a time. A waiting challenge stays verified, so a restart resubmits it.
+        with self.submit_lock:
+            self.submit_now(chal)
+
+    def submit_now(self, chal: Path) -> None:
+        status = load_status(chal)
         digest = status.get("flag_sha256")
         # Record the attempt before the browser acts: a crash must never lead to a blind replay.
         status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
@@ -1027,9 +1035,8 @@ class Checker:
         status.setdefault("submissions", []).append({"sha256": digest, "result": "pending", "at": _now()})
         save_status(chal, status)
         try:
-            with self.submit_lock:
-                result = submit(self.contest, chal, replace(self.opts, effort=self.opts.submit_effort or self.opts.effort),
-                                self.runner)
+            result = submit(self.contest, chal, replace(self.opts, effort=self.opts.submit_effort or self.opts.effort),
+                            self.runner)
         except Exception as exc:  # noqa: BLE001 - the outcome is unknown, never retried blindly
             result = {"result": "unknown", "message": f"제출 작업 오류: {exc}"}
         status = load_status(chal)
