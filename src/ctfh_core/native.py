@@ -9,6 +9,7 @@ is the only contract between the solver sessions and the checker.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import getpass
 import hashlib
 import json
 import os
@@ -1793,6 +1794,33 @@ def credential(host: str) -> dict | None:
     return entry if isinstance(entry, dict) else None
 
 
+def ask_credential(host: str, ask=input, ask_secret=getpass.getpass) -> None:
+    """Offer at start to keep the site login for secret-fill, the fallback when Chrome's autofill cannot log a
+    dropped session back in. Asked only on a terminal and only while the host has no entry; Enter skips."""
+    try:
+        if not host or not sys.stdin.isatty() or credential(host) is not None:
+            return
+        username = ask(f"{host} 아이디 (세션이 끊기면 자동 재로그인용, Enter면 건너뜀): ").strip()
+        password = ask_secret(f"{host} 비밀번호 (화면에 보이지 않음): ") if username else ""
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    except ValueError as exc:  # a credentials file readable by others is never used
+        print(exc)
+        return
+    if not password:
+        return
+    entry = f"\n[{_toml_str(host)}]\nusername = {_toml_str(username)}\npassword = {_toml_str(password)}\n"
+    if tomllib.loads(entry).get(host) != {"username": username, "password": password}:
+        print("아이디나 비밀번호에 저장할 수 없는 문자가 있어 저장하지 않았습니다.")
+        return
+    CREDENTIALS.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(CREDENTIALS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as out:
+        out.write(entry)
+    os.chmod(CREDENTIALS, 0o600)
+    print(f"{CREDENTIALS}에 저장했습니다 (본인만 읽기 가능).")
+
+
 def secret_fill(root: Path, field: str, ref: str, session: str) -> None:
     """Fill a login field from the credentials file without the value reaching the model."""
     if field not in ("username", "password"):
@@ -1874,6 +1902,7 @@ def go(site: str | None, directory: str | None, opts: Options, attach: bool = Tr
     tmux = Tmux(session_name(root))
     _write_atomic(LAST_CONTEST, f"{root}\n")
     print(f"대회 폴더: {root}")
+    ask_credential(urlparse(contest.url).hostname or "")
     if not tmux.exists():
         while not contest.challenges():
             print("문제를 수집하는 중입니다 (Codex + chrome-use, 몇 분 걸릴 수 있음)...", flush=True)

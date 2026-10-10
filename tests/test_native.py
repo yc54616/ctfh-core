@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures as cf
 import json
+import tomllib
 import os
 import shutil
 import subprocess
@@ -197,6 +198,24 @@ class LayoutTests(Base):
         self.assertLess(prompt.index("로그인 버튼을 한 번"), prompt.index("secret-fill"))
         self.assertIn("--session ctfh-submit-web-1", prompt)
         self.assertNotIn('"p"', prompt)
+
+
+    def test_start_asks_once_for_the_site_login_and_keeps_it_private(self):
+        creds = Path(self.temp.name) / "cfg" / "credentials.toml"
+        asked = []
+        def ask(text):
+            asked.append(text)
+            return "me"
+        with patch.object(native, "CREDENTIALS", creds), patch.object(native.sys.stdin, "isatty", return_value=True):
+            native.ask_credential("ctf.example", ask, lambda text: 'p"w\\x')
+            self.assertEqual(native.credential("ctf.example"), {"username": "me", "password": 'p"w\\x'})
+            native.ask_credential("ctf.example", ask, lambda text: "other")  # already saved: not asked again
+            native.ask_credential("other.example", lambda text: "", lambda text: self.fail("asked"))  # Enter skips
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(creds.stat().st_mode & 0o777, 0o600)
+        self.assertIsNone(tomllib.loads(creds.read_text()).get("other.example"))
+        with patch.object(native, "CREDENTIALS", creds), patch.object(native.sys.stdin, "isatty", return_value=False):
+            native.ask_credential("third.example", lambda text: self.fail("asked off a terminal"))
 
 
 class VerifyTests(Base):
