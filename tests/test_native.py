@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures as cf
 import json
 import os
 import shutil
@@ -639,6 +640,39 @@ class CheckerFlowTests(Base):
         subprocess.run(native.restart_loop(["sh", "-c", f"echo x >> {runs}; exit 3"], delay=0),
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         self.assertEqual(len(runs.read_text().split()), 5)  # a checker that cannot start stops retrying
+
+    def test_challenges_start_while_big_attachments_download(self):
+        web = make_challenge(self.root, "web")
+        (web / "challenge.json").write_text(json.dumps({"name": "web", "category": "web", "attachments": []}))
+        for slug, size in (("dfir", "4.2 GB"), ("rev", "120 KB")):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({
+                "name": slug, "category": "forensics" if slug == "dfir" else "rev",
+                "attachments": [{"name": f"{slug}.bin", "url": "https://x/f", "size": size}]}))
+        prompts = []
+        def downloader(opts, cwd, prompt, *rest, **kw):
+            prompts.append((opts.model, prompt))
+            (cwd / "challenges" / "rev" / "files" / native.FILES_DONE).touch()  # dfir never arrives
+            return {"downloaded": ["rev"], "failed": [{"slug": "dfir", "reason": "too slow"}]}
+        checker = self.checker(runner=downloader)
+        def run_now(fn, *args):  # run background jobs inline so the test sees their effect
+            future = cf.Future()
+            future.set_result(fn(*args))
+            return future
+        with patch.object(checker.pool, "submit", side_effect=run_now):
+            checker.tick()
+        self.assertEqual(self.status("web")["state"], "solving")  # nothing to download: starts at once
+        self.assertLess(prompts[0][1].index("rev"), prompts[0][1].index("dfir"))  # small first, big image last
+        self.assertEqual(prompts[0][0], "gpt-6-luna")
+        checker.tick()
+        self.assertEqual(self.status("rev")["state"], "solving")
+        self.assertEqual(self.status("dfir")["state"], "pending")
+        self.assertIn(native.FILES_WAIT, checker.board())
+        for _ in range(native.DOWNLOAD_TRIES - 1):
+            checker.job_download([self.root / "challenges" / "dfir"])
+        checker.fill_slots(checker.tmux.windows())
+        self.assertEqual(self.status("dfir")["state"], "solving")  # gave up waiting, starts with what arrived
+        self.assertTrue(self.status("dfir")["files_failed"])
 
     def test_submit_and_review_run_with_their_own_effort(self):
         chal = make_challenge(self.root, "heap")

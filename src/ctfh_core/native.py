@@ -140,6 +140,11 @@ def memory_prefix(opts: Options, chal: Path) -> list[str]:
 
 REMOTE_PROBE_SECONDS = 30
 REMOTE_DOWN_REASON = "서버 닫힘 대기"
+FILES_DONE = ".ctfh-done"  # files/<this>: every attachment of the challenge is fully downloaded
+FILES_WAIT = "첨부 다운로드 대기"
+DOWNLOAD_RETRY_SECONDS = 600
+DOWNLOAD_TRIES = 3  # then the solver starts with whatever arrived
+DOWNLOAD_TIMEOUT = 3 * 3600
 _HOST = r"(?:\d{1,3}(?:\.\d{1,3}){3}|(?:[a-z0-9-]+\.)+[a-z]{2,})"
 _HOST_PORT = re.compile(rf"\bnc\s+(?:-\S+\s+)*(?P<a>{_HOST})\s+(?P<b>\d{{2,5}})\b|(?P<c>{_HOST}):(?P<d>\d{{2,5}})\b", re.I)
 _URL = re.compile(rf"\b(?P<scheme>https?)://(?P<host>{_HOST})(?::(?P<port>\d{{2,5}}))?", re.I)
@@ -575,6 +580,51 @@ def run_codex_json(opts: Options, cwd: Path, prompt: str, schema: dict, work: Pa
     return result
 
 
+DOWNLOAD_SCHEMA = _strict({
+    "downloaded": {"type": "array", "items": {"type": "string"}},
+    "failed": {"type": "array", "items": _strict({"slug": {"type": "string"}, "reason": {"type": "string"}})},
+})
+
+
+def files_ready(chal: Path, status: dict) -> bool:
+    """Attachments are in, or there are none to wait for (folders collected before attachment lists count as ready)."""
+    info = _read_json(chal / "challenge.json", {})
+    attachments = info.get("attachments") if isinstance(info, dict) else None
+    return not attachments or (chal / "files" / FILES_DONE).exists() or bool(status.get("files_failed"))
+
+
+def _download_size(chal: Path) -> float:
+    """Rough attachment size for ordering; an unknown size counts as big for forensics."""
+    info = _read_json(chal / "challenge.json", {})
+    info = info if isinstance(info, dict) else {}
+    total = 0.0
+    for item in info.get("attachments") or []:
+        size = str(item.get("size") or "") if isinstance(item, dict) else ""
+        match = re.search(r"(\d+(?:\.\d+)?)\s*([KMGT]?)i?B", size, re.I)
+        if match:
+            unit = match.group(2).upper()
+            total += float(match.group(1)) * (1024 ** ("KMGT".index(unit) + 1) if unit else 1)
+        else:
+            total += 1e9 if "forens" in str(info.get("category", "")).lower() else 1e6
+    return total
+
+
+def download(contest: Contest, opts: Options, chals: list[Path], runner=run_codex_json, show=None) -> dict:
+    order = ", ".join(chal.name for chal in sorted(chals, key=_download_size))
+    prompt = f"""너는 CTF 대회의 첨부 파일 다운로드 담당이다. 대상: {contest.url}
+문제를 풀지 마라. 현재 폴더가 대회 폴더다.
+1. 먼저 `chrome-use skills get core`로 사용법을 읽고, 사용자의 로그인된 Chrome을 세션 이름 `ctfh-download`로 쓴다.
+2. 아래 순서대로 문제마다 challenges/<slug>/challenge.json의 attachments를 challenges/<slug>/files/에 내려받는다
+   (압축은 풀지 않는다). 작은 것부터 받도록 이미 정렬해 두었다: {order}
+3. 한 문제의 첨부를 끝까지 다 받았으면 (크기가 사이트에 보인 크기와 맞는지 확인) 다음 문제로 넘어가기 전에 바로
+   challenges/<slug>/files/{FILES_DONE} 빈 파일을 만든다. 검사기는 이 파일을 보는 즉시 그 문제의 풀이를 시작한다.
+   덜 받은 파일이 있으면 만들지 마라.
+4. 받지 못한 문제는 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고
+   남은 문제를 모두 failed로 적고 끝낸다.
+최종 응답은 주어진 스키마의 JSON으로만 한다."""
+    return runner(opts, contest.root, prompt, DOWNLOAD_SCHEMA, contest.state_dir, "download", DOWNLOAD_TIMEOUT, show=show)
+
+
 def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -> dict:
     existing = ", ".join(p.name for p in contest.challenges()) or "(없음)"
     login = ("로그인되어 있지 않거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고 login=\"needs_user\"로 바로 끝낸다.")
@@ -594,8 +644,9 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
    - challenge.md: 제목, 카테고리, 점수, 설명 원문, 접속 정보(nc/URL), 첨부 목록, 문제 페이지 URL,
      그리고 이 문제 창만 정확히 여는 방법(고유 링크, 또는 카드의 고유 CSS 선택자/data 속성)
    - challenge.json: {{"id": 사이트 id, "name", "category", "points", "solves": 푼 팀 수 (모르면 null), "url": 문제 페이지,
-     "solved": 내 계정 기준 해결 여부}}
-   - files/: 첨부 파일 다운로드 (압축은 풀지 않아도 된다)
+     "solved": 내 계정 기준 해결 여부, "attachments": [{{"name", "url", "size": 사이트에 보이는 크기 (모르면 null)}}]
+     (첨부가 없으면 [])}}
+   - 첨부 파일은 내려받지 않는다. 검사기가 따로 받으므로 목록만 attachments에 적는다.
    인스턴스를 켜야 하는 문제는 켜지 말고 challenge.md에 그 사실과 방법만 적는다.
 5. flag 형식(정규식)과 제출 방법(어느 페이지의 어떤 입력창/버튼인지)을 알아낸다.
 6. 대회 규칙(Rules/FAQ/공지)을 읽고 풀이에 영향을 주는 것만 한국어로 짧게 rules에 적는다: 자동화 도구·AI 사용 제한,
@@ -888,7 +939,7 @@ class Tmux:
 class Checker:
     def __init__(self, contest: Contest, opts: Options, tmux: Tmux, runner=run_codex_json):
         self.contest, self.opts, self.tmux, self.runner = contest, opts, tmux, runner
-        self.pool = cf.ThreadPoolExecutor(max_workers=4)
+        self.pool = cf.ThreadPoolExecutor(max_workers=6)  # collect and download may run for long
         self.jobs: dict[str, cf.Future] = {}
         self.submit_lock = threading.Lock()
         self.last_scan = time.time()
@@ -900,7 +951,7 @@ class Checker:
         self.last_solved_poll = 0.0
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
         self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
-        self.last_outage_check = self.last_probe = 0.0
+        self.last_outage_check = self.last_probe = self.last_download = 0.0
         saved = _read_json(contest.state_dir / "checker.json", {})
         saved = saved if isinstance(saved, dict) else {}
         limit, self.base_parallel = saved.get("max_parallel") or {}, opts.max_parallel
@@ -1020,6 +1071,36 @@ class Checker:
                           f"{_now()} Chrome에서 {self.contest.url} 에 다시 로그인하세요.\n")
         else:
             (self.contest.state_dir / "needs_user.txt").unlink(missing_ok=True)
+
+    def waiting_files(self) -> list[Path]:
+        return [chal for chal in self.contest.challenges()
+                if (status := load_status(chal)).get("state") not in FINISHED and not files_ready(chal, status)]
+
+    def job_download(self, chals: list[Path]) -> None:
+        """Fetch attachments in the background; each challenge starts as soon as its own files are in."""
+        opts = replace(self.opts, model=self.opts.rescan_model or self.opts.model,
+                       effort=self.opts.rescan_effort or self.opts.effort)
+        result = {}
+        try:
+            result = download(self.contest, opts, chals, self.runner,
+                              show=lambda text: setattr(self, "download_line", text))
+        finally:  # a crashed or timed-out run counts as a try too
+            self.last_download = time.time()
+            self.count_download_tries(chals, result)
+
+    def count_download_tries(self, chals: list[Path], result: dict) -> None:
+        reasons = {str(item.get("slug")): str(item.get("reason", "")) for item in result.get("failed", [])
+                   if isinstance(item, dict)}
+        with self.lock:
+            for chal in chals:
+                status = load_status(chal)
+                if files_ready(chal, status):
+                    continue
+                status["download_tries"] = tries = status.get("download_tries", 0) + 1
+                if tries >= DOWNLOAD_TRIES:  # better to start with what arrived than to wait forever
+                    status.update(files_failed=True, reason=f"첨부를 {tries}번 받지 못함, 받은 것만으로 시작: "
+                                                            + (reasons.get(chal.name) or "files/ 확인"))
+                save_status(chal, status)
 
     # -- one decision per challenge per tick
     def step(self, chal: Path, windows: set[str]):
@@ -1242,8 +1323,8 @@ class Checker:
                 continue
             status = load_status(chal)
             state = status.get("state")
-            if state == "pending" or (state == "blocked" and status.get("blocked_by")
-                                      != f"{self.opts.binary}:{self.opts.model or '-'}"):
+            if (state == "pending" or (state == "blocked" and status.get("blocked_by")
+                                       != f"{self.opts.binary}:{self.opts.model or '-'}")) and files_ready(chal, status):
                 fresh.append((chal, status))
             elif state in ACTIVE | {"accepted"} and not status.get("remote_down") \
                     and time.time() - status.get("launched_ts", 0) > 60:
@@ -1277,7 +1358,8 @@ class Checker:
             rows.append({"name": chal.name, "state": status.get("state", "-"),
                          "tokens": f"{tokens:,}" if tokens else "-",
                          "activity": self.activity_text(chal, status, windows),
-                         "reason": str(status.get("reason", ""))})
+                         "reason": str(status.get("reason", "")) or (
+                             FILES_WAIT if status.get("state") == "pending" and not files_ready(chal, status) else "")})
         rows.sort(key=lambda row: BOARD_ORDER.get(row["state"], 2))  # stable: name order within a group
         manual = [row["name"] for row in rows if row["state"] == "manual"]
         busy = ", ".join(sorted(k for k, f in self.jobs.items() if not f.done() and k != "__solved__")) or "-"
@@ -1311,6 +1393,8 @@ class Checker:
             head.append(f"메모리 부족: {used:.0%} 사용 중, 새 풀이 창은 여유가 생기면 연다")
         if "__collect__" in self.jobs and not self.jobs["__collect__"].done():
             head.append("문제 재수집 중: " + getattr(self, "collect_line", "시작"))
+        if "__download__" in self.jobs and not self.jobs["__download__"].done():
+            head.append(f"첨부 받는 중 ({len(self.waiting_files())}개 남음): " + getattr(self, "download_line", "시작"))
         return head, rows
 
     def board(self) -> str:
@@ -1494,6 +1578,12 @@ class Checker:
                 self.jobs[chal.name] = self.pool.submit(job)
         if not self.outage:
             self.fill_slots(self.tmux.windows())
+        if not self.outage and not ended and "__download__" not in self.jobs:
+            waiting = self.waiting_files()
+            # a newly listed challenge starts at once; one that failed waits before the next try
+            if waiting and (any(not load_status(chal).get("download_tries") for chal in waiting)
+                            or time.time() - self.last_download > DOWNLOAD_RETRY_SECONDS):
+                self.jobs["__download__"] = self.pool.submit(self.job_download, waiting)
         if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
             self.last_solved_poll = time.time()
             self.jobs["__solved__"] = self.pool.submit(self.job_solved)

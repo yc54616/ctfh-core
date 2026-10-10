@@ -229,6 +229,12 @@ Checker safeguards:
   flag in the contest format, the newer one replaces `flag.txt` and is submitted
   (instances that mint a flag per start). If the rerun fails while the remote is
   closed, the challenge waits for the server instead of counting as a wrong solve.
+- **Attachments download in the background**: collecting only lists
+  challenges and their attachments, so web/remote challenges start right away.
+  A separate cheap Codex run (rescan model) fetches attachments smallest first,
+  big forensics images last; each challenge opens as soon as its own files are
+  complete (`files/.ctfh-done`). After 3 failed tries it starts with whatever
+  arrived.
 - **Checker restarts itself** after a crash (5 s later); `q`/Ctrl-C ends it, and
   5 quick crashes in a row stop the retries and leave the error on screen.
 - **Cheaper side jobs**: submitting runs at low effort and writeup review at
