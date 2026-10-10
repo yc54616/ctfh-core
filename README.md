@@ -205,7 +205,7 @@ rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it
    | `p` | hold: close the window, no automatic restart until `r` (a teammate is on it) |
    | `d` | mark solved (a teammate solved it) and close the window |
    | `s` | rescan the site now (default every 60 minutes on `gpt-6-luna`, low effort) |
-   | `+` / `-` | change the window limit live; limited slots open the most-solved challenges first |
+   | `+` / `-` | change the window limit live (kept across checker restarts until `--max-parallel` changes); limited slots open the most-solved challenges first |
    | `q` | quit the checker; solver windows keep running |
 
 Checker safeguards:
@@ -225,6 +225,9 @@ Checker safeguards:
   fake/dummy/placeholder wording, or one found in the handed-out files
   (including inside zip/tar), goes back to the solver instead of being
   submitted.
+- **Cheaper side jobs**: submitting runs at low effort and writeup review at
+  medium, on the solver model (`--submit-thinking`, `--review-thinking`;
+  `same` follows `--thinking`).
 - **Rules and usage**: the collector summarizes the contest rules onto the board
   and into every `AGENTS.md`. A ban on automation or AI, and weekly Codex usage
   of 90% or more, are flagged `!!`.

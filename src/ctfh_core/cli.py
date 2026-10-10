@@ -416,6 +416,10 @@ def _native_options(parser: argparse.ArgumentParser) -> None:
                         help=f"주기적 재스캔에만 쓸 모델 (same이면 --model과 같음, 기본 {ctfh_native.RESCAN_MODEL})")
     parser.add_argument("--rescan-thinking", choices=(*ctfh_native.EFFORTS, "same"),
                         help="주기적 재스캔에만 쓸 추론 강도 (same이면 --thinking과 같음, 기본 low)")
+    parser.add_argument("--submit-thinking", choices=(*ctfh_native.EFFORTS, "same"),
+                        help="사이트 제출 작업의 추론 강도 (same이면 --thinking과 같음, 기본 low)")
+    parser.add_argument("--review-thinking", choices=(*ctfh_native.EFFORTS, "same"),
+                        help="writeup 검토 작업의 추론 강도 (same이면 --thinking과 같음, 기본 medium)")
     parser.add_argument("--rescan-minutes", type=int, help="새 문제·해결 상태 재수집 주기 (0이면 끔, 기본 60)")
     parser.add_argument("--idle-seconds", type=int, help="멈춘 풀이 세션을 깨우기까지 기다리는 시간 (기본 180)")
     parser.add_argument("--nudge-limit", type=int, help="문제당 자동 재촉·재시작 최대 횟수, 넘으면 manual 상태로 사용자에게 넘김 (기본 3)")
@@ -439,6 +443,8 @@ def _native_settings(args) -> ctfh_native.Options:
         binary=binary, model=pick("model", "model", ctfh_native.DEFAULT_MODEL), effort=pick("reasoning_effort", "thinking", None),
         rescan_model=None if (rescan_model := pick("rescan_model", "rescan_model", ctfh_native.RESCAN_MODEL)) == "same" else rescan_model,
         rescan_effort=None if (rescan_effort := pick("rescan_thinking", "rescan_thinking", "low")) == "same" else rescan_effort,
+        submit_effort=None if (submit_effort := pick("submit_thinking", "submit_thinking", "low")) == "same" else submit_effort,
+        review_effort=None if (review_effort := pick("review_thinking", "review_thinking", "medium")) == "same" else review_effort,
         max_parallel=max(0, int(pick("max_parallel", "max_parallel", 0))),
         submit=not args.no_submit and bool(config.get("submit", True)),
         plain=args.plain or bool(config.get("plain", False)),

@@ -54,6 +54,8 @@ class Options:
     effort: str | None = None
     rescan_model: str | None = RESCAN_MODEL  # periodic rescans only re-read the list; None: same as model
     rescan_effort: str | None = "low"  # None: same as effort
+    submit_effort: str | None = "low"  # submitting is a few clicks; None: same as effort
+    review_effort: str | None = "medium"  # writeup review; None: same as effort
     max_parallel: int = 0  # 0: every unsolved challenge at once
     submit: bool = True
     rescan_seconds: int = 3600
@@ -73,7 +75,8 @@ class Options:
             args += ["--model", self.model]
         if self.effort:
             args += ["--thinking", self.effort]
-        args += ["--rescan-model", self.rescan_model or "same", "--rescan-thinking", self.rescan_effort or "same"]
+        args += ["--rescan-model", self.rescan_model or "same", "--rescan-thinking", self.rescan_effort or "same",
+                 "--submit-thinking", self.submit_effort or "same", "--review-thinking", self.review_effort or "same"]
         if not self.submit:
             args.append("--no-submit")
         if self.plain:
@@ -882,7 +885,12 @@ class Checker:
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
         self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
         self.last_outage_check = self.last_probe = 0.0
-        self.end_handled = False
+        saved = _read_json(contest.state_dir / "checker.json", {})
+        saved = saved if isinstance(saved, dict) else {}
+        limit, self.base_parallel = saved.get("max_parallel") or {}, opts.max_parallel
+        if isinstance(limit, dict) and limit.get("base") == opts.max_parallel and isinstance(limit.get("live"), int):
+            self.opts = replace(self.opts, max_parallel=max(0, limit["live"]))  # a live +/- outlives a restart
+        self.end_handled = saved.get("end_handled")  # the end time already handled, so r after the end sticks
         self.last_view: tuple[list[str], list[dict]] = ([], [])
 
     # -- solver windows
@@ -940,7 +948,8 @@ class Checker:
         save_status(chal, status)
         try:
             with self.submit_lock:
-                result = submit(self.contest, chal, self.opts, self.runner)
+                result = submit(self.contest, chal, replace(self.opts, effort=self.opts.submit_effort or self.opts.effort),
+                                self.runner)
         except Exception as exc:  # noqa: BLE001 - the outcome is unknown, never retried blindly
             result = {"result": "unknown", "message": f"제출 작업 오류: {exc}"}
         status = load_status(chal)
@@ -963,7 +972,7 @@ class Checker:
         save_status(chal, status)
 
     def job_review(self, chal: Path, mtime: int) -> None:
-        result = review(chal, self.opts, self.runner)
+        result = review(chal, replace(self.opts, effort=self.opts.review_effort or self.opts.effort), self.runner)
         status = load_status(chal)
         status.update(writeup_mtime_ns=mtime, review=result)
         if result.get("writeup_ok") and result.get("matches_solve"):
@@ -1393,11 +1402,18 @@ class Checker:
             status.update(state="hold", reason="대회 종료: 자동 풀이를 멈춤 (r로 계속).")
             save_status(chal, status)
 
+    def save_state(self) -> None:
+        """What the checker must remember across restarts; a new --max-parallel replaces the live limit."""
+        _write_atomic(self.contest.state_dir / "checker.json", json.dumps({
+            "max_parallel": {"base": self.base_parallel, "live": self.opts.max_parallel},
+            "end_handled": self.end_handled}) + "\n")
+
     def set_parallel(self, delta: int) -> str:
         """Change the window limit live; 0 means every challenge at once. Open windows are never closed."""
         with self.lock:
             limit = max(0, self.opts.max_parallel + delta)
             self.opts = replace(self.opts, max_parallel=limit)
+            self.save_state()
             return f"동시 풀이 창: {limit or '전체'}" + (" (이미 열린 창은 그대로, 새 창만 제한)" if delta < 0 and limit else "")
 
     def rescan_now(self) -> str:
@@ -1427,8 +1443,9 @@ class Checker:
         self.outage = outage
         ends = self.contest.ends_at()
         ended = ends is not None and datetime.now(timezone.utc) >= ends
-        if ended and not self.end_handled:
-            self.end_handled = True
+        if ended and self.end_handled != ends.isoformat():
+            self.end_handled = ends.isoformat()
+            self.save_state()
             self.stop_for_end()
         for key, future in list(self.jobs.items()):
             if not future.done():

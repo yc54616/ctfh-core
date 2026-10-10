@@ -212,6 +212,8 @@ class CodexCommandTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--rescan-model") + 1], "gpt-6-luna")
         argv = native.Options(rescan_model=None, rescan_effort=None).to_args()
         self.assertEqual((argv[argv.index("--rescan-model") + 1], argv[argv.index("--rescan-thinking") + 1]), ("same", "same"))
+        self.assertEqual((argv[argv.index("--submit-thinking") + 1], argv[argv.index("--review-thinking") + 1]),
+                         ("low", "medium"))
 
 
 
@@ -599,6 +601,36 @@ class CheckerFlowTests(Base):
         self.assertRegex(checker.board(), r"heap +hold .*보류 \(r로 재개\)")
         self.assertIn("풀이 창을 다시 열었습니다", checker.act("restart", "heap"))
         self.assertEqual(self.status("heap")["state"], "solving")
+
+    def test_submit_and_review_run_with_their_own_effort(self):
+        chal = make_challenge(self.root, "heap")
+        checker = self.checker(effort="xhigh")
+        seen = []
+        with patch("ctfh_core.native.submit", side_effect=lambda contest, chal, opts, runner:
+                   seen.append(("submit", opts.model, opts.effort)) or {"result": "unknown", "message": ""}), \
+             patch("ctfh_core.native.review", side_effect=lambda chal, opts, runner:
+                   seen.append(("review", opts.model, opts.effort)) or {}):
+            checker.job_submit(chal)
+            checker.job_review(chal, 0)
+        self.assertEqual(seen, [("submit", "gpt-6-sol", "low"), ("review", "gpt-6-sol", "medium")])
+
+    def test_live_limit_and_handled_end_survive_a_checker_restart(self):
+        from datetime import datetime, timedelta, timezone
+        make_challenge(self.root, "heap")
+        checker = self.checker()
+        checker.tick()
+        checker.set_parallel(2)
+        config = self.root / "contest.toml"
+        ended = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        config.write_text(config.read_text().replace('ends_at = ""', f'ends_at = "{ended}"'))
+        checker.tick()
+        self.assertEqual(self.status("heap")["state"], "hold")
+        checker.act("restart", "heap")  # keep practicing after the end
+        again = self.checker()
+        self.assertEqual(again.opts.max_parallel, 2)
+        again.tick()
+        self.assertEqual(self.status("heap")["state"], "solving")  # the end is not handled twice
+        self.assertEqual(self.checker(max_parallel=5).opts.max_parallel, 5)  # a new setting wins over the live one
 
     def test_limited_slots_open_easiest_first_and_limit_changes_live(self):
         for slug, solves in (("hard", 5), ("easy", 50), ("unknown", None)):
