@@ -19,10 +19,12 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import tomllib
+import zipfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -182,6 +184,12 @@ def probe_endpoint(endpoint: tuple[str, int], timeout: float = 3.0) -> str:
 
 SOLVED_POLL_SECONDS = 60
 USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
+OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
+OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
+OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
+OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
+                            r"network error|connection (?:refused|reset)", re.I)
+FAKE_FLAG_PATTERN = re.compile(r"fake|dummy|placeholder|redacted|not_?(?:the_?)?real|(?:sample|test)_?flag", re.I)
 SOLVED_JS = ("fetch({api!r},{{credentials:'include'}}).then(r=>r.json()).then(d=>JSON.stringify({{success:d.success,"
              "solved:(d.data||[]).filter(c=>c.solved_by_me).map(c=>[String(c.id),c.name])}}))")
 
@@ -344,6 +352,13 @@ class Contest:
     def flag_regex(self) -> str:
         return str(self.config().get("flag_regex") or self.site().get("flag_regex") or "")
 
+    def ends_at(self) -> datetime | None:
+        try:
+            ends = datetime.fromisoformat(str(self.config().get("ends_at") or self.site().get("ends_at") or ""))
+        except ValueError:
+            return None
+        return ends if ends.tzinfo else ends.astimezone()  # no zone given: this machine's local time
+
     def challenges(self) -> list[Path]:
         if not self.challenges_dir.is_dir():
             return []
@@ -370,7 +385,8 @@ def init_contest(url: str, root: Path) -> Contest:
     if not config.exists():
         _write_atomic(config, "# 사람이 고쳐도 되는 대회 설정. 비어 있으면 수집 결과(.ctfh/site.json)를 쓴다.\n"
                       f"url = {_toml_str(url)}\n"
-                      "flag_regex = \"\"   # 예: \"DH\\\\{[^}]+\\\\}\"\n")
+                      "flag_regex = \"\"   # 예: \"DH\\\\{[^}]+\\\\}\"\n"
+                      "ends_at = \"\"      # 대회 종료 시각, 예: \"2026-10-12T18:00:00+09:00\"\n")
     agents = contest.root / "AGENTS.md"
     if not agents.exists():
         _write_atomic(agents, CONTEST_AGENTS.format(url=url))
@@ -442,6 +458,7 @@ COLLECT_SCHEMA = _strict({
     "challenges": {"type": "array", "items": _strict({
         "slug": {"type": "string"}, "name": {"type": "string"}, "solved": {"type": "boolean"}})},
     "rules": {"type": "string"},
+    "ends_at": {"type": "string"},
     "notes": {"type": "string"},
 })
 SUBMIT_SCHEMA = _strict({
@@ -579,11 +596,13 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
 6. 대회 규칙(Rules/FAQ/공지)을 읽고 풀이에 영향을 주는 것만 한국어로 짧게 rules에 적는다: 자동화 도구·AI 사용 제한,
    공격 허용 범위, 무차별 대입·스캐너 금지, 제출 횟수 제한, flag 공유 금지. 자동화나 AI 사용을 금지하면 맨 앞에
    `[금지]`를 붙인다. 규칙을 찾지 못하면 빈 문자열.
+7. 대회 종료 시각을 찾으면 ends_at에 시간대를 넣은 ISO 8601로 적는다 (예: 2026-10-12T18:00:00+09:00). 못 찾으면 빈 문자열.
 이미 있는 폴더: {existing}
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
     result = runner(opts, contest.root, prompt, COLLECT_SCHEMA, contest.state_dir, "collect", show=show)
     site = {k: result.get(k, "") for k in ("platform", "flag_regex", "submit_hint", "notes")}
-    site["rules"] = result.get("rules") or contest.site().get("rules", "")  # a rescan that missed them keeps the old
+    site["rules"] = result.get("rules") or contest.site().get("rules", "")
+    site["ends_at"] = result.get("ends_at") or contest.site().get("ends_at", "")  # a rescan that missed them keeps the old
     site.update(login=result.get("login"), collected_at=_now())
     _write_atomic(contest.state_dir / "site.json", json.dumps(site, ensure_ascii=False, indent=2) + "\n")
     contest.normalize()
@@ -620,6 +639,45 @@ def run_solve(chal: Path, timeout: int) -> tuple[int | None, str]:
         return None, output or ""
 
 
+def fake_flag_reason(chal: Path, flag: str) -> str | None:
+    """Why a remote challenge's flag looks like the local test one, which the server would reject as wrong."""
+    try:
+        remote = bool((chal / "remote.txt").read_text().strip())
+    except OSError:
+        remote = False
+    if not remote:  # file-only challenges: the real flag may well sit in the handed-out files
+        return None
+    if FAKE_FLAG_PATTERN.search(flag):
+        return "flag가 로컬 테스트용 가짜 값으로 보입니다 (fake/dummy 등). 원격 서버에서 실제 flag를 받아 와라."
+    if _in_attachments(chal / "files", flag.encode()):
+        return "이 flag는 배포 파일(files/)에 들어 있는 값이다. 원격 서버에서 실제 flag를 받아 와라."
+    return None
+
+
+def _in_attachments(folder: Path, needle: bytes, limit: int = 64 << 20) -> bool:
+    """Whether the handed-out files, including inside zip/tar archives, contain these bytes."""
+    for path in sorted(folder.rglob("*")) if folder.is_dir() else ():
+        try:
+            if not path.is_file() or path.stat().st_size > limit:
+                continue
+            if zipfile.is_zipfile(path):
+                with zipfile.ZipFile(path) as archive:
+                    if any(not item.is_dir() and item.file_size <= limit and needle in archive.read(item)
+                           for item in archive.infolist()):
+                        return True
+            elif tarfile.is_tarfile(path):
+                with tarfile.open(path) as archive:
+                    for item in archive:
+                        member = archive.extractfile(item) if item.isfile() and item.size <= limit else None
+                        if member is not None and needle in member.read():
+                            return True
+            elif needle in path.read_bytes():
+                return True
+        except (OSError, RuntimeError, ValueError, EOFError, zipfile.BadZipFile, tarfile.TarError):
+            continue  # encrypted or broken archives
+    return False
+
+
 def verify_flag(chal: Path, flag_regex: str, timeout: int) -> CheckResult:
     """Deterministic gate: format, provenance (no literal flag), independent re-run."""
     try:
@@ -632,6 +690,9 @@ def verify_flag(chal: Path, flag_regex: str, timeout: int) -> CheckResult:
     digest = flag_hash(flag)
     if flag_regex and not re.fullmatch(flag_regex, flag):
         return CheckResult(False, f"flag 형식이 대회 정규식 {flag_regex!r}과 맞지 않습니다.", digest)
+    fake = fake_flag_reason(chal, flag)
+    if fake:
+        return CheckResult(False, fake, digest)
     solve = chal / "solve.py"
     if not solve.is_file():
         return CheckResult(False, "solve.py가 없습니다. flag를 다시 얻는 스크립트가 필요합니다.", digest)
@@ -717,6 +778,17 @@ def find_rollout(cwd: Path, home: Path, since: float) -> Path | None:
     return best[1] if best else None
 
 
+def api_reachable() -> bool:
+    """Whether this machine reaches the Codex backend at all (a TCP connect, no request)."""
+    for host in ("chatgpt.com", "api.openai.com"):
+        try:
+            socket.create_connection((host, 443), timeout=3).close()
+            return True
+        except OSError:
+            continue
+    return False
+
+
 def rollout_info(path: Path) -> dict:
     """Total tokens and whether the last turn finished (idle) from a rollout tail."""
     info = {"tokens": None, "idle": False, "mtime": 0.0}
@@ -737,9 +809,13 @@ def rollout_info(path: Path) -> dict:
         if info["tokens"] is None and kind == "token_count":
             usage = (payload.get("info") or {}).get("total_token_usage") or {}
             info["tokens"] = usage.get("total_tokens")
-        primary = (payload.get("rate_limits") or {}).get("primary") or {} if kind == "token_count" else {}
+        rates = (payload.get("rate_limits") or {}) if kind == "token_count" else {}
+        primary, credits = rates.get("primary") or {}, rates.get("credits") or {}
         if "limits" not in info and primary.get("used_percent") is not None:
-            info["limits"] = {"used": primary["used_percent"], "resets": primary.get("resets_at")}
+            info["limits"] = {"used": primary["used_percent"], "resets": primary.get("resets_at"),
+                              "reached": bool(rates.get("rate_limit_reached_type") or rates.get("spend_control_reached")
+                                              or (primary["used_percent"] >= 100 and not credits.get("has_credits")
+                                                  and not credits.get("unlimited")))}
         if kind in ("task_started", "task_complete", "turn_aborted") and "turn" not in info:
             info["turn"] = kind
             info["idle"] = kind != "task_started"
@@ -804,6 +880,9 @@ class Checker:
         self.solved_probe = site_solved
         self.last_solved_poll = 0.0
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
+        self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
+        self.last_outage_check = self.last_probe = 0.0
+        self.end_handled = False
         self.last_view: tuple[list[str], list[dict]] = ([], [])
 
     # -- solver windows
@@ -1064,6 +1143,8 @@ class Checker:
                 status["state"] = "solving"
                 save_status(chal, status)
             return
+        if self.outage:  # every window is stuck for the same reason; nudging would only spend the limit
+            return
         if not info["idle"] or time.time() - info["mtime"] < self.opts.idle_seconds \
                 or time.time() - status.get("nudged_ts", 0) < self.opts.idle_seconds:
             return
@@ -1178,6 +1259,15 @@ class Checker:
             head.append(("!! " if limits["limits"]["used"] >= USAGE_WARN else "")
                         + f"Codex 주간 사용량 {limits['limits']['used']:.0f}%"
                         + (f" ({datetime.fromtimestamp(resets):%m/%d %H:%M} 초기화)" if resets else ""))
+        if self.outage:
+            head.append(f"!! 일시정지: {self.outage}. 재촉·재시작을 멈췄고, 풀리면 자동으로 이어 갑니다.")
+        ends = self.contest.ends_at()
+        if ends:
+            left, when = (ends - datetime.now(timezone.utc)).total_seconds(), f"{ends.astimezone():%m/%d %H:%M}"
+            if left <= 0:
+                head.append(f"대회 종료됨 ({when}): 자동 풀이를 멈췄고, 정답 문제의 writeup만 마무리합니다.")
+            elif left < 86400:
+                head.append(f"대회 종료까지 {int(left // 3600)}시간 {int(left % 3600 // 60)}분 ({when})")
         rules = str(self.contest.site().get("rules", ""))
         if rules:
             head.append(("!! " if rules.startswith("[금지]") else "") + "대회 규칙: " + _short(rules, 110))
@@ -1204,27 +1294,20 @@ class Checker:
         The user's own nudges and restarts do not count against the automatic nudge limit.
         """
         with self.lock:
+            refused = self.refusal(action, name)
+            if refused:
+                return refused
             chal = self.contest.challenges_dir / name
-            if not chal.is_dir():
-                return f"{name}: 문제 폴더가 없습니다."
-            if name in self.jobs and not self.jobs[name].done():
-                return f"{name}: 검사·제출 작업 중입니다. 끝난 뒤 다시 시도하세요."
             status = load_status(chal)
             state = status.get("state", "pending")
             if action == "done":
-                if state in FINISHED:
-                    return f"{name}: 이미 끝난 문제입니다 ({state})."
                 (chal / "USER_SOLVED").write_text(_now() + "\n")
                 status.update(state="user_solved", reason="사용자가 해결로 표시 (팀원 풀이 등).")
                 save_status(chal, status)
                 self.close(chal)
                 return f"{name}: 해결로 표시하고 풀이 창을 닫았습니다."
-            if state not in ACTIVE | {"accepted", "pending", "blocked"}:
-                return f"{name}: {state} 상태라 할 수 없습니다."
             opened = window_name(name) in self.tmux.windows()
             if action == "hold":
-                if state == "hold":
-                    return f"{name}: 이미 보류 중입니다."
                 self.close(chal)
                 status.update(state="hold", reason="보류: 사용자가 멈춤 (팀원이 푸는 중 등). r로 재개.")
                 save_status(chal, status)
@@ -1239,14 +1322,76 @@ class Checker:
                 return f"{name}: 풀이 창을 다시 열었습니다."
             if not opened:
                 return f"{name}: 열린 창이 없습니다. r로 다시 여세요."
-            status["nudged_ts"] = time.time()
-            save_status(chal, status)
-            if state == "accepted":
-                self.tell(chal, "정답 처리됐다. writeup.md를 AGENTS.md 형식대로 마무리해라.")
-            else:
-                self.tell(chal, "아직 검증된 flag가 없다. work/NOTES.md와 status.json을 보고 "
-                                "다른 접근을 시도해 계속 진행해라.")
+            self.prod(chal, status)
             return f"{name}: 재촉했습니다."
+
+    def refusal(self, action: str, name: str) -> str | None:
+        """Why a dashboard key cannot apply to this challenge now; None when it can."""
+        chal = self.contest.challenges_dir / name
+        if not chal.is_dir():
+            return f"{name}: 문제 폴더가 없습니다."
+        if name in self.jobs and not self.jobs[name].done():
+            return f"{name}: 검사·제출 작업 중입니다. 끝난 뒤 다시 시도하세요."
+        state = load_status(chal).get("state", "pending")
+        if action == "done":
+            return f"{name}: 이미 끝난 문제입니다 ({state})." if state in FINISHED else None
+        if state not in ACTIVE | {"accepted", "pending", "blocked"}:
+            return f"{name}: {state} 상태라 할 수 없습니다."
+        if action == "hold" and state == "hold":
+            return f"{name}: 이미 보류 중입니다."
+        return None
+
+    def prod(self, chal: Path, status: dict) -> None:
+        """Tell an open window to keep going; not counted against the automatic nudge limit."""
+        status["nudged_ts"] = time.time()
+        save_status(chal, status)
+        if status.get("state") == "accepted":
+            self.tell(chal, "정답 처리됐다. writeup.md를 AGENTS.md 형식대로 마무리해라.")
+        else:
+            self.tell(chal, "아직 검증된 flag가 없다. work/NOTES.md와 status.json을 보고 "
+                            "다른 접근을 시도해 계속 진행해라.")
+
+    def check_outage(self, windows: set[str]) -> str | None:
+        """Why every solver is stuck at once (offline, usage limit), so idle windows are not nudged meanwhile."""
+        if time.time() - self.last_outage_check < OUTAGE_CHECK_SECONDS:
+            return self.outage
+        self.last_outage_check = time.time()
+        if not api_reachable():
+            return OFFLINE
+        infos = [info for info in self.activity.values() if info.get("mtime")]
+        latest = max((info for info in infos if info.get("limits")), key=lambda info: info["mtime"], default=None)
+        if latest and latest["limits"].get("reached") \
+                and time.time() < (latest["limits"].get("resets") or float("inf")):
+            return "Codex 사용 한도 도달 (크레딧 없음)"
+        if any(time.time() - info["mtime"] < 2 * OUTAGE_CHECK_SECONDS for info in infos):
+            return None  # some solver is still writing its rollout: Codex works
+        opened = [chal for chal in self.contest.challenges() if window_name(chal.name) in windows]
+        errors = []
+        for chal in opened:
+            tail = self.tmux.capture(window_name(chal.name)).splitlines()[-15:]
+            errors += [line.strip() for line in tail if OUTAGE_PATTERN.search(line)][-1:]
+        if len(errors) >= 2 and 2 * len(errors) >= len(opened):
+            return f"Codex 오류 화면 {len(errors)}/{len(opened)}개 창: {_short(errors[0], 60)}"
+        return None
+
+    def prod_open(self, windows: set[str], first_only: bool = False) -> None:
+        for chal in self.contest.challenges():
+            status = load_status(chal)
+            if window_name(chal.name) in windows and chal.name not in self.jobs \
+                    and status.get("state") in {"solving", "needs_fix", "accepted"}:
+                self.prod(chal, status)
+                if first_only:
+                    return
+
+    def stop_for_end(self) -> None:
+        """The contest is over: close unsolved solver windows; accepted ones finish their writeups."""
+        for chal in self.contest.challenges():
+            status = load_status(chal)
+            if chal.name in self.jobs or status.get("state") not in (ACTIVE - {"hold"}) | {"pending", "blocked"}:
+                continue
+            self.close(chal)
+            status.update(state="hold", reason="대회 종료: 자동 풀이를 멈춤 (r로 계속).")
+            save_status(chal, status)
 
     def set_parallel(self, delta: int) -> str:
         """Change the window limit live; 0 means every challenge at once. Open windows are never closed."""
@@ -1271,6 +1416,20 @@ class Checker:
 
     def _tick(self) -> str:
         windows = self.tmux.windows()
+        outage = self.check_outage(windows)
+        if self.outage and not outage:
+            self.prod_open(windows)  # back online: wake the windows stalled meanwhile
+        elif outage and not self.outage:
+            self.last_probe = time.time()
+        elif outage and outage != OFFLINE and time.time() - self.last_probe > OUTAGE_PROBE_SECONDS:
+            self.last_probe = time.time()
+            self.prod_open(windows, first_only=True)  # a lifted limit only shows once a turn runs again
+        self.outage = outage
+        ends = self.contest.ends_at()
+        ended = ends is not None and datetime.now(timezone.utc) >= ends
+        if ended and not self.end_handled:
+            self.end_handled = True
+            self.stop_for_end()
         for key, future in list(self.jobs.items()):
             if not future.done():
                 continue
@@ -1292,11 +1451,12 @@ class Checker:
             job = self.step(chal, windows)
             if job is not None:
                 self.jobs[chal.name] = self.pool.submit(job)
-        self.fill_slots(self.tmux.windows())
+        if not self.outage:
+            self.fill_slots(self.tmux.windows())
         if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
             self.last_solved_poll = time.time()
             self.jobs["__solved__"] = self.pool.submit(self.job_solved)
-        if self.opts.rescan_seconds and "__collect__" not in self.jobs \
+        if self.opts.rescan_seconds and not self.outage and not ended and "__collect__" not in self.jobs \
                 and time.time() - self.last_scan > self.opts.rescan_seconds:
             self.last_scan = time.time()
             self.jobs["__collect__"] = self.pool.submit(self.job_collect)

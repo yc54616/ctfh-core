@@ -80,7 +80,8 @@ class Base(unittest.TestCase):
         self.home = Path(self.temp.name) / "codex-home"
         for target, value in (("codex_home", self.home), ("rollout_homes", [self.home]),
                               ("_meminfo", 32 << 30), ("set_memory_slice", None),
-                              ("site_solved", None), ("probe_endpoint", "unknown")):
+                              ("site_solved", None), ("probe_endpoint", "unknown"),
+                              ("api_reachable", True)):
             patcher = patch(f"ctfh_core.native.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -445,6 +446,89 @@ class CheckerFlowTests(Base):
             for payload in payloads:
                 handle.write(json.dumps({"type": "event_msg", "payload": payload}) + "\n")
 
+    def test_offline_pauses_nudges_and_wakes_windows_when_back(self):
+        chal = make_challenge(self.root, "heap")
+        checker = self.checker(idle_seconds=0)
+        checker.tick()
+        self.idle_rollout(chal)
+        with patch("ctfh_core.native.api_reachable", return_value=False):
+            checker.last_outage_check = 0
+            checker.tick()
+            checker.tick()
+            self.assertEqual(checker.outage, native.OFFLINE)
+            self.assertFalse(checker.tmux.sent)  # no nudge while every window is cut off
+            self.assertIn("!! 일시정지", checker.board())
+        self.assertEqual(self.status("heap").get("nudges", 0), 0)
+        checker.last_outage_check = 0
+        checker.tick()
+        self.assertIsNone(checker.outage)
+        self.assertIn("계속 진행", checker.tmux.sent[0][1])
+
+    def test_usage_limit_pauses_until_a_probe_turn_runs(self):
+        chal = make_challenge(self.root, "heap")
+        checker = self.checker(idle_seconds=600)
+        checker.tick()
+        self.idle_rollout(chal)
+        self.append_rollout(chal, {"type": "token_count", "info": None, "rate_limits": {
+            "primary": {"used_percent": 100.0, "resets_at": time.time() + 3600},
+            "credits": {"has_credits": False, "unlimited": False}}})
+        checker.tick()
+        checker.last_outage_check = 0
+        checker.tick()
+        self.assertIn("사용 한도", checker.outage)
+        self.assertFalse(checker.tmux.sent)
+        checker.last_probe = 0
+        checker.tick()
+        self.assertEqual(len(checker.tmux.sent), 1)  # one window tries a turn to see if the limit lifted
+
+    def test_contest_end_holds_unsolved_windows_and_counts_down(self):
+        from datetime import datetime, timedelta, timezone
+        make_challenge(self.root, "heap")
+        chal = make_challenge(self.root, "writeup")
+        checker = self.checker()
+        checker.tick()
+        status = self.status("writeup")
+        status["state"] = "accepted"
+        native.save_status(chal, status)
+        config = self.root / "contest.toml"
+        template = config.read_text()
+        soon = datetime.now(timezone.utc) + timedelta(hours=2, minutes=5)
+        config.write_text(template.replace('ends_at = ""', f'ends_at = "{soon.isoformat()}"'))
+        self.assertIn("대회 종료까지 2시간", checker.board())
+        config.write_text(template.replace('ends_at = ""', f'ends_at = "{(soon - timedelta(hours=3)).isoformat()}"'))
+        checker.tick()
+        self.assertEqual(self.status("heap")["state"], "hold")
+        self.assertNotIn(native.window_name("heap"), checker.tmux.windows())
+        self.assertEqual(self.status("writeup")["state"], "accepted")  # still finishing its writeup
+        self.assertIn("대회 종료됨", checker.board())
+        self.assertIn("풀이 창을 다시 열었습니다", checker.act("restart", "heap"))
+        checker.tick()
+        self.assertEqual(self.status("heap")["state"], "solving")  # stopped once; r still works after the end
+
+    def test_local_test_flag_is_not_submitted(self):
+        import zipfile
+        chal = make_challenge(self.root, "pwn")
+        self.assertIsNone(native.fake_flag_reason(chal, "FLAG{fake_flag}"))  # file-only: the files may hold it
+        (chal / "remote.txt").write_text("nc host 1337\n")
+        self.assertIn("가짜", native.fake_flag_reason(chal, "FLAG{this_is_fake}"))
+        with zipfile.ZipFile(chal / "files" / "dist.zip", "w") as archive:
+            archive.writestr("deploy/flag", "FLAG{l0cal_d3ploy_v4lue}\n")
+        self.assertIn("배포 파일", native.fake_flag_reason(chal, "FLAG{l0cal_d3ploy_v4lue}"))
+        self.assertIsNone(native.fake_flag_reason(chal, "FLAG{r3al_s3rv3r_v4lue}"))
+        write_solution(chal, flag="FLAG{fake_flag}")
+        result = native.verify_flag(chal, "", 30)
+        self.assertFalse(result.ok)
+        self.assertIn("가짜", result.reason)
+
+    def test_keys_on_finished_challenge_are_refused_up_front(self):
+        chal = make_challenge(self.root, "heap")
+        checker = self.checker()
+        checker.tick()
+        self.assertIsNone(checker.refusal("hold", "heap"))
+        native.save_status(chal, {**self.status("heap"), "state": "done"})
+        self.assertIn("이미 끝난 문제", checker.refusal("done", "heap"))
+        self.assertIn("done 상태라 할 수 없습니다", checker.refusal("hold", "heap"))
+
     def test_no_progress_in_notes_hands_solver_to_user(self):
         chal = make_challenge(self.root, "heap")
         checker = self.checker(idle_seconds=0, nudge_limit=5)
@@ -610,6 +694,9 @@ class CheckerFlowTests(Base):
                     await pilot.pause(0.1)
                     if self.status("zzz")["state"] == "user_solved":
                         break
+                await pilot.pause(0.3)
+                await pilot.press("d")  # finished now: refused before any question
+                self.assertEqual(len(app.screen_stack), 1)
 
         asyncio.run(drive())
         status = self.status("zzz")

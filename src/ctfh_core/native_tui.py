@@ -157,15 +157,21 @@ class CheckerApp(App):
     def action_restart(self) -> None:
         self.request("restart")
 
+    def refused(self, action: str, name: str) -> str | None:
+        message = self.checker.refusal(action, name)
+        if message:  # say no before asking, not after the user confirmed
+            self.notify(message, severity="warning")
+        return message
+
     def action_done(self) -> None:
         name = self.selected()
-        if name is not None:  # closing a working solver is not undone by a key, so ask first
+        if name is not None and self.refused("done", name) is None:  # closing a solver is not undone by a key
             self.push_screen(ConfirmScreen(f"{name}: 팀원이 풀었다고 해결로 표시하고 풀이 창을 닫을까요?"),
                              lambda yes: self.request("done", name) if yes else None)
 
     def action_hold(self) -> None:
         name = self.selected()
-        if name is not None:
+        if name is not None and self.refused("hold", name) is None:
             self.push_screen(ConfirmScreen(f"{name}: 풀이 창을 닫고 보류할까요? (r로 재개)"),
                              lambda yes: self.request("hold", name) if yes else None)
 

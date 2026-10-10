@@ -193,6 +193,41 @@ rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it
    flag hash at most once through Chrome (`ctfh-submit`), reviews `writeup.md`
    blind-first, sends `[검사기] …` feedback into the solver window, and closes it
    when done.
+4. The checker window is a keyboard dashboard (`--plain` or `plain = true` in
+   `ctfh.toml` keeps the old text board):
+
+   | Key | Action |
+   |---|---|
+   | Enter | jump to the selected challenge's window (back: tmux window list, default `Ctrl-b w`) |
+   | `n` | nudge now; does not count against `--nudge-limit` |
+   | `r` | reopen a closed window; also resumes `manual` and `hold` challenges |
+   | `o` | read `work/NOTES.md` |
+   | `p` | hold: close the window, no automatic restart until `r` (a teammate is on it) |
+   | `d` | mark solved (a teammate solved it) and close the window |
+   | `s` | rescan the site now (default every 60 minutes on `gpt-6-luna`, low effort) |
+   | `+` / `-` | change the window limit live; limited slots open the most-solved challenges first |
+   | `q` | quit the checker; solver windows keep running |
+
+Checker safeguards:
+
+- **manual**: after `--nudge-limit` (default 3) nudges or restarts, or 2 nudges
+  with no change to `work/NOTES.md`, the checker stops nudging and leaves the
+  challenge to you.
+- **Pause**: when Codex is unreachable, out of usage (limit reached with no
+  credits), or most windows show a Codex error, nudges, restarts, and rescans
+  stop. One window retries a turn every 10 minutes. Once Codex works again,
+  every stalled window gets one nudge.
+- **Contest end**: the collector stores the end time in `.ctfh/site.json`
+  (`ends_at` in `contest.toml` overrides it). The board counts down the last 24
+  hours. At the end, unsolved windows go to `hold`. Accepted ones finish their
+  writeups.
+- **Fake flags**: for a remote challenge (`remote.txt`), a flag with
+  fake/dummy/placeholder wording, or one found in the handed-out files
+  (including inside zip/tar), goes back to the solver instead of being
+  submitted.
+- **Rules and usage**: the collector summarizes the contest rules onto the board
+  and into every `AGENTS.md`. A ban on automation or AI, and weekly Codex usage
+  of 90% or more, are flagged `!!`.
 
 Folder contract (`~/Desktop/CTF/<site>/` by default, or `--dir`):
 
