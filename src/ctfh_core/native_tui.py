@@ -13,7 +13,7 @@ from textual.widgets import DataTable, Footer, Static
 
 from .native import Checker, window_name
 
-STYLES = {"manual": "bold yellow", "hold": "blue", "unknown": "bold red", "blocked": "red", "needs_fix": "magenta",
+STYLES = {"needs_user": "bold red", "manual": "bold yellow", "hold": "blue", "unknown": "bold red", "blocked": "red", "needs_fix": "magenta",
           "checking": "cyan", "verified": "cyan", "submitting": "cyan", "accepted": "green",
           "done": "green", "user_solved": "green", "site_solved": "green", "pending": "dim"}
 

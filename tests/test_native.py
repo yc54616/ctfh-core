@@ -15,6 +15,8 @@ from unittest.mock import patch
 from ctfh_core import native
 from ctfh_core.cli import main
 
+REAL_CHROME_ACCOUNT = native.chrome_account  # Base patches it
+
 SITE_SOLVED = native.site_solved  # the real one; Base replaces it so tests never drive Chrome
 
 
@@ -87,7 +89,7 @@ class Base(unittest.TestCase):
         for target, value in (("codex_home", self.home), ("rollout_homes", [self.home]),
                               ("_meminfo", 32 << 30), ("set_memory_slice", None),
                               ("site_solved", None), ("probe_endpoint", "unknown"),
-                              ("api_reachable", True)):
+                              ("api_reachable", True), ("chrome_account", "player@example.com")):
             patcher = patch(f"ctfh_core.native.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -446,6 +448,40 @@ class CheckerFlowTests(Base):
         self.assertEqual(status["state"], "verified")
         self.assertEqual(status["submissions"], [])
         self.assertGreater(status["retry_after"], time.time())
+        head, rows = checker.view()
+        self.assertEqual((rows[0]["label"], rows[0]["group"]), ("입력 필요", "!"))
+        self.assertIn("https://ctf.example/ 에 로그인하세요", rows[0]["reason"])
+        self.assertIn("!! 입력 필요 (1개, 할 일은 사유 칸): crypto", head)
+
+    def test_the_signup_account_is_chromes_default_profile(self):
+        out = json.dumps({"success": True, "data": {"browsers": [{"email": "other@example.com", "default": False},
+                                                                {"email": "me@example.com", "default": True}]}})
+        done = subprocess.CompletedProcess([], 0, out, "")
+        with patch.object(native, "_chrome_account", ("", 0.0)), \
+                patch("ctfh_core.native.subprocess.run", return_value=done) as run:
+            self.assertEqual(REAL_CHROME_ACCOUNT(), "me@example.com")
+            self.assertEqual(REAL_CHROME_ACCOUNT(), "me@example.com")
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("chrome-use browsers", native.account_rule(""))
+
+    def test_a_solver_waiting_for_the_user_is_shown_and_not_nudged(self):
+        chal = make_challenge(self.root, "captcha")
+        checker = self.checker(idle_seconds=0)
+        checker.tick()
+        rules = (chal / "AGENTS.md").read_text()
+        self.assertIn("이메일은 player@example.com, 아이디는 player를 쓴다", rules)
+        self.assertIn("work/ACCOUNTS.md", rules)
+        (chal / "needs_user.txt").write_text("Chrome 탭의 캡차를 풀어 주세요\n")
+        self.idle_rollout(chal)
+        checker.tick()
+        self.assertEqual(checker.tmux.sent, [])
+        head, rows = checker.view()
+        self.assertEqual((rows[0]["label"], rows[0]["reason"], rows[0]["activity"]),
+                         ("입력 필요", "Chrome 탭의 캡차를 풀어 주세요", "사용자 입력 대기"))
+        (chal / "needs_user.txt").unlink()
+        checker.tick()
+        self.assertTrue(checker.tmux.sent)
+        self.assertNotEqual(checker.view()[1][0]["label"], "입력 필요")
 
     def test_site_solved_and_no_submit_mode(self):
         make_challenge(self.root, "solved-elsewhere", solved=True)

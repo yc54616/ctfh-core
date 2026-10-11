@@ -269,6 +269,8 @@ Reproduction alone does not prove website acceptance: check the recorded submiss
 
 CTFH first uses the connected Chrome login, then tries Chrome's saved-password autofill if the session expires. The optional startup prompt saves a fallback to `~/.config/ctfh/credentials.toml` with mode `600`. This contains **plaintext credentials**, not an encrypted vault. `secret-fill` supplies values through `chrome-use fill --from-env` without printing them. Full-access Codex processes still have your user's file access. Complete 2FA and captchas yourself in Chrome.
 
+When a challenge service needs an account, the solver signs up by itself with the Google account of Chrome's default profile (`chrome-use browsers`, DEFAULT row): that email, its local part as the username, and a fresh random password kept in `work/ACCOUNTS.md`. It may use "Sign in with Google" and open the verification mail in Gmail. Steps only a person can do (captcha, SMS, payment) go to the challenge's `needs_user.txt`; the board shows the challenge as `입력 필요` and the checker stops nudging it until the file is gone.
+
 ## Troubleshooting
 
 | Symptom | What to check or do |
@@ -279,6 +281,7 @@ CTFH first uses the connected Chrome login, then tries Chrome's saved-password a
 | Unsupported model/reasoning | Choose an available `--model`; use `--rescan-model same` if the default rescan model is unavailable. |
 | Unsupported `--no-daemon` or another Codex option | Check `codex --help` and `codex exec --help`; the native launcher requires a compatible CLI build. |
 | `manual` / 직접 확인 | Nudge limit reached or two nudges made no note progress. Read `work/NOTES.md`, enter the window, or use `r` / `n`. |
+| `입력 필요` | The site login was lost before a submit (retried every 5 minutes), or a solver wrote `needs_user.txt`. Do the step in the reason column in Chrome; the solver deletes the file and continues. |
 | `hold` / 보류 | Resume with `r`. Contest end also puts unfinished challenges on hold. |
 | Waiting for attachments | Check `.ctfh/` download logs and links. Solving may start with incomplete files after three failures. |
 | Waiting for a closed server | Wait for the remote service to recover; read the notes. Local success does not establish a remote solve. |
