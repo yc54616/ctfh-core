@@ -20,12 +20,13 @@ STYLES = {"needs_user": "bold red", "manual": "bold yellow", "hold": "blue", "un
 
 # Table columns: key, header, and how a header click sorts by it (None = the board's own grouping).
 COLUMNS = [("group", ""), ("name", "문제"), ("category", "분류"), ("label", "상태"), ("tokens", "토큰"),
-           ("activity", "활동"), ("reason", "메모")]
+           ("elapsed", "시간"), ("activity", "활동"), ("reason", "메모")]
 SORT_KEYS = {"name": lambda row: row["name"], "category": lambda row: (row["category"], row["name"]),
              "label": lambda row: (row["label"], row["name"]), "tokens": lambda row: row["tokens_n"],
+             "elapsed": lambda row: row["elapsed_n"],
              "activity": lambda row: (row["activity"] == "", row["activity"]),
              "reason": lambda row: (row["reason"] == "", row["reason"])}
-DESCENDING_FIRST = {"tokens"}  # the biggest spenders first
+DESCENDING_FIRST = {"tokens", "elapsed"}  # the biggest spenders first
 
 
 class NotesScreen(ModalScreen):
@@ -149,6 +150,7 @@ class CheckerApp(App):
             table.add_row(Text(row["group"], style=style), Text(row["name"], style=style + (" dim" if finished else "")),
                           Text(row["category"], style="dim"), Text(row["label"], style=style),
                           Text(row["tokens"], justify="right", style="dim" if finished else ""),
+                          Text(row["elapsed"], justify="right", style="dim" if finished else ""),
                           Text(row["activity"], style="dim" if finished or "서버 대기" in row["activity"] else ""),
                           Text(row["reason"] if len(row["reason"]) <= 48 else row["reason"][:47] + "…",
                                style="dim" if finished else ""), key=row["name"])
@@ -195,7 +197,7 @@ class CheckerApp(App):
         text = Text()
         if row:
             text.append(f"{row['name']}", style="bold")
-            text.append(f"  {row['category'] or '-'} · {row['label']} · 토큰 {row['tokens']}\n", style="dim")
+            text.append(f"  {row['category'] or '-'} · {row['label']} · 토큰 {row['tokens']} · 시간 {row['elapsed']}\n", style="dim")
             if row["activity"]:
                 text.append(f"활동: {row['activity']}\n")
             if row["reason"]:

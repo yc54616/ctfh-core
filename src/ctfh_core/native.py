@@ -542,12 +542,25 @@ def user_input(chal: Path, status: dict) -> str:
         return str(status.get("needs_user", "")) if state == "verified" else ""
 
 
+def solve_seconds(status: dict) -> float | None:
+    """Wall time since the first solver window opened, up to the solve; None before it opened."""
+    start = status.get("first_launched_ts") or status.get("launched_ts")
+    if not start:
+        return None
+    if status.get("state") in FINISHED | {"accepted"}:
+        end = status.get("solved_ts")
+        return None if end is None else max(0.0, end - start)
+    return max(0.0, time.time() - start)
+
+
 def load_status(chal: Path) -> dict:
     return _read_json(chal / "status.json", {})
 
 
 def save_status(chal: Path, status: dict) -> None:
     status["updated_at"] = _now()
+    if status.get("state") in FINISHED | {"accepted"}:
+        status.setdefault("solved_ts", time.time())  # stops the board's solving time
     _write_atomic(chal / "status.json", json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
@@ -1232,6 +1245,7 @@ class Checker:
         if resume and count:
             status["nudges"] = status.get("nudges", 0) + 1
         status.update(launched_at=_now(), launched_ts=time.time())
+        status.setdefault("first_launched_ts", status["launched_ts"])
         save_status(chal, status)
 
     def tell(self, chal: Path, text: str) -> None:
@@ -1696,7 +1710,9 @@ class Checker:
                 state, reason = "needs_user", need
             if reason in QUIET_REASONS or (reason == FILES_WAIT and activity.startswith("첨부")):
                 reason = ""
+            spent_time = solve_seconds(status)
             rows.append({"name": chal.name, "state": state, "group": BOARD_GROUPS.get(state, "●"),
+                         "elapsed_n": spent_time or 0, "elapsed": "-" if spent_time is None else _ago(spent_time),
                          "label": STATE_LABELS.get(state, state),
                          "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
                          "tokens_n": tokens or 0, "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
@@ -1755,8 +1771,8 @@ class Checker:
 
     def board(self) -> str:
         head, rows = self.last_view = self.view()
-        lines = [f"   {'문제':<28} {'상태':<10} {'토큰':>8}  {'활동':<24} 메모"]
-        lines += [f"{row['group']}  {row['name'][:28]:<28} {row['label']:<10} {row['tokens']:>8}  "
+        lines = [f"   {'문제':<28} {'상태':<10} {'토큰':>8} {'시간':>9}  {'활동':<24} 메모"]
+        lines += [f"{row['group']}  {row['name'][:28]:<28} {row['label']:<10} {row['tokens']:>8} {row['elapsed']:>9}  "
                   f"{row['activity']:<24} {row['reason'][:60]}" for row in rows]
         return "\n".join(head + lines) + "\n"
 

@@ -454,6 +454,22 @@ class CheckerFlowTests(Base):
         self.assertIn("https://ctf.example/ 에 로그인하세요", rows[0]["reason"])
         self.assertIn("!! 입력 필요 (1개, 할 일은 사유 칸): crypto", head)
 
+    def test_the_board_shows_how_long_each_challenge_has_been_solved(self):
+        chal = make_challenge(self.root, "slow")
+        checker = self.checker()
+        checker.tick()
+        status = self.status("slow")
+        first = status["first_launched_ts"]
+        status.update(first_launched_ts=first - 5400, launched_ts=first)  # restarts keep the first start
+        native.save_status(chal, status)
+        row = checker.view()[1][0]
+        self.assertEqual(row["elapsed"], "1시간 30분")
+        self.assertIn("1시간 30분", checker.board())
+        status = self.status("slow")
+        status.update(state="accepted", solved_ts=status["first_launched_ts"] + 600)
+        native.save_status(chal, status)
+        self.assertEqual(checker.view()[1][0]["elapsed"], "10분")  # stopped at the solve
+
     def test_a_newly_listed_challenge_starts_a_rescan_without_codex(self):
         chal = make_challenge(self.root, "old")
         (chal / "challenge.json").write_text(json.dumps({"id": 7, "name": "old"}))
