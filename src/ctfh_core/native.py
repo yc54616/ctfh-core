@@ -1761,7 +1761,7 @@ class Checker:
                 f"   ◐ 검사 {count('checking')}   ↑ 제출 {count('verified', 'submitting')}"
                 f"   ⏳ 대기 {count('pending', 'hold')}   ! 확인 필요 {sum(row['group'] == '!' for row in rows)}"]
         if alert.exists():
-            head.append("!! 입력 필요: " + alert.read_text().strip())
+            head.append("!! 입력 필요 (문제 목록 수집에서 로그인 확인 실패, 풀이 창과 무관): " + alert.read_text().strip())
         limits = max((i for i in self.activity.values() if i.get("limits")), key=lambda i: i["mtime"], default=None)
         if limits:
             resets = limits["limits"]["resets"]

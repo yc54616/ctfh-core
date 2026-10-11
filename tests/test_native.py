@@ -516,6 +516,15 @@ class CheckerFlowTests(Base):
             self.assertIsNone(REAL_SITE_LIST(self.contest))
             self.assertEqual(calls, [])
 
+    def test_a_login_alert_from_the_collect_says_where_it_came_from(self):
+        make_challenge(self.root, "web-1")
+        checker = self.checker()
+        checker.contest.state_dir.mkdir(parents=True, exist_ok=True)
+        (checker.contest.state_dir / "needs_user.txt").write_text("Chrome에서 다시 로그인하세요.\n")
+        head = checker.view()[0]
+        self.assertIn("!! 입력 필요 (문제 목록 수집에서 로그인 확인 실패, 풀이 창과 무관): Chrome에서 다시 로그인하세요.", head)
+        self.assertNotEqual(checker.view()[1][0]["state"], "needs_user")  # no challenge row is marked
+
     def test_the_signup_account_is_chromes_default_profile(self):
         out = json.dumps({"success": True, "data": {"browsers": [{"email": "other@example.com", "default": False},
                                                                 {"email": "me@example.com", "default": True}]}})
