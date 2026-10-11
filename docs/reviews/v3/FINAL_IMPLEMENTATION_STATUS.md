@@ -1001,8 +1001,16 @@ The user explicitly selected a public repository.
   signatures and tracked credential/flag filenames; no matches were found.
   Local contest runs and `.venv` remain ignored. This is a bounded pattern
   check, not a guarantee that every possible secret format was detected.
-- IN_PROGRESS: create the authorized public `yc54616/ctfh-core` repository,
-  push intended changes, and verify the remote commit and README contents.
+- DONE: `rtk gh repo create yc54616/ctfh-core --public --source . --remote
+  origin --push` (with the project description) exited 0. Published
+  <https://github.com/yc54616/ctfh-core>, retaining the existing `master`
+  branch and history. `origin/master` is now the upstream.
+- DONE: `rtk gh repo view yc54616/ctfh-core --json
+  nameWithOwner,url,visibility,defaultBranchRef,description` confirmed PUBLIC.
+  GitHub API verification matched commit
+  `73bb160a951afd5a1742632717e458a2fef4c096` to local HEAD and matched the
+  remote blobs for both READMEs and `ctfh.toml` to local `git hash-object`
+  results. This publication record is committed as a follow-up.
 - NOT_RUN: real model turns, contest execution, or flag submissions for this
   documentation/publication task. Local tests are not live solve evidence.
 - No `.planning/STATE.md` or `.intent/INTENT.toml` exists in this checkout;
