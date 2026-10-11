@@ -26,6 +26,7 @@ import threading
 import time
 import tomllib
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -97,7 +98,7 @@ class Options:
 
 # ---------------------------------------------------------------- memory
 
-MEMORY_SHARE = 0.98  # all solver windows together may use this much of RAM
+MEMORY_SHARE = 0.90  # all solver windows together may use this much of RAM; the rest stays for Chrome and the desktop
 MEMORY_SLICE = "ctfh.slice"
 SWAP_PER_SOLVER = "512M"
 
@@ -114,7 +115,7 @@ def _meminfo(key: str) -> int:
 
 
 def memory_limit(setting: str | None) -> str | None:
-    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (98% of RAM)."""
+    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (90% of RAM)."""
     value = (setting or "auto").strip()
     if value.lower() in ("off", "none", "0"):
         return None
@@ -202,6 +203,8 @@ def probe_endpoint(endpoint: tuple[str, int], timeout: float = 3.0) -> str:
 # ---------------------------------------------------------------- site solved state
 
 SOLVED_POLL_SECONDS = 60
+LIST_POLL_SECONDS = 150  # look at the challenge list (no Codex) this often for newly released challenges
+LIST_RESCAN_GAP = 300  # a new challenge starts a rescan at most this soon after the last one
 USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
 SUBMIT_RETRIES = 3  # resend a flag whose submit outcome stayed unclear this many times
@@ -215,31 +218,109 @@ SOLVED_JS = ("fetch({api!r},{{credentials:'include'}}).then(r=>r.json()).then(d=
              "solved:(d.data||[]).filter(c=>c.solved_by_me).map(c=>[String(c.id),c.name])}}))")
 
 
-def site_solved(contest: "Contest") -> list[tuple[str, str]] | None:
-    """(id, name) of challenges the site shows solved for this account, read in the logged-in Chrome.
+def same_site(contest: "Contest", link: str) -> str:
+    """link made absolute when it is on the contest's site (or a subdomain of it), else ""."""
+    if not link or not contest.url:
+        return ""
+    url, base = urlparse(urljoin(contest.url, link)), (urlparse(contest.url).hostname or "").removeprefix("www.")
+    host = url.hostname or ""
+    return url.geturl() if url.scheme in ("http", "https") and (host == base or host.endswith("." + base)) else ""
 
-    Only CTFd has a stable API for this; other platforms rely on the periodic rescan.
+
+def list_api(contest: "Contest") -> str:
+    """Absolute URL of the site's challenge-list JSON API, or ""."""
+    site = contest.site()
+    api = str(site.get("list_api") or "")
+    if not api and "ctfd" in str(site.get("platform", "")).lower():
+        api = "/api/v1/challenges"
+    return same_site(contest, api)
+
+
+def site_eval(contest: "Contest", script: str, ok: str, page: str = "") -> dict | None:
+    """Run script in the checker's own tab on the contest site (reloading page first, if given).
+
+    Returns the script's JSON answer when answer[ok] is true.
     """
-    if "ctfd" not in str(contest.site().get("platform", "")).lower() or not contest.url:
-        return None
     session = f"ctfh-status-{contest.root.name[:40]}"
-    script = SOLVED_JS.format(api=urljoin(contest.url, "/api/v1/challenges"))
-    for attempt in range(2):
+    for attempt in range(1 if page else 2):
         try:
+            if page:
+                subprocess.run(["chrome-use", "--session", session, "open", page],
+                               capture_output=True, text=True, timeout=60)
             out = subprocess.run(["chrome-use", "--session", session, "eval", script],
                                  capture_output=True, text=True, timeout=60).stdout
             for line in reversed(out.splitlines()):
                 if line.startswith("{"):
                     data = json.loads(line)
-                    if data.get("success"):
-                        return [(str(i), str(n)) for i, n in data.get("solved", [])]
+                    if isinstance(data, dict) and data.get(ok):
+                        return data
                     break
-            if attempt == 0:  # our tab is not on the site yet (or was logged out): open it once
+            if attempt == 0 and not page:  # our tab is not on the site yet (or was logged out): open it once
                 subprocess.run(["chrome-use", "--session", session, "open", contest.url],
                                capture_output=True, text=True, timeout=60)
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return None
     return None
+
+
+def site_solved(contest: "Contest") -> list[tuple[str, str]] | None:
+    """(id, name) of challenges the site shows solved for this account, read in the logged-in Chrome.
+
+    Only CTFd has a stable API for this; other platforms rely on the periodic rescan.
+    """
+    api = list_api(contest)
+    if "ctfd" not in str(contest.site().get("platform", "")).lower() and not api.endswith("/api/v1/challenges"):
+        return None
+    data = site_eval(contest, SOLVED_JS.format(api=api), "success")
+    return None if data is None else [(str(i), str(n)) for i, n in data.get("solved", [])]
+
+
+# Every object with an id and a name inside a list, skipping lists of solvers, users and the like.
+LIST_JS = """fetch(__API__,{credentials:'include'}).then(r=>r.json()).then(d=>{
+const ids=new Set(),skip=/solve|user|team|member|award|score/i;
+const walk=(v,key,inList)=>{
+ if(Array.isArray(v)){if(!skip.test(key))v.forEach(x=>walk(x,key,true));return;}
+ if(!v||typeof v!=='object')return;
+ const id=v.id??v._id??v.slug;
+ if(inList&&id!=null&&(v.name||v.title))ids.add(String(id));
+ for(const[k,x]of Object.entries(v))if(x&&typeof x==='object')walk(x,k,false);};
+walk(d,'',false);
+return JSON.stringify({ok:ids.size>0,ids:[...ids].sort()});}).catch(()=>JSON.stringify({ok:false}))"""
+
+
+# Sites without a list API: one key per challenge card on the list page, once the cards have rendered.
+# The key is the card's id or link; otherwise its text without digits, so solve counts and points do not change it.
+CARDS_JS = """new Promise(res=>{let n=0;const t=setInterval(()=>{const c=document.querySelectorAll(__SEL__);
+if(c.length||++n>40){clearInterval(t);res([...c]);}},250);}).then(cards=>{
+const ids=cards.map(c=>{const a=c.matches('a[href]')?c:c.querySelector('a[href]');
+ const href=a?a.getAttribute('href'):'';
+ const id=c.dataset.id||c.id||(href&&!/^(#|javascript:)/.test(href)?href:'');
+ return id?String(id):(c.innerText||c.textContent||'').replace(/[0-9]+/g,'').replace(/\\s+/g,' ').trim().slice(0,60);
+}).filter(Boolean).sort();
+return JSON.stringify({ok:ids.length>0,ids});})"""
+
+
+def list_page(contest: "Contest") -> tuple[str, str]:
+    """(challenge list page, CSS selector of one challenge card) recorded at collect time, or ("", "")."""
+    site = contest.site()
+    page, selector = same_site(contest, str(site.get("list_page") or "")), str(site.get("list_selector") or "")
+    return (page, selector) if page and selector else ("", "")
+
+
+def site_list(contest: "Contest") -> list[str] | None:
+    """One key per challenge on the site's list, read without Codex: from the list API, else the list page's cards.
+
+    None when the site has neither or reading failed.
+    """
+    api = list_api(contest)
+    if api:
+        data = site_eval(contest, LIST_JS.replace("__API__", json.dumps(api)), "ok")
+    else:
+        page, selector = list_page(contest)
+        if not page:
+            return None
+        data = site_eval(contest, CARDS_JS.replace("__SEL__", json.dumps(selector)), "ok", page=page)
+    return None if data is None else [str(i) for i in data.get("ids", [])]
 
 
 def mark_site_solved(contest: "Contest", ids: set[str], names: set[str]) -> list[str]:
@@ -527,6 +608,9 @@ COLLECT_SCHEMA = _strict({
         "slug": {"type": "string"}, "name": {"type": "string"}, "solved": {"type": "boolean"}})},
     "rules": {"type": "string"},
     "ends_at": {"type": "string"},
+    "list_api": {"type": "string"},
+    "list_page": {"type": "string"},
+    "list_selector": {"type": "string"},
     "notes": {"type": "string"},
 })
 SUBMIT_SCHEMA = _strict({
@@ -800,6 +884,12 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
    공격 허용 범위, 무차별 대입·스캐너 금지, 제출 횟수 제한, flag 공유 금지. 자동화나 AI 사용을 금지하면 맨 앞에
    `[금지]`를 붙인다. 규칙을 찾지 못하면 빈 문자열.
 7. 대회 종료 시각을 찾으면 ends_at에 시간대를 넣은 ISO 8601로 적는다 (예: 2026-10-12T18:00:00+09:00). 못 찾으면 빈 문자열.
+8. 검사기가 Codex 없이 몇 분마다 문제 목록을 읽어 새로 공개된 문제를 알아챌 수 있게, 목록을 읽는 방법을 하나 적는다.
+   - 로그인한 브라우저에서 GET하면 문제 목록을 JSON으로 주는 이 사이트의 API가 있으면 그 경로를 list_api에 적는다
+     (예: CTFd는 /api/v1/challenges).
+   - 그런 API가 없으면 list_api는 빈 문자열로 두고, 문제 목록 페이지 주소를 list_page에, 그 페이지에서 문제 카드
+     하나하나에만 맞는 CSS 선택자를 list_selector에 적는다 (카테고리 제목·버튼은 빼고 지금 문제 수만큼 잡히게).
+   - 둘 다 못 찾으면 셋 다 빈 문자열.
 이미 있는 폴더: {existing}
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
     fetched = {chal: info["attachments"] for chal in contest.challenges() if (chal / "files" / FILES_DONE).exists()
@@ -816,6 +906,8 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
     site = {k: result.get(k, "") for k in ("platform", "flag_regex", "submit_hint", "notes")}
     site["rules"] = result.get("rules") or contest.site().get("rules", "")
     site["ends_at"] = result.get("ends_at") or contest.site().get("ends_at", "")  # a rescan that missed them keeps the old
+    for key in ("list_api", "list_page", "list_selector"):
+        site[key] = result.get(key) or contest.site().get(key, "")
     site.update(login=result.get("login"), collected_at=_now())
     _write_atomic(contest.state_dir / "site.json", json.dumps(site, ensure_ascii=False, indent=2) + "\n")
     contest.normalize()
@@ -1103,13 +1195,17 @@ class Checker:
         self.jobs: dict[str, cf.Future] = {}
         # Downloads and submits, all at once and off the check pool: each runs in a Chrome session of its own.
         self.browser_pool = cf.ThreadPoolExecutor(max_workers=256)
-        self.last_scan = time.time()
+        # A site.json from before list_api existed: rescan once now so new challenges can be watched for.
+        self.last_scan = 0.0 if contest.site() and "list_api" not in contest.site() else time.time()
         self.rollouts: dict[str, Path] = {}
         self.tokens: dict[str, int | None] = {}
         self.activity: dict[str, dict] = {}
         self.probes: dict[tuple[str, int], tuple[float, str]] = {}
         self.solved_probe = site_solved
         self.last_solved_poll = 0.0
+        self.list_probe = site_list
+        self.last_list_poll = 0.0
+        self.list_seen: tuple[float, int] | None = None  # when the list was last read, and how many it had
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
         self.outage: str | None = None  # every solver stalls at once: pause nudges and restarts meanwhile
         self.last_outage_check = self.last_probe = 0.0
@@ -1229,6 +1325,31 @@ class Checker:
         solved = self.solved_probe(self.contest)
         if solved:
             mark_site_solved(self.contest, {i for i, _ in solved}, {n for _, n in solved})
+
+    def job_list(self) -> None:
+        """Rescan as soon as the site lists a challenge we have not seen; costs no Codex tokens."""
+        ids = self.list_probe(self.contest)
+        if not ids:
+            return
+        self.list_seen = (time.time(), len(ids))
+        path = self.contest.state_dir / "listed.json"
+        known = _read_json(path, None)
+        if not isinstance(known, list):  # first look: what is listed now is the baseline
+            _write_atomic(path, json.dumps(sorted(ids)) + "\n")
+            return
+        ours = {str(info.get("id")) for chal in self.contest.challenges()
+                if isinstance(info := _read_json(chal / "challenge.json", {}), dict) and info.get("id") not in (None, "")}
+        new = set((Counter(ids) - Counter(map(str, known))).elements()) - ours
+        with self.lock:
+            if new:
+                if self.outage or ("__collect__" in self.jobs and not self.jobs["__collect__"].done()) \
+                        or time.time() - self.last_scan < LIST_RESCAN_GAP:
+                    return  # look again at the next poll
+                self.last_scan = time.time()
+                self.collect_line = f"새 문제 {len(new)}개 감지"
+                self.jobs["__collect__"] = self.pool.submit(self.job_collect)
+        if known != sorted(ids):
+            _write_atomic(path, json.dumps(sorted(ids)) + "\n")
 
     def job_collect(self) -> None:
         opts = self.opts
@@ -1622,6 +1743,11 @@ class Checker:
             head.append(f"메모리 부족: {used:.0%} 사용 중, 새 풀이 창은 여유가 생기면 연다")
         if "__collect__" in self.jobs and not self.jobs["__collect__"].done():
             head.append("문제 재수집 중: " + getattr(self, "collect_line", "시작"))
+        elif self.list_seen:
+            head.append(f"새 문제 감시: {LIST_POLL_SECONDS // 60}분 {LIST_POLL_SECONDS % 60}초마다 목록 확인"
+                        f" (문제 {self.list_seen[1]}개, {datetime.fromtimestamp(self.list_seen[0]):%H:%M:%S})")
+        elif self.contest.site().get("collected_at") and not list_api(self.contest) and not list_page(self.contest)[0]:
+            head.append(f"새 문제 감시: 목록을 읽을 방법을 못 찾아 {self.opts.rescan_seconds // 60}분마다 재수집으로만 확인")
         downloading = sum(k.startswith("__download_") and not f.done() for k, f in self.jobs.items())
         if downloading:
             head.append(f"첨부 받는 중: {downloading}개 동시에")
@@ -1818,6 +1944,9 @@ class Checker:
         if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
             self.last_solved_poll = time.time()
             self.jobs["__solved__"] = self.pool.submit(self.job_solved)
+        if not ended and "__list__" not in self.jobs and time.time() - self.last_list_poll > LIST_POLL_SECONDS:
+            self.last_list_poll = time.time()
+            self.jobs["__list__"] = self.pool.submit(self.job_list)
         if self.opts.rescan_seconds and not self.outage and not ended and "__collect__" not in self.jobs \
                 and time.time() - self.last_scan > self.opts.rescan_seconds:
             self.last_scan = time.time()

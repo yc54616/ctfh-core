@@ -15,7 +15,7 @@ from unittest.mock import patch
 from ctfh_core import native
 from ctfh_core.cli import main
 
-REAL_CHROME_ACCOUNT = native.chrome_account  # Base patches it
+REAL_CHROME_ACCOUNT, REAL_SITE_LIST = native.chrome_account, native.site_list  # Base patches them
 
 SITE_SOLVED = native.site_solved  # the real one; Base replaces it so tests never drive Chrome
 
@@ -89,7 +89,8 @@ class Base(unittest.TestCase):
         for target, value in (("codex_home", self.home), ("rollout_homes", [self.home]),
                               ("_meminfo", 32 << 30), ("set_memory_slice", None),
                               ("site_solved", None), ("probe_endpoint", "unknown"),
-                              ("api_reachable", True), ("chrome_account", "player@example.com")):
+                              ("api_reachable", True), ("chrome_account", "player@example.com"),
+                              ("site_list", None)):
             patcher = patch(f"ctfh_core.native.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -452,6 +453,51 @@ class CheckerFlowTests(Base):
         self.assertEqual((rows[0]["label"], rows[0]["group"]), ("입력 필요", "!"))
         self.assertIn("https://ctf.example/ 에 로그인하세요", rows[0]["reason"])
         self.assertIn("!! 입력 필요 (1개, 할 일은 사유 칸): crypto", head)
+
+    def test_a_newly_listed_challenge_starts_a_rescan_without_codex(self):
+        chal = make_challenge(self.root, "old")
+        (chal / "challenge.json").write_text(json.dumps({"id": 7, "name": "old"}))
+        checker = self.checker()
+        listed, collects = [["1", "2"]], []
+        checker.list_probe = lambda contest: listed[0]
+        checker.job_collect = lambda: collects.append(1)
+        checker.job_list()  # the first look is the baseline
+        self.assertEqual(collects, [])
+        self.assertIn("새 문제 감시", "\n".join(checker.view()[0]))
+        listed[0] = ["1", "2", "7"]  # already one of ours
+        checker.job_list()
+        self.assertEqual(collects, [])
+        listed[0] = ["1", "2", "3", "7"]
+        checker.last_scan = time.time()  # a rescan just ran: look again later
+        checker.job_list()
+        self.assertEqual((collects, json.loads((self.contest.state_dir / "listed.json").read_text())),
+                         ([], ["1", "2", "7"]))
+        checker.last_scan = 0
+        checker.job_list()
+        checker.jobs["__collect__"].result()
+        self.assertEqual((collects, json.loads((self.contest.state_dir / "listed.json").read_text())),
+                         ([1], ["1", "2", "3", "7"]))
+
+    def test_the_list_is_read_from_the_api_or_else_from_the_card_page(self):
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, '{"ok":true,"ids":["a","b"]}\n', "")
+        site = self.contest.state_dir / "site.json"
+        with patch("ctfh_core.native.subprocess.run", side_effect=run):
+            site.write_text(json.dumps({"platform": "CTFd"}))
+            self.assertEqual(REAL_SITE_LIST(self.contest), ["a", "b"])
+            self.assertEqual([argv[3] for argv in calls], ["eval"])
+            self.assertIn('"https://ctf.example/api/v1/challenges"', calls[0][4])
+            calls.clear()
+            site.write_text(json.dumps({"platform": "custom", "list_page": "/challenges", "list_selector": ".card"}))
+            self.assertEqual(REAL_SITE_LIST(self.contest), ["a", "b"])
+            self.assertEqual([argv[3:5] for argv in calls][0], ["open", "https://ctf.example/challenges"])
+            self.assertIn('querySelectorAll(".card")', calls[1][4])
+            calls.clear()
+            site.write_text(json.dumps({"list_api": "https://evil.example/api", "list_page": "https://evil.example/"}))
+            self.assertIsNone(REAL_SITE_LIST(self.contest))
+            self.assertEqual(calls, [])
 
     def test_the_signup_account_is_chromes_default_profile(self):
         out = json.dumps({"success": True, "data": {"browsers": [{"email": "other@example.com", "default": False},
@@ -1152,7 +1198,7 @@ class CheckerFlowTests(Base):
                 patch("ctfh_core.native.set_memory_slice") as slice_limit:
             checker = self.checker(memory_max="auto")
             checker.tick()
-        slice_limit.assert_called_once_with("32112M")  # 98% of 32G, shared by every solver window
+        slice_limit.assert_called_once_with("29491M")  # 90% of 32G, shared by every solver window
         argv = checker.tmux.open["fuzz"]
         self.assertEqual(argv[:4], ["systemd-run", "--user", "--scope", "--quiet"])
         self.assertIn("--slice=ctfh.slice", argv)

@@ -200,14 +200,16 @@ ctfh2 checker --help                         # Checker options.
 | `--rescan-thinking LEVEL` | `low` | Rescan/download reasoning; `same` follows `--thinking`. |
 | `--submit-thinking LEVEL` | `low` | Submission reasoning, on the main model. |
 | `--review-thinking LEVEL` | `medium` | Write-up review reasoning, on the main model. |
-| `--rescan-minutes N` | `60` | Full discovery interval; `0` disables periodic full rescans. Other checker checks continue. |
+| `--rescan-minutes N` | `60` | Full discovery interval; `0` disables periodic full rescans. Other checker checks continue. Newly released challenges are also caught within minutes: see below the table. |
 | `--idle-seconds N` | `180` | Wait before nudging an idle solver. |
 | `--nudge-limit N` | `3` | Automatic nudge/restart limit before handing control to you. |
 | `--solve-timeout N` | `300` | Seconds allowed for a `solve.py` reproduction. |
-| `--memory-max SIZE` | `auto` | Shared solver memory cap via systemd; `auto` is 98% of RAM. Examples: `8G`, `off`. Not a per-window cap. |
+| `--memory-max SIZE` | `auto` | Shared solver memory cap via systemd; `auto` is 90% of RAM, leaving the rest for Chrome and the desktop. Examples: `8G`, `off`. Not a per-window cap. |
 | `--plain` | Not set | Text board instead of the interactive dashboard. |
 | `--no-attach` | Not set | Create the tmux session without attaching. |
 | `--secondary` | Not set | Use an existing `codex-secondary` executable. CTFH does not install this account wrapper. |
+
+New challenges released during the contest are watched for without Codex. Every 2.5 minutes the checker reads the challenge list in its own Chrome tab. It uses the site's list API (CTFd: `/api/v1/challenges`), or, on sites without one, the list page and a card CSS selector; the collect run finds either one for each site and records it in `.ctfh/site.json`. When the list shows a challenge it has not seen, a rescan starts right away, at most one every 5 minutes. A site where neither could be found falls back to the periodic rescan, and the board says so.
 
 The default account uses `codex` and `~/.codex`. `--secondary` is a CTFH option, not a direct Codex argument. Claude is supported by the isolated smoke/benchmark adapter, not by this native contest launcher.
 
