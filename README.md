@@ -1,500 +1,323 @@
 # ctfh-core
 
-Performance-first thin supervisor for authorized CTF competition agents.
+**English** · [한국어](README.ko.md)
 
-## Design rule
+A terminal CTF runner that opens one interactive Codex session per challenge, with a separate checker for flag reproduction, website submission, and write-up review.
 
-CTFH does **not** replace Codex, Claude Code, or another native agent with a
-second general-purpose agent framework.
-
-It supervises native agents through a small set of enforceable boundaries:
+Give `ctfh2` a contest URL. It discovers challenges through your connected Chrome, downloads attachments, opens solver windows in tmux, and tracks their progress. You can enter any solver window and work with Codex directly.
 
 ```text
-TaskSource
-   |
-TargetProvider
-   |
-KernelLoop ---- OutcomeAuthority
-   |
-WorkerEnvironment
-   |-- native shell/files
-   |-- optional interactive PTY/session service
-   |-- optional managed GhostChrome browser service
-   |
-AgentAdapter
-   |-- Codex CLI
-   `-- Claude Code CLI
+Contest URL → Chrome discovery → challenge folders → Codex windows
+                                                         ↓
+                                    checker → reproduce → submit → review
 ```
 
-The kernel owns durable state, deadlines, recovery, target epochs,
-cancellation, RunLock configuration, artifact publication, and authoritative
-outcome commits. Native agents keep their own planning, conversation loop,
-ordinary tools, context compaction, and native skill activation.
+This guide covers the default **native runner** (`ctfh2 <URL>`). The older `start` / `live` controller and the isolated benchmark runtime are separate workflows; see [Advanced workflows](#advanced-workflows).
 
-## V3 implemented capabilities
+## Contents
 
-### Agent adapters
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Start your first contest](#start-your-first-contest)
+- [Use the dashboard](#use-the-dashboard)
+- [Detach, stop, and resume](#detach-stop-and-resume)
+- [Commands and configuration](#commands-and-configuration)
+- [Files and verification](#files-and-verification)
+- [Troubleshooting](#troubleshooting)
+- [Advanced workflows](#advanced-workflows)
+- [Development](#development)
 
-- Codex CLI
-- Claude Code CLI
-- common `AgentAdapter` contract extracted only after both real adapters were
-  exercised
+## Requirements
 
-### WorkerEnvironment capabilities
+| Component | What you need |
+|---|---|
+| OS | Linux is the current development environment. Memory controls use `/proc` and systemd user scopes. Other platforms have not been validated. |
+| Python | **3.12 or newer**, with `venv` and pip. |
+| tmux | Installed and available on `PATH`. |
+| Codex CLI | Installed, authenticated, and able to use your chosen model. The native runner requires `--no-daemon`, `--dangerously-bypass-approvals-and-sandbox`, and `codex exec --json --output-schema`. |
+| Chrome + chrome-use | An open Chrome profile connected to [chrome-use](https://github.com/leeguooooo/chrome-use), with access to the contest site. |
+| Model access | Solvers and collection, download, submission, and review jobs consume your Codex account's usage. |
 
-- Bubblewrap attempt isolation and kill-domain ownership
-- interactive PTY sessions through `ctfh-session`
-  - open / send / read / signal / close / list
-  - bounded in-memory and on-disk transcripts
-  - cancellation-safe connected RPC shutdown
-- lazy managed GhostChrome browser through `ctfh-browser`
-  - attempt-local disposable browser profile
-  - explicit WebSocket attachment to the attempt-owned Chrome
-  - navigation domain allowlist support
-  - browser lifecycle and controller processes tracked under WorkerOwnerTag
+The native runner launches Codex with **host access and approval/sandbox bypass enabled**, including its background Codex jobs. It can execute challenge code and access files available to your user. The `dangerously_bypass_approvals_and_sandbox = false` value in `ctfh.toml` is **not a sandbox switch for this runner**. Use an environment suitable for running CTF code, only solve authorized challenges, and follow the contest's automation/AI rules.
 
-Neither session nor browser calls go through KernelLoop or SQLite.
+RTK is optional for running CTFH. The commands below work without it.
 
-### Skills and native configuration
+## Installation
 
-Codex skills are materialized into an attempt-local snapshot before launch.
+### 1. Install the project
 
-- content-addressed digest in RunLock
-- symlinks dereferenced into the snapshot
-- materialized tree digest rechecked
-- read-only inside the sandbox
+On Ubuntu/Debian with Python 3.12+ available:
 
-The native Codex configuration is also materialized and pinned so host
-MCP/plugin/memory settings do not silently alter a benchmark run.
+```bash
+sudo apt update
+sudo apt install git python3 python3-venv python3-pip tmux
 
-### Frozen knowledge
+git clone https://github.com/yc54616/ctfh-core.git
+cd ctfh-core
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
 
-`memory=off` is the default.
+Use an editable installation (`-e .`): the launcher reads `ctfh.toml` and bundled fixtures from this checkout. Installation provides `ctfh2` and `ctfh-learn`. The `./ctfh2` shortcut also works from the repository root once dependencies are installed. Activate the virtual environment again in new terminals.
 
-A run may optionally use a frozen knowledge snapshot:
+### 2. Prepare Codex and Chrome
 
-- source tree is content-addressed
-- copied into attempt-local storage
-- digest rechecked
-- mounted read-only at `/ctfh-knowledge`
-- exposed as `$CTFH_KNOWLEDGE_DIR`
-- pinned in RunLock
+1. Install and authenticate [Codex CLI](https://github.com/openai/codex). Confirm `codex login status` succeeds and that its help lists the required flags above.
+2. Follow the [chrome-use installation guide](https://chrome-use.leeguoo.com/en/install.html): install the CLI, add its Chrome extension, and register the local bridge with `chrome-use extension install`.
+3. Keep the connected Chrome profile open and log in to the CTF site. Make chrome-use available to Codex; its bundled usage guide is available with `chrome-use skills get core`.
 
-There are no live shared-memory writes on the solve path.
+Check the prerequisites without starting a contest:
 
-### Trace and artifacts
+```bash
+python --version
+tmux -V
+codex login status
+chrome-use status
+ctfh2 --help
+ctfh2 go --help
+```
 
-Bulk agent/session/browser evidence stays out of KernelLoop/SQLite.
+Pip installs Python dependencies. Codex, tmux, Chrome, chrome-use, and challenge-specific tools such as debuggers are installed separately.
 
-At attempt completion:
+## Start your first contest
 
-1. environment services are quiesced
-2. service evidence is copied to attempt output
-3. `trace-manifest.json` records stream hashes, sizes, coverage boundaries,
-   and truncation accounting
-4. evidence is made read-only
-5. supervised attempts are streamed into content-addressed storage without
-   buffering the whole attempt in RAM
+Replace `https://ctf.example.com/challenges` with the real URL. For a first run, limit concurrency to two solver windows and disable automatic submission:
 
-### Offline WikiSkill-style learning
+```bash
+ctfh2 https://ctf.example.com/challenges \
+  --dir "$HOME/CTF/my-contest" \
+  --max-parallel 2 \
+  --no-submit
+```
 
-`ctfh_learning` is a separate package; `ctfh_core` does not import it.
+If your account cannot use the default model, add `--model YOUR_MODEL --rescan-model same`. To choose a supported reasoning level, add an option such as `--thinking high`.
 
-Pipeline:
+On startup:
+
+1. CTFH prints the contest directory. On a terminal it optionally asks for site credentials as a re-login fallback. **Press Enter at the username prompt to skip saving credentials** and use the existing Chrome login.
+2. A Codex collector reads the site, rules, and challenge list. Initial collection can take a few minutes. If login needs your help, finish it in Chrome and press Enter when prompted.
+3. CTFH creates a tmux session. For the example directory its name is `ctfh-my-contest`. The `checker` window shows progress; other windows run interactive Codex solvers.
+4. Attachments download in the background. Each challenge becomes eligible to start when its files are ready. After three failed download attempts, it may start with incomplete files.
+5. The checker reproduces candidate flags with `solve.py` and reviews `writeup.md`. With `--no-submit`, it does not submit flags to the website.
+
+For normal operation with automatic submission, omit `--no-submit`:
+
+```bash
+ctfh2 https://ctf.example.com/challenges --max-parallel 2
+```
+
+**Defaults:** automatic submission is on; `--max-parallel 0` means all eligible challenges can run concurrently. Reattaching to an existing contest does not change its running checker's options; use the restart procedure below.
+
+## Use the dashboard
+
+The `checker` window shows each challenge's state, token usage, activity, and reason for waiting. Dashboard labels and generated agent instructions are currently primarily Korean; this README does not change the UI language.
+
+Select a row with the arrow keys or mouse:
+
+| Key | Action |
+|---|---|
+| `Enter` | Enter the selected solver's Codex window. |
+| `n` | Nudge the solver now. Manual nudges do not count against the automatic limit. |
+| `r` | Reopen a closed window or resume a `manual` / `hold` challenge. |
+| `o` | Read the challenge's `work/NOTES.md`. |
+| `p` | Hold the challenge and close its solver window. Resume with `r`. |
+| `d` | Mark a challenge solved by you/a teammate and close its solver window. |
+| `s` | Rescan the site now. |
+| `t` | Sort by the next column; clicking a header also changes sorting. |
+| `+` / `-` | Adjust the solver-window limit. This override survives checker restarts unless the configured `--max-parallel` value changes. |
+| `q` / `Ctrl-c` | Quit the checker. **Solver windows continue running.** |
+
+These are dashboard shortcuts. Inside a solver window, interact with Codex normally.
+
+| tmux shortcut (default prefix) | Action |
+|---|---|
+| `Ctrl-b`, then `w` | List windows; choose `checker` to return to the dashboard. |
+| `Ctrl-b`, then `n` / `p` | Next / previous window. |
+| `Ctrl-b`, then `d` | Detach while the contest keeps running. |
+
+## Detach, stop, and resume
+
+**Leave it running:** detach with `Ctrl-b`, then `d`. In another terminal with the virtual environment active:
+
+```bash
+ctfh2 status --dir "$HOME/CTF/my-contest"
+ctfh2 --dir "$HOME/CTF/my-contest"
+```
+
+With no arguments, `ctfh2` selects the contest containing your current directory, or the last started contest recorded in `~/.cache/ctfh/last_contest`. On a first run with no saved contest, provide a URL. Use `--dir` to select a specific contest reliably.
+
+**Pause one challenge:** select it and press `p`. Its `hold` state survives restart; press `r` to resume.
+
+**Change checker options:** quit the checker with `q`, wait for its window to close, then launch again with the same `--dir` and desired options. Existing solver windows retain their model/settings; new windows use the new options.
+
+**End the contest's tmux session:** from another terminal, confirm its name and terminate that session:
+
+```bash
+tmux list-sessions
+# This name matches the --dir "$HOME/CTF/my-contest" example.
+tmux kill-session -t ctfh-my-contest
+```
+
+This closes its checker and solver windows. Saved challenge files remain. Separately detached processes started by challenge tools may need their own cleanup.
+
+Restart from saved files, for example to enable automatic submission after the initial trial:
+
+```bash
+ctfh2 --dir "$HOME/CTF/my-contest" --max-parallel 2
+```
+
+Launching an existing tmux session only reattaches. Different flags do not replace a running checker's options. Supply your desired options again on restart or save them in `ctfh.toml`.
+
+## Commands and configuration
+
+### Everyday commands
+
+```bash
+ctfh2 https://ctf.example.com/challenges     # Start a contest.
+ctfh2                                       # Reattach/resume the current or last contest.
+ctfh2 status                                # Show saved progress.
+ctfh2 done web-1 pwn-2                      # Mark these challenges solved by you/a teammate.
+ctfh2 go --help                              # All native-runner options.
+ctfh2 checker --help                         # Checker options.
+```
+
+`web-1` and `pwn-2` are examples: use the actual folder names under `challenges/`. `status`, `done`, and `approve` accept `--dir`.
+
+`ctfh2 approve web-1` is an override: it trusts the current `flag.txt`, bypasses reproduction, and queues it for the running checker to submit. It can authorize a previously tried flag again. It **does not submit synchronously**, and a checker started with `--no-submit` still will not submit. Use it only after independently checking the flag.
+
+### Main options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--dir PATH` | `~/Desktop/CTF/<site-slug>/` for a new URL | Contest workspace. |
+| `--max-parallel N` | `0` | Solver-window cap; `0` means no fixed cap. Background jobs are separate. |
+| `--no-submit` | Not set | Disable website submission; keep verification and write-up review. |
+| `--model MODEL` | `gpt-6-sol` | Solver and initial-collection model. |
+| `--thinking LEVEL` | Account default | Reasoning effort; alias: `--reasoning-effort`. Model support varies. |
+| `--rescan-model MODEL` | `gpt-6-luna` | Periodic rescan and attachment-download model; `same` uses `--model`. |
+| `--rescan-thinking LEVEL` | `low` | Rescan/download reasoning; `same` follows `--thinking`. |
+| `--submit-thinking LEVEL` | `low` | Submission reasoning, on the main model. |
+| `--review-thinking LEVEL` | `medium` | Write-up review reasoning, on the main model. |
+| `--rescan-minutes N` | `60` | Full discovery interval; `0` disables periodic full rescans. Other checker checks continue. |
+| `--idle-seconds N` | `180` | Wait before nudging an idle solver. |
+| `--nudge-limit N` | `3` | Automatic nudge/restart limit before handing control to you. |
+| `--solve-timeout N` | `300` | Seconds allowed for a `solve.py` reproduction. |
+| `--memory-max SIZE` | `auto` | Shared solver memory cap via systemd; `auto` is 98% of RAM. Examples: `8G`, `off`. Not a per-window cap. |
+| `--plain` | Not set | Text board instead of the interactive dashboard. |
+| `--no-attach` | Not set | Create the tmux session without attaching. |
+| `--secondary` | Not set | Use an existing `codex-secondary` executable. CTFH does not install this account wrapper. |
+
+The default account uses `codex` and `~/.codex`. `--secondary` is a CTFH option, not a direct Codex argument. Claude is supported by the isolated smoke/benchmark adapter, not by this native contest launcher.
+
+### Save defaults
+
+Edit **this checkout's** [ctfh.toml](ctfh.toml). Command-line values take precedence. Put these keys under `[native]`, **before** `[native.secondary]`:
+
+```toml
+[native]
+binary = "codex"
+model = "gpt-6-sol"
+thinking = "high"
+max_parallel = 2
+submit = false
+rescan_model = "same"
+rescan_thinking = "low"
+submit_thinking = "low"
+review_thinking = "medium"
+rescan_minutes = 60
+idle_seconds = 180
+nudge_limit = 3
+solve_timeout = 300
+memory_max = "8G"
+plain = false
+```
+
+This is a conservative example, not the shipped defaults. Set `submit = true` to enable automatic submission if the file disabled it; there is no `--submit` flag to override `submit = false`. Restart the checker to apply changes. A contest directory's `contest.toml` describes that contest; it is not the launcher defaults file.
+
+## Files and verification
 
 ```text
-sealed trace
-  -> verify evidence
-  -> append-only learning wiki
-  -> candidate knowledge / one atomic skill
-  -> held-out baseline-vs-candidate evaluation
-  -> promote or reject
-  -> versioned read-only snapshot
+my-contest/
+├── contest.toml                 # Site URL and contest overrides
+├── AGENTS.md                    # Contest instructions
+├── .ctfh/                       # Collection logs, site metadata, board, checker state
+└── challenges/
+    └── web-1/
+        ├── challenge.md         # Description
+        ├── challenge.json       # Site metadata
+        ├── AGENTS.md            # Solver instructions
+        ├── files/               # Attachments
+        ├── work/NOTES.md         # Progress and recovery notes
+        ├── solve.py             # Reproducible solver
+        ├── flag.txt             # Candidate/accepted flag
+        ├── writeup.md           # Explanation of the solve
+        ├── status.json          # Checker-owned state
+        └── .ctfh-check/          # Verification and review evidence
 ```
 
-Promotion safeguards include:
+Files appear as their stages run. Remote challenges may also have `remote.txt`. Keep contest directories and credentials out of your public source repository.
 
-- source-trace tasks cannot overlap promotion tasks
-- promotion tasks cannot overlap the final untouched set
-- promotion/final splits are immutable once committed
-- invalid first evaluations cannot poison the split registry
-- evaluation records are bound to RunLock hashes
-- candidate evaluations are bound to the exact candidate content digest
-- candidate provenance fields are rehashed on load
-- each candidate has one terminal decision; reject cannot later flip to promote
-- rejected hypotheses remain in the learning-side wiki but are not
-  automatically agent-visible
+The usual path is `solving → checking → verified → submitting → accepted → done`. `accepted` means the website accepted the flag; `done` also requires write-up review. With `--no-submit`, a verified solution can reach `done` after review **without website acceptance**.
 
-## Quick smoke tests
+The checker reruns `solve.py` and compares its output with `flag.txt`. For remote challenges it rejects known placeholders and flags copied from attachments; a newly reproduced remote flag may replace an older one. A wrong flag hash is not automatically resubmitted. Unclear submission outcomes can retry up to three times, two minutes apart, then remain `unknown` for you to inspect.
 
-From the repository root:
+Reproduction alone does not prove website acceptance: check the recorded submission result. Challenges you mark with `done`, or that the site already reports solved, do not require invented local flag files.
+
+### Login persistence
+
+CTFH first uses the connected Chrome login, then tries Chrome's saved-password autofill if the session expires. The optional startup prompt saves a fallback to `~/.config/ctfh/credentials.toml` with mode `600`. This contains **plaintext credentials**, not an encrypted vault. `secret-fill` supplies values through `chrome-use fill --from-env` without printing them. Full-access Codex processes still have your user's file access. Complete 2FA and captchas yourself in Chrome.
+
+## Troubleshooting
+
+| Symptom | What to check or do |
+|---|---|
+| Command not found / missing `yaml` or `textual` | Activate `.venv` and run `python -m pip install -e .` from the checkout. |
+| No contest found | Supply a URL on the first run or select saved work with `--dir`. |
+| Chrome disconnected / login needed | Check `chrome-use status`, extension, open profile, and site login. Complete the launch prompt or rescan with `s`. |
+| Unsupported model/reasoning | Choose an available `--model`; use `--rescan-model same` if the default rescan model is unavailable. |
+| Unsupported `--no-daemon` or another Codex option | Check `codex --help` and `codex exec --help`; the native launcher requires a compatible CLI build. |
+| `manual` / 직접 확인 | Nudge limit reached or two nudges made no note progress. Read `work/NOTES.md`, enter the window, or use `r` / `n`. |
+| `hold` / 보류 | Resume with `r`. Contest end also puts unfinished challenges on hold. |
+| Waiting for attachments | Check `.ctfh/` download logs and links. Solving may start with incomplete files after three failures. |
+| Waiting for a closed server | Wait for the remote service to recover; read the notes. Local success does not establish a remote solve. |
+| `unknown` submission result | Inspect the scoreboard and `.ctfh-check/` evidence before using `approve`. |
+| Account quota/outage | The checker pauses nudges, restarts, and rescans and probes periodically. Restore account access; reasoning settings do not bypass provider policy. |
+| systemd user-scope error | Use a working Linux user systemd session or `--memory-max off` to disable that memory cap. |
+| New settings ignored on resume | Restart the checker. Also check `[native]` vs `[native.secondary]` in TOML. |
+
+## Advanced workflows
+
+| Workflow | Entry point | Guide |
+|---|---|---|
+| Native contest runner (default) | `ctfh2 <URL>` | This README; [design notes](docs/research/NATIVE_CODEX_SOLVER_CHECKER_2026-10-09.md) |
+| Earlier live controller | `ctfh2 start <URL>` / `ctfh2 live run` | [Live protocol and operating guide](docs/LIVE_AGENT.md) |
+| Isolated direct/supervised benchmark | `ctfh2 smoke` | [Architecture](docs/ARCHITECTURE.md), [V3 design](docs/ARCHITECTURE_V3_PROPOSAL.md), [benchmark rules](benchmarks/README.md) |
+| Offline evidence/knowledge tools | `ctfh-learn --help` | `verify-trace`, `wiki-add`, `wiki-show`, `propose`, `decide` |
+
+Resume the `start` workflow with `ctfh2 start`; its state and shortcuts differ from the native runner. The [sample dashboard image](docs/images/ctfh-terminal-dashboard.svg) depicts that older controller, not the default native dashboard.
+
+The benchmark runtime retains Codex/Claude adapters, Bubblewrap isolation, optional PTY/GhostChrome services, pinned RunLock configurations, sealed traces, and read-only skills/knowledge. Offline learning is a separate `ctfh_learning` package. These benchmark boundaries do not sandbox the native runner.
+
+A smoke run needs additional runtime tools and a working model account; it starts real model turns:
 
 ```bash
-PYTHONPATH=src python3 -m ctfh_core.cli smoke \
-  --agent codex \
-  --mode pair \
-  --model gpt-6-sol \
-  --effort high
+ctfh2 smoke --agent codex --mode pair --model gpt-6-sol --effort high
+ctfh2 smoke --help
+ctfh-learn --help
 ```
 
-Enable the interactive session capability:
+Historical validation and limitations are in [project decisions](docs/DECISIONS.md) and [dated implementation records](docs/reviews/v3/FINAL_IMPLEMENTATION_STATUS.md).
+
+## Development
+
+From the activated virtual environment:
 
 ```bash
-PYTHONPATH=src python3 -m ctfh_core.cli smoke \
-  --agent codex \
-  --mode pair \
-  --interactive-session
+python -m pip install pytest
+python -m pytest -q -o pythonpath=src
+git diff --check
 ```
 
-Enable the managed browser capability:
-
-```bash
-PYTHONPATH=src python3 -m ctfh_core.cli smoke \
-  --agent codex \
-  --mode pair \
-  --browser \
-  --browser-domain example.ctf
-```
-
-Use a frozen knowledge snapshot:
-
-```bash
-PYTHONPATH=src python3 -m ctfh_core.cli smoke \
-  --agent codex \
-  --mode pair \
-  --knowledge-snapshot ./knowledge-snapshot
-```
-
-Claude can be selected with `--agent claude`; its default model is
-`claude-opus-5-5`. A valid local Claude login is required.
-
-## Native contest runner (default)
-
-`ctfh2 <URL>` now runs plain interactive Codex sessions instead of the live
-wrapper. One extra checker verifies flags and writeups. Design and sources:
-[docs/research/NATIVE_CODEX_SOLVER_CHECKER_2026-10-09.md](docs/research/NATIVE_CODEX_SOLVER_CHECKER_2026-10-09.md).
-
-```bash
-rtk proxy ./ctfh2 https://ctf.example.com/challenges            # collect, open tmux, attach
-rtk proxy ./ctfh2 https://ctf.example.com/challenges --secondary --model gpt-6-sol --thinking xhigh
-rtk proxy ./ctfh2                     # reattach to the current or last contest
-rtk proxy ./ctfh2 status              # board: state, tokens, reason per challenge
-rtk proxy ./ctfh2 done web-1 pwn-2    # you solved these yourself: their windows close
-rtk proxy ./ctfh2 approve web-1       # trust the current flag.txt and submit it once
-```
-
-1. A `codex exec` collector logs in through connected Chrome (`chrome-use`,
-   session `ctfh-collect`, closed when the run ends) and writes one folder per challenge.
-2. A tmux session `ctfh-<contest>` opens a `checker` window plus one
-   `codex --dangerously-bypass-approvals-and-sandbox` window per challenge
-   (`--max-parallel`, default 0 = every challenge at once). Attach with `tmux attach -t ctfh-<contest>` and
-   type into any window as usual. Each window's chrome-use session is pinned to
-   `ctfh-<slug>` (`AGENT_BROWSER_SESSION`), and its tabs close when the window does.
-3. The checker re-runs `solve.py` and requires the same flag. It submits each
-   flag hash through Chrome, every ready flag at once, each from its own
-   chrome-use session (`ctfh-submit-<slug>`) that the checker closes when the run
-   ends; checks keep running meanwhile. A wrong flag is never resent; an unclear
-   outcome (error, timeout, interrupted run) is resent up to 3 times, 2 minutes
-   apart, before it is left `unknown` for you. It reviews `writeup.md`
-   blind-first, sends `[검사기] …` feedback into the solver window, and closes it
-   when done.
-4. The checker window is a keyboard dashboard (`--plain` or `plain = true` in
-   `ctfh.toml` keeps the old text board):
-
-   | Key | Action |
-   |---|---|
-   | Enter | jump to the selected challenge's window (back: tmux window list, default `Ctrl-b w`) |
-   | `n` | nudge now; does not count against `--nudge-limit` |
-   | `r` | reopen a closed window; also resumes `manual` and `hold` challenges |
-   | `o` | read `work/NOTES.md` |
-   | `p` | hold: close the window, no automatic restart until `r` (a teammate is on it) |
-   | `d` | mark solved (a teammate solved it) and close the window |
-   | `s` | rescan the site now (default every 60 minutes on `gpt-6-luna`, low effort) |
-   | `t` | sort by the next column; clicking a header sorts by it, again reverses, a third time returns to the grouping |
-   | `+` / `-` | change the window limit live (kept across checker restarts until `--max-parallel` changes); limited slots open the most-solved challenges first |
-   | `q` | quit the checker; solver windows keep running |
-
-Checker safeguards:
-
-- **manual**: after `--nudge-limit` (default 3) nudges or restarts, or 2 nudges
-  with no change to `work/NOTES.md`, the checker stops nudging and leaves the
-  challenge to you.
-- **Pause**: when Codex is unreachable, out of usage (limit reached with no
-  credits), or most windows show a Codex error, nudges, restarts, and rescans
-  stop. One window retries a turn every 10 minutes. Once Codex works again,
-  every stalled window gets one nudge.
-- **Contest end**: the collector stores the end time in `.ctfh/site.json`
-  (`ends_at` in `contest.toml` overrides it). The board counts down the last 24
-  hours. At the end, unsolved windows go to `hold`. Accepted ones finish their
-  writeups.
-- **Fake flags**: for a remote challenge (`remote.txt`), a flag with
-  fake/dummy/placeholder wording, or one found in the handed-out files
-  (including inside zip/tar), goes back to the solver instead of being
-  submitted.
-- **Changing remote flags**: when a remote challenge's rerun prints a different
-  flag in the contest format, the newer one replaces `flag.txt` and is submitted
-  (instances that mint a flag per start). If the rerun fails while the remote is
-  closed, the challenge waits for the server instead of counting as a wrong solve.
-- **Attachments download in the background**: collecting only lists
-  challenges and their attachments, so web/remote challenges start right away.
-  Cheap Codex runs (rescan model) fetch the attachments of every challenge at
-  once, each in its own chrome-use session (`ctfh-download-<slug>`, closed when
-  the run ends); each challenge opens as soon as its own files are
-  complete (`files/.ctfh-done`). After 3 failed tries it starts with whatever
-  arrived.
-- **Checker restarts itself** after a crash (5 s later); `q`/Ctrl-C ends it, and
-  5 quick crashes in a row stop the retries and leave the error on screen.
-- **Cheaper side jobs**: submitting runs at low effort and writeup review at
-  medium, on the solver model (`--submit-thinking`, `--review-thinking`;
-  `same` follows `--thinking`).
-- **Rules and usage**: the collector summarizes the contest rules onto the board
-  and into every `AGENTS.md`. A ban on automation or AI, and weekly Codex usage
-  of 90% or more, are flagged `!!`.
-
-Folder contract (`~/Desktop/CTF/<site>/` by default, or `--dir`):
-
-```text
-contest.toml  AGENTS.md  .ctfh/{site.json,board.txt,collect.log}
-challenges/<slug>/
-  challenge.md challenge.json files/ work/NOTES.md   # collector / solver
-  solve.py flag.txt writeup.md                        # solver output
-  status.json .ctfh-check/                            # checker only
-```
-
-Login uses the Chrome profile you are already signed into. When the site logs
-it out, a collect or submit run opens the login page and clicks the login
-button without typing: if Chrome saved the site's password, its autofill sends
-it on that click (the page and the model see empty fields). Optionally,
-`~/.config/ctfh/credentials.toml` (mode 600, `["host"] username/password`) lets
-the run fill the login form through `ctfh2 secret-fill` when autofill fails.
-`ctfh2` asks for that login at start on a terminal while the site has no entry
-(hidden password input, Enter skips) and appends it to the file with mode 600. That command
-passes the value via `chrome-use fill --from-env`, so the model never sees it.
-2FA and captchas are handed back to you. Solver sessions run with full host
-access, so they can read any file you can.
-
-## Live contest agent (previous flow: `ctfh2 start`)
-
-### Terminal shortcut
-
-[Terminal dashboard preview (sample data)](docs/images/ctfh-terminal-dashboard.svg)
-
-The executable `./ctfh2` runs directly from this checkout without installing the
-package or setting `PYTHONPATH`:
-
-```bash
-rtk proxy ./ctfh2 start https://h4ckingga.me/challenges
-```
-
-The shortcut also accepts `--codex codex` or `--codex codex --secondary`, including
-when resuming the last contest: `rtk proxy ./ctfh2 start --codex codex --secondary`.
-`--secondary` is a CTFH option: the installed Codex CLI does not accept it
-directly. CTFH uses the installed `codex-secondary` account wrapper for that option.
-
-The shortcut opens the contest in connected Chrome, chooses the state directory,
-and shows a terminal dashboard with the problem list and important contest
-results. Clicking or selecting a problem shows its detailed events on the right.
-The list shows each problem's accumulated input plus output tokens, and the
-banner shows the contest total. Exact input, cached input, and output counts
-appear in the selected problem's details after Codex reports a completed turn.
-A turn rejected before usage is reported shows `—`.
-It uses an existing matching contest
-when available. New and saved native contests run directly through the selected
-Codex CLI. This checkout defaults to ordinary `codex` from `~/.codex`.
-Discovery and site-monitor turns use the workspace sandbox with Chrome session
-and network access. Every problem-solving Codex turn uses
-`--dangerously-bypass-approvals-and-sandbox`, including with the ordinary
-account, so challenge tools such as QEMU can access the host when the user can.
-Explicit `--codex codex --secondary` selects the previously requested secondary
-account with full access.
-To select the model and thinking level for this contest, use for example:
-
-```bash
-rtk proxy ./ctfh2 start https://h4ckingga.me/challenges --model gpt-6-sol --thinking xhigh
-```
-
-These choices persist when the contest resumes and apply to new and resumed
-Codex turns. If omitted, the selected account's own settings apply. Model and
-reasoning choices do not override the account's cyber safety gate.
-In the terminal dashboard, press `S` to change them. Saved changes apply to
-new turns; already running turns continue with their current settings.
-If browser login needs your help, complete it in Chrome and press `R` in the dashboard.
-
-Select a problem and press `D` to mark it solved, `R` to resume after login,
-`S` to edit Codex settings, or `Q` to stop. All ready problems still run concurrently.
-Use `--plain` for line-by-line output and the earlier `목록` / `완료 2` / `종료`
-commands. To resume the last
-contest, run just:
-
-```bash
-rtk proxy ./ctfh2 start
-```
-
-On the first invocation without a saved contest, it asks only for the site URL.
-The shortcut and last-contest record are anchored to this checkout, so they
-also work when the executable is invoked by absolute path from another directory.
-
-### Advanced live commands
-
-Use these when explicit state paths or a separate event viewer are useful:
-
-```bash
-rtk proxy ./ctfh2 live run https://h4ckingga.me/challenges --state .ctfh-live/h4ckinggame
-rtk proxy ./ctfh2 live status --state .ctfh-live/h4ckinggame --details
-rtk proxy ./ctfh2 live events --state .ctfh-live/h4ckinggame --follow
-rtk proxy ./ctfh2 live mark-solved --state .ctfh-live/h4ckinggame --challenge stable-key
-```
-
-To check the selected account and run directly through its Codex CLI:
-
-```bash
-rtk proxy ./ctfh2 live check-engine --codex codex --secondary
-rtk proxy ./ctfh2 live run https://h4ckingga.me/challenges \
-  --state .ctfh-live/h4ckinggame --codex codex --secondary
-```
-
-`check-engine` checks local Codex login status without starting a model turn.
-The native engine selection is saved; resume with
-`rtk proxy ./ctfh2 live run --state .ctfh-live/h4ckinggame`.
-Saved contests that previously selected the removed shift runner are migrated
-to direct Codex while keeping their problem state and native thread IDs.
-
-Use `live events --follow` in another terminal to watch public progress
-messages, plan updates, tool starts/completions, checkpoints, and solve/stop
-events while turns are running. Add `--challenge KEY` to follow one problem,
-or `--json` for JSONL output. The latest 5,000 events survive restart.
-Closing this viewer does not stop the contest. Events are collected by new
-controller runs; earlier executions cannot be reconstructed from this log.
-Tool arguments/output and private reasoning are excluded.
-
-The `live` workflow accepts a site URL and account access, discovers the
-challenge list, and starts all ready challenges concurrently by default.
-It inspects each new site's actual page, rules, challenge navigation, solve
-markers, and submission controls at run time; it has no preconfigured site
-template or site-specific connector.
-Each challenge has its own named Chrome session and persistent agent thread.
-It stores challenge work, submissions, and resumable progress. A user-supplied
-connection speaks the versioned `ctfh.turn.v1`
-JSONL protocol. The user owns the Codex connection; the core can be prepared
-and verified without model credentials.
-
-Prepare a contest locally:
-
-```bash
-rtk proxy env PYTHONPATH=src python3 -m ctfh_core live init \
-  https://h4ckingga.me/challenges --state .ctfh-live/h4ckinggame --account my-account
-```
-
-Run with your connection command (a JSON argv array, never evaluated by a shell):
-
-```bash
-rtk proxy env PYTHONPATH=src python3 -m ctfh_core live run \
-  --state .ctfh-live/h4ckinggame \
-  --agent-command '["/usr/bin/python3", "/absolute/path/my_codex_connection.py"]'
-```
-
-The command and thread ID are persisted. Resume with `live run --state ...`.
-Use `live status --state ... --details` for checkpoints, `--resume-handoff`
-after a user login handoff, or `--reset-thread` to reconnect while retaining
-challenge work. Without a turn limit the controller keeps running; use a
-user service for unattended operation.
-
-Mark a problem you solved yourself with its key from `live status --details`:
-
-```bash
-rtk proxy env PYTHONPATH=src python3 -m ctfh_core live mark-solved \
-  --state .ctfh-live/h4ckinggame --challenge stable-key
-```
-
-Only that problem's worker stops; other workers continue. The independent
-site monitor also checks for problems solved directly on the site (every 15
-seconds by default). Use `--scan-seconds` to adjust this interval and
-`--max-workers` only when a concurrency cap is needed.
-
-Browser verdicts require fresh, turn-bound receipts from `live browser`,
-including the contest origin and observed URL. Candidates are journaled before
-submission; unresolved candidates must be reconciled before another submission.
-For an agent-accepted flag, the problem workspace must contain private
-`flag.txt` (exact accepted flag bytes) and `writeup.md` before CTFH records the
-accepted verdict. The flag file's SHA-256 must match the journaled candidate.
-Existing problems solved outside the agent may have no recoverable flag file.
-Workspaces, checkpoints, cooldowns, and fair problem selection survive restart.
-
-See [the connection contract and operating guide](docs/LIVE_AGENT.md) for the
-complete protocol, report fields, browser helpers, systemd command, and tests.
-The built-in `codex exec` path uses the selected account's configuration and
-persistent native sessions.
-Actual account connectivity and model solve capability are separate validation items.
-
-## Offline learning CLI
-
-The package exposes:
-
-```text
-ctfh-learn verify-trace
-ctfh-learn wiki-add
-ctfh-learn wiki-show
-ctfh-learn propose
-ctfh-learn decide
-```
-
-Promotion input is a restricted evaluation-summary schema. Raw evaluator
-secrets are not accepted as learning input.
-
-## Validation status
-
-As of 2026-10-06:
-
-- full repository suite: **101 passed**
-- real Codex supervised smoke: authoritative PASS
-- final supervised attempt artifact and trace manifest published to CAS
-- GPT-6.1 Sol final blocker recheck: **READY**, blockers none
-- GPT-6 Astra final blocker recheck: **READY**, blockers none
-- Claude Opus 5.5 participated in the architecture review that shaped V3; its
-  final patch recheck could not be rerun because the local Claude CLI was
-  logged out at final validation time
-
-At the 2026-10-08 core delivery, before the shift integration,
-`rtk pytest -q -o pythonpath=src` passed **140 tests**.
-`tests/manual_live_core.py` also passed through a separate
-JSONL fixture connection and real Chrome: two accepted challenges, one rejected
-candidate, restart recovery after submission, zero replayed submissions, and
-the alternate UI scoreboard. This verifies the contest core and connection
-contract using a deterministic localhost fixture. The user owns the later
-Codex connection and validation of actual model solve capability.
-`tests/manual_live_parallel.py` passed with real Chrome: two simultaneous
-problem workers, one site-submitted solution detected by the monitor, only its
-worker stopped, and the second worker stopped after explicit user input.
-
-The previous shift integration was removed after the user selected direct
-Codex execution; see [the current verification record](docs/reviews/v3/FINAL_IMPLEMENTATION_STATUS.md).
-The earlier 140-test result is historical. A prior full-suite rerun timed out
-in an existing V0 browser cancellation test.
-
-## Documents
-
-- `docs/ARCHITECTURE.md` — preserved control-plane architecture and invariants
-- `docs/ARCHITECTURE_V3_PROPOSAL.md` — V3 design and implementation sequence
-- `docs/research/MODULAR_AGENT_ARCHITECTURE_2026-10-06.md` — modular
-  agent/browser/skills/memory research synthesis
-- `docs/research/BROWSER_NATIVE_CTF_SOLVER_2026-10-08.md` — browser-driven
-  continuous solver research and architecture proposal
-- `docs/reviews/v3/CONSENSUS.md` — multi-model architecture consensus
-- `docs/reviews/v3/SYNTHESIS.md` — corrected V3 boundary synthesis
-- `benchmarks/README.md` — matched evaluation rules
-
-## Still deferred
-
-These remain deferred until paired benchmark evidence justifies them:
-
-- core-level generic Hand protocol
-- global ToolRouter / ToolRegistry
-- live shared memory and vector/graph retrieval on the solve path
-- Desktop/GUI hand
-- real-user-profile browser reuse in the isolated benchmark path (the live
-  command uses the connected chrome-use profile)
-- planner/executor overlays
-- critic loops on the authoritative path
-- heterogeneous model routing
-- generic dynamic plugin discovery
-- distributed scheduling
+The automated suite covers the native checker, live-controller state, artifacts, and learning invariants. Separate `tests/manual_*.py` scripts require additional browser/runtime setup and are not included above. Local test success does not establish real-contest solve performance or current model/account availability.

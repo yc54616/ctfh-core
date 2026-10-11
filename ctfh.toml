@@ -3,11 +3,8 @@
 binary = "codex"
 dangerously_bypass_approvals_and_sandbox = false
 
-# Explicit --secondary retains the previously requested secondary launch mode.
-[native.secondary]
-dangerously_bypass_approvals_and_sandbox = true
-
 # ctfh2 <URL> (네이티브 풀이기 + 검사기) 기본값. 명령줄 옵션이 우선한다.
+# Uncomment these keys here, under [native], before [native.secondary].
 # model = "gpt-6-sol"
 # thinking = "xhigh"
 # max_parallel = 0       # 동시에 여는 풀이 창 수 (0 = 전체 문제, 검사기 화면에서 +/- 로 바로 조절)
@@ -22,3 +19,7 @@ dangerously_bypass_approvals_and_sandbox = true
 # solve_timeout = 300
 # memory_max = "auto"   # 풀이 창 전체가 함께 쓸 메모리 상한 (auto = RAM의 98%, "28G", "off")
 # plain = false          # true면 검사기 화면을 키 조작 없는 텍스트 표로
+
+# Explicit --secondary retains the previously requested secondary launch mode.
+[native.secondary]
+dangerously_bypass_approvals_and_sandbox = true

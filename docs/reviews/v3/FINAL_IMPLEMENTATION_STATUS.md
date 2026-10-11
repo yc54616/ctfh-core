@@ -970,3 +970,40 @@ and clarification of the native runner after a secondary-account solver error.
   test changes the saved settings between solver turns and verifies that the
   next `CodexExecRunner` receives the new model and effort.
 - DONE: final `rtk pytest -q -o pythonpath=src` exited 0: **179 passed**.
+
+## Bilingual usage guide and GitHub publication — 2026-10-11
+
+User direction: publish this project under `yc54616` on GitHub and revise both
+Korean and English READMEs so a new user can understand how to operate it.
+The user explicitly selected a public repository.
+
+- DONE: rewrote `README.md` in English and added matching `README.ko.md` with
+  language links, prerequisites, editable installation, a first contest run,
+  dashboard/tmux controls, pause/restart behavior, configuration, saved files,
+  submission semantics, and troubleshooting. Distinguished the default native
+  runner from the older live controller and isolated benchmark runtime.
+- DONE: checked commands/defaults against the current CLI and native runner.
+  Documented full host access, the external `codex-secondary` prerequisite,
+  required Codex flags, plaintext optional credential storage, checker option
+  persistence, `approve` queuing, and `--no-submit` completion semantics.
+- DONE: moved commented default options in `ctfh.toml` before
+  `[native.secondary]`, so uncommenting them configures `[native]`. Parsed
+  before/after TOML values are identical; no runtime behavior was changed.
+- DONE: `rtk test timeout 240s pytest -q -o pythonpath=src` exited 0:
+  **241 passed in 30.30s**.
+- DONE: `rtk proxy python3 -m venv .venv` and
+  `rtk proxy .venv/bin/python -m pip install -e .` exited 0 in a fresh virtual
+  environment. The installed `ctfh2` and `ctfh-learn` help commands work.
+- DONE: a finite Python documentation check validated 42 local links/anchors,
+  syntax-checked 20 Bash blocks with `bash -n`, parsed 20 CLI examples, and
+  parsed/matched both TOML examples. `rtk git diff --check` exited 0.
+- DONE: checked 245 existing Git-history blobs for common token/private-key
+  signatures and tracked credential/flag filenames; no matches were found.
+  Local contest runs and `.venv` remain ignored. This is a bounded pattern
+  check, not a guarantee that every possible secret format was detected.
+- IN_PROGRESS: create the authorized public `yc54616/ctfh-core` repository,
+  push intended changes, and verify the remote commit and README contents.
+- NOT_RUN: real model turns, contest execution, or flag submissions for this
+  documentation/publication task. Local tests are not live solve evidence.
+- No `.planning/STATE.md` or `.intent/INTENT.toml` exists in this checkout;
+  this existing status document remains the session record.
