@@ -15,7 +15,8 @@ from unittest.mock import patch
 from ctfh_core import native
 from ctfh_core.cli import main
 
-REAL_CHROME_ACCOUNT, REAL_SITE_LIST = native.chrome_account, native.site_list  # Base patches them
+REAL_CHROME_ACCOUNT, REAL_SITE_LIST, REAL_DIRECT_FETCH = (  # Base patches them
+    native.chrome_account, native.site_list, native.direct_fetch)
 
 SITE_SOLVED = native.site_solved  # the real one; Base replaces it so tests never drive Chrome
 
@@ -90,7 +91,7 @@ class Base(unittest.TestCase):
                               ("_meminfo", 32 << 30), ("set_memory_slice", None),
                               ("site_solved", None), ("probe_endpoint", "unknown"),
                               ("api_reachable", True), ("chrome_account", "player@example.com"),
-                              ("site_list", None)):
+                              ("site_list", None), ("direct_fetch", None)):
             patcher = patch(f"ctfh_core.native.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -839,6 +840,34 @@ class CheckerFlowTests(Base):
         self.assertIn("id=1iW2iseW82LOwZC4Iw_vy2_qfrCMgcGHK&export=download&confirm=t", calls[0][-1])
         self.assertEqual(runner.calls, [])  # no Codex run for a Drive-only challenge
         self.assertNotIn("download_tries", self.status("art"))
+
+    def test_a_tokened_attachment_is_fetched_with_curl_and_a_login_page_goes_to_the_browser(self):
+        chal = make_challenge(self.root, "mem")
+        (chal / "challenge.json").write_text(json.dumps({"name": "mem", "attachments": [
+            {"name": "Memory1.mans", "url": "https://ctf.example.com/files/ab/Memory1.mans?token=t"},
+            {"name": "notes.txt", "url": "https://ctf.example.com/files/cd/notes.txt"}]}))
+        def curl(args, out=None, timeout=1800):
+            head, body = Path(args[args.index("-D") + 1]), Path(args[args.index("-o") + 1])
+            if "token=" in args[-1]:  # redirected to the file store
+                head.write_text("HTTP/2 302\r\nlocation: https://files.example.com/x\r\n\r\n"
+                                "HTTP/2 200\r\ncontent-type: application/octet-stream\r\ncontent-length: 5\r\n\r\n")
+                body.write_bytes(b"MEMRY")
+            else:  # no token: the login page
+                head.write_text("HTTP/2 200\r\ncontent-type: text/html; charset=utf-8\r\n\r\n")
+                body.write_bytes(b"<html>login</html>")
+            return subprocess.CompletedProcess(args, 0)
+        runner = FakeRunner(download=[{"downloaded": [], "failed": [{"slug": "mem", "reason": "x"}]}])
+        checker = self.checker(runner=runner)
+        with patch.object(native, "_curl", side_effect=curl), patch.object(native, "direct_fetch", REAL_DIRECT_FETCH):
+            checker.job_download(chal)
+            self.assertEqual(sorted(p.name for p in (chal / "files").iterdir()), ["Memory1.mans"])
+            self.assertEqual(len(runner.calls), 1)  # only the login-walled file goes to the browser run
+            self.assertIn("다시 받지 마라: Memory1.mans", runner.calls[0][2])
+            (chal / "challenge.json").write_text(json.dumps({"name": "mem", "attachments": [
+                {"name": "../../evil", "url": "https://ctf.example.com/files/ab/x?token=t"}]}))
+            checker.job_download(chal)
+        self.assertEqual(sorted(p.name for p in (chal / "files").iterdir()), sorted(["Memory1.mans", native.FILES_DONE, "evil"]))
+        self.assertEqual(len(runner.calls), 1)  # all fetched: no Codex run
 
     def test_a_closed_solver_window_closes_its_browser_session(self):
         chal = make_challenge(self.root, "web-1")

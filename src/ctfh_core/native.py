@@ -836,6 +836,34 @@ def drive_fetch(url: str, folder: Path) -> str:
     return name
 
 
+def direct_fetch(url: str, folder: Path, name: str = "") -> str | None:
+    """One attachment with plain curl and no browser, for links that carry their own access (CTFd's ?token=, S3,
+    release assets): the Chrome relay times out while the solvers load the machine. None when the server answers
+    with a page instead of the file (a login wall), so the browser run takes it. Returns the saved file name."""
+    link = urlparse(url)
+    name = Path(name or unquote(link.path)).name
+    if link.scheme not in ("http", "https") or not name.strip("."):
+        return None
+    folder.mkdir(parents=True, exist_ok=True)
+    part, head = folder / f".{name}.part", folder / f".{name}.head"
+    try:
+        ok = _curl(["--retry", "3", "-D", str(head), "-o", str(part), url]).returncode == 0
+        blocks = [b for b in re.split(r"\r?\n\r?\n", head.read_text(errors="replace") if head.exists() else "")
+                  if b.startswith("HTTP/")]
+        last = blocks[-1] if blocks else ""  # the file's own response, after any redirects
+        kind = re.search(r"^content-type:\s*([^;\r\n]+)", last, re.I | re.M)
+        size = re.search(r"^content-length:\s*(\d+)", last, re.I | re.M)
+        have = part.stat().st_size if part.exists() else 0
+        if (not ok or not have or (kind and kind.group(1).strip().lower() == "text/html")
+                or (size and int(size.group(1)) != have)):
+            return None
+        part.replace(folder / name)
+        return name
+    finally:
+        part.unlink(missing_ok=True)
+        head.unlink(missing_ok=True)
+
+
 def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json, fetched=()) -> dict:
     slug = chal.name
     already = f"\n   검사기가 이미 받은 파일이니 다시 받지 마라: {', '.join(fetched)}" if fetched else ""
@@ -1403,14 +1431,17 @@ class Checker:
         try:
             info = _read_json(chal / "challenge.json", {})
             attachments = [item for item in (info.get("attachments") or []) if isinstance(item, dict)]
-            drive = [item for item in attachments if DRIVE_FILE.search(str(item.get("url", "")))]
-            for item in drive:  # the checker fetches these itself; no browser needed
-                try:
-                    fetched.append(drive_fetch(str(item["url"]), chal / "files"))
-                except (OSError, RuntimeError) as exc:
-                    result = {"downloaded": [], "failed": [{"slug": chal.name, "reason": f"Google Drive: {exc}"}]}
-                    return
-            if drive and len(fetched) == len(attachments):
+            for item in attachments:  # the checker tries each itself first; the browser gets only what is left
+                url = str(item.get("url", ""))
+                if DRIVE_FILE.search(url):
+                    try:
+                        fetched.append(drive_fetch(url, chal / "files"))
+                    except (OSError, RuntimeError) as exc:
+                        result = {"downloaded": [], "failed": [{"slug": chal.name, "reason": f"Google Drive: {exc}"}]}
+                        return
+                elif got := direct_fetch(url, chal / "files", str(item.get("name") or "")):
+                    fetched.append(got)
+            if attachments and len(fetched) == len(attachments):
                 (chal / "files" / FILES_DONE).touch()
                 result = {"downloaded": [chal.name], "failed": []}
                 return
