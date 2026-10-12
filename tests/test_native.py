@@ -985,6 +985,25 @@ class CheckerFlowTests(Base):
         self.assertEqual(json.loads((chal / "challenge.json").read_text())["open"],  # remembered for the next time
                          {"url": "https://ctf.example.com/#42", "click": "#chall42-flag-header"})
 
+    def test_a_link_behind_a_recorded_button_is_downloaded_directly_and_the_open_page_is_reused(self):
+        watch = native.DownloadWatch()
+        with patch.object(watch, "download_url", return_value=False) as direct, \
+                patch.object(watch, "click", return_value=False) as click:
+            self.assertIsNone(watch.fetch("https://ctf.example.com/download/42", self.root, "a.zip", None,
+                                          "https://ctf.example.com/dashboard#42", button='a[href="download/42"]'))
+            self.assertEqual(direct.call_args.args, ("https://ctf.example.com/download/42",))
+            self.assertEqual(click.call_count, 1)  # the page click only when the link brought nothing
+            direct.reset_mock()
+            watch.fetch("https://ctf.example.com/dashboard#42", self.root, "a.zip", None,
+                        "https://ctf.example.com/dashboard#42", button="#js-download")
+            direct.assert_not_called()  # a JS button on the page itself has no link to fetch
+        watch.opened = "https://ctf.example.com/dashboard#34"
+        run = MagicMock(return_value=subprocess.CompletedProcess([], 0, b"clicked"))
+        with patch.object(native.subprocess, "run", run):
+            self.assertTrue(watch.click("https://ctf.example.com/download/42", "a.zip",
+                                        "https://ctf.example.com/dashboard#42", button='a[href="download/42"]'))
+        self.assertEqual([c.args[0][3] for c in run.call_args_list], ["eval"])  # same page: no reload
+
     def test_chrome_holding_back_several_downloads_is_asked_at_start_and_said_on_the_board(self):
         prefs = self.root / ".config/google-chrome/Default/Preferences"
         prefs.parent.mkdir(parents=True)

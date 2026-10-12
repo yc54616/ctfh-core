@@ -967,7 +967,10 @@ class DownloadWatch:
             return None
         # A plain file link goes through Chrome's own download API first: the site's cookies go along and Chrome
         # never holds it back as one of "multiple automatic downloads". A click on the page is the fallback.
-        for direct in ([True, False] if not (opener or button) else [False]):
+        # A recorded button or opener only says how to reach that same link on the page, so the link is tried first
+        # unless it is the page itself (a JS button with nothing behind it).
+        plain = not (opener or button) or url.split("#")[0] != page.split("#")[0]
+        for direct in ([True, False] if plain else [False]):
             entry = {"stem": Path(name).stem, "name": name, "total": total, "dest": folder / name,
                      "clicked": time.time(), "done": threading.Event(), "ok": False}
             downloads = chrome_download_dir()
@@ -1021,12 +1024,18 @@ class DownloadWatch:
                 if (wait := self.down_until - time.time()) > 0:  # a hang just now (often a Chrome that just started):
                     time.sleep(wait)  # wait it out, since a Codex download would need the same Chrome
                 try:
+                    self.clicked = True  # held back by Chrome unless the site may download several files
+                    # Only the part after # differs (dashboard#42, dashboard#34): the page is already open, so the
+                    # element is looked for right there before loading the page again.
+                    if (not attempt and not opener and self.opened != page
+                            and self.opened.split("#")[0] == page.split("#")[0] and b"clicked" in chrome("eval", find)):
+                        self.hangs = 0
+                        return True
                     if self.opened != page or attempt:
                         chrome("open", page, timeout=60)
                         self.opened = page
                     if opener:
                         chrome("eval", open_it)
-                    self.clicked = True  # held back by Chrome unless the site may download several files
                     if self.find(chrome, find):
                         return True
                     if not opener and b"opener " in (out := chrome("eval", reveal)):
@@ -2092,7 +2101,9 @@ class Checker:
             head.append(f"새 문제 감시: 목록을 읽을 방법을 못 찾아 {self.opts.rescan_seconds // 60}분마다 재수집으로만 확인")
         downloading = sum(k.startswith("__download_") and not f.done() for k, f in self.jobs.items())
         if downloading:
-            head.append(f"첨부 받는 중: {downloading}개 동시에")
+            with DOWNLOADS.lock:
+                arriving = len(DOWNLOADS.pending)
+            head.append(f"첨부: {downloading}개 문제 대기, Chrome에서 {arriving}개 받는 중")
         return head, rows
 
     def board(self) -> str:
