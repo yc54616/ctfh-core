@@ -15,8 +15,8 @@ from unittest.mock import patch
 from ctfh_core import native
 from ctfh_core.cli import main
 
-REAL_CHROME_ACCOUNT, REAL_SITE_LIST, REAL_DIRECT_FETCH = (  # Base patches them
-    native.chrome_account, native.site_list, native.direct_fetch)
+REAL_CHROME_ACCOUNT, REAL_SITE_LIST, REAL_DIRECT_FETCH, REAL_BROWSER_FETCH = (  # Base patches them
+    native.chrome_account, native.site_list, native.direct_fetch, native.browser_fetch)
 
 SITE_SOLVED = native.site_solved  # the real one; Base replaces it so tests never drive Chrome
 
@@ -91,7 +91,8 @@ class Base(unittest.TestCase):
                               ("_meminfo", 32 << 30), ("set_memory_slice", None),
                               ("site_solved", None), ("probe_endpoint", "unknown"),
                               ("api_reachable", True), ("chrome_account", "player@example.com"),
-                              ("site_list", None), ("direct_fetch", None)):
+                              ("site_list", None), ("direct_fetch", None),
+                              ("browser_fetch", None)):
             patcher = patch(f"ctfh_core.native.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -877,6 +878,31 @@ class CheckerFlowTests(Base):
             checker.job_download(chal)
         self.assertEqual(sorted(p.name for p in (chal / "files").iterdir()), sorted(["Memory1.mans", native.FILES_DONE, "evil"]))
         self.assertEqual(len(runner.calls), 1)  # all fetched: no Codex run
+
+    def test_a_login_walled_attachment_is_clicked_in_one_window_and_watched_until_done(self):
+        downloads, files = self.root / "dl", self.root / "files"
+        downloads.mkdir()
+        (downloads / "Memory1.mans").write_bytes(b"the user's own")  # already there: never taken
+        opened = []
+        def run(argv, **kwargs):
+            opened.append(argv)
+            (downloads / "Memory1 (1).mans.crdownload").write_bytes(b"MEM")
+            return subprocess.CompletedProcess(argv, 0)
+        polls = []
+        def sleep(seconds):  # Chrome finishes the file after a few polls
+            polls.append(seconds)
+            if len(polls) == 2:
+                (downloads / "Memory1 (1).mans.crdownload").rename(downloads / "Memory1 (1).mans")
+        with patch.object(native, "chrome_download_dir", return_value=downloads), \
+                patch.object(native.subprocess, "run", side_effect=run), patch.object(native.time, "sleep", side_effect=sleep):
+            self.assertEqual(REAL_BROWSER_FETCH("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans"),
+                             "Memory1.mans")
+            self.assertEqual((files / "Memory1.mans").read_bytes(), b"MEM")
+            self.assertEqual((downloads / "Memory1.mans").read_bytes(), b"the user's own")
+            self.assertEqual(opened[0][:4], ["chrome-use", "--session", native.DOWNLOAD_SESSION, "open"])
+            polls.clear()
+            self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans",
+                                                 total=999))  # a wrong size is not taken as done
 
     def test_a_closed_solver_window_closes_its_browser_session(self):
         chal = make_challenge(self.root, "web-1")

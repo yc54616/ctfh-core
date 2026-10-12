@@ -864,6 +864,61 @@ def direct_fetch(url: str, folder: Path, name: str = "") -> str | None:
         head.unlink(missing_ok=True)
 
 
+DOWNLOAD_SESSION = "ctfh-download"  # the one Chrome window attachments are opened in, one at a time
+BROWSER_POLL = 3
+BROWSER_IDLE = 300  # a download that stops growing this long has failed
+_browser_lock = threading.Lock()
+
+
+def chrome_download_dir() -> Path:
+    prefs = _read_json(Path.home() / ".config" / "google-chrome" / "Default" / "Preferences", {})
+    folder = prefs.get("download", {}).get("default_directory") if isinstance(prefs, dict) else None
+    return Path(folder) if folder else Path.home() / "Downloads"
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return -1
+
+
+def browser_fetch(url: str, folder: Path, name: str = "", total: int | None = None) -> str | None:
+    """One attachment that needs the logged-in browser: its link is opened in the one download window and Chrome's
+    download folder is watched until the file stops growing. chrome-use's download command waits on the relay and
+    times out under the solvers' load. Only a new file named like the attachment (or of its exact size) is taken,
+    since the user downloads into the same folder. Returns the saved file name, or None."""
+    link = urlparse(url)
+    name = Path(name or unquote(link.path)).name
+    if link.scheme not in ("http", "https") or not name.strip("."):
+        return None
+    downloads, stem = chrome_download_dir(), Path(name).stem
+    with _browser_lock:
+        before = set(os.listdir(downloads)) if downloads.is_dir() else set()
+        try:
+            subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "open", url], capture_output=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # the download may have started anyway; the folder tells
+        seen, changed = None, time.time()
+        opened = changed
+        while time.time() - changed < BROWSER_IDLE:
+            new = [p for p in downloads.iterdir() if p.name not in before] if downloads.is_dir() else []
+            if not new and time.time() - opened > 60:
+                return None  # shown in the tab instead of downloaded, or a login page
+            sizes = sorted((p.name, _size(p)) for p in new)
+            if sizes != seen:  # still growing (or just appeared): look again before deciding
+                seen, changed = sizes, time.time()
+            elif new and not any(p.name.endswith(".crdownload") for p in new):
+                got = [p for p in new if p.name.startswith(stem) or (total and _size(p) == total)]
+                if not got or (total and _size(got[0]) != total):
+                    return None
+                folder.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(got[0]), folder / name)
+                return name
+            time.sleep(BROWSER_POLL)
+        return None
+
+
 def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json, fetched=()) -> dict:
     slug = chal.name
     already = f"\n   검사기가 이미 받은 파일이니 다시 받지 마라: {', '.join(fetched)}" if fetched else ""
@@ -875,6 +930,9 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
    Google Drive 링크(drive.google.com/file/d/<ID>/...)는 브라우저로 받지 마라 (큰 파일은 경고 페이지만 받아진다).
    `curl -fL --retry 5 -C - -o <저장 경로> 'https://drive.usercontent.google.com/download?id=<ID>&export=download&confirm=t'`로
    받고, `curl -sL -r 0-0 -o /dev/null -D - '<같은 URL>'`의 content-range `/` 뒤 숫자(전체 크기)와 받은 크기를 대조한다.
+   `chrome-use download` 명령은 부하가 높으면 시간 초과되니 쓰지 마라. 링크를 클릭한 뒤 Chrome 다운로드 폴더
+   (`{chrome_download_dir()}`)에서 `.crdownload`가 사라지고 크기가 멈출 때까지 기다렸다가 files/로 옮긴다.
+   이어받기는 처음부터 다시 받는다 (서명된 주소는 만료되면 오류 페이지가 파일 뒤에 붙는다).
 2. 다 받았으면 challenges/{slug}/files/{FILES_DONE} 빈 파일을 만든다. 검사기는 이 파일을 보는 즉시 풀이를 시작한다.
    사이트나 challenge.json에 크기가 있으면 맞는지 대조한다. 크기가 없으면 다운로드가 오류 없이 끝났고 파일이 비어 있지
    않을 때 다 받은 것으로 본다 (크기를 확인할 수 없다는 이유로 멈추지 마라). 덜 받았거나 빈 파일이면 만들지 마라.
@@ -1439,7 +1497,9 @@ class Checker:
                     except (OSError, RuntimeError) as exc:
                         result = {"downloaded": [], "failed": [{"slug": chal.name, "reason": f"Google Drive: {exc}"}]}
                         return
-                elif got := direct_fetch(url, chal / "files", str(item.get("name") or "")):
+                elif got := (direct_fetch(url, chal / "files", str(item.get("name") or ""))
+                             or browser_fetch(url, chal / "files", str(item.get("name") or ""),
+                                              item["size"] if isinstance(item.get("size"), int) else None)):
                     fetched.append(got)
             if attachments and len(fetched) == len(attachments):
                 (chal / "files" / FILES_DONE).touch()
