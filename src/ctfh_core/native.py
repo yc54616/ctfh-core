@@ -1073,13 +1073,13 @@ class DownloadWatch:
             names = set(os.listdir(downloads)) if downloads.is_dir() else set()
             new = {name: _size(downloads / name) for name in names - self.known}
             now = time.time()
-            if new != self.sizes:  # still growing (or just appeared): look again before deciding
-                self.sizes, self.moved_at = new, now
-                return
+            prev, self.sizes = self.sizes, new
+            if new != prev:
+                self.moved_at = now
             busy = any(name.endswith(".crdownload") for name in new)
-            for name, size in new.items():
-                if busy and name.endswith(".crdownload"):
-                    continue
+            for name, size in new.items():  # each file on its own: many arrive at once and the folder never rests
+                if name.endswith(".crdownload") or prev.get(name) != size:
+                    continue  # still downloading, or just appeared: look again before deciding
                 entry = next((e for e in self.pending if name.startswith(e["stem"])
                               or (e["total"] and size == e["total"])), None)
                 if entry is None:

@@ -1006,6 +1006,21 @@ class CheckerFlowTests(Base):
                 checker.tick()
             self.assertTrue(any("여러 파일 다운로드를 막고" in line for line in checker.view()[0]))
 
+    def test_a_finished_download_is_taken_while_others_still_grow(self):
+        downloads, files = self.root / "dl", self.root / "files"
+        downloads.mkdir()
+        watch = native.DownloadWatch()
+        entry = {"stem": "a", "name": "a.zip", "total": None, "dest": files / "a.zip", "clicked": time.time(),
+                 "done": threading.Event(), "ok": False}
+        watch.pending = [entry]
+        (downloads / "a.zip").write_bytes(b"done")
+        with patch.object(native, "chrome_download_dir", return_value=downloads):
+            for size in (1, 2):  # a big one keeps growing, so the folder as a whole never rests
+                (downloads / "big.crdownload").write_bytes(b"x" * size)
+                watch.poll()
+        self.assertTrue(entry["ok"])
+        self.assertEqual((files / "a.zip").read_bytes(), b"done")
+
     def test_a_closed_chrome_is_started_again_and_said_on_the_board(self):
         make_challenge(self.root, "web-1")
         checker = self.checker()
