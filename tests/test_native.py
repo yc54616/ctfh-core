@@ -526,6 +526,15 @@ class CheckerFlowTests(Base):
         self.assertIn("!! 입력 필요 (문제 목록 수집에서 로그인 확인 실패, 풀이 창과 무관): Chrome에서 다시 로그인하세요.", head)
         self.assertNotEqual(checker.view()[1][0]["state"], "needs_user")  # no challenge row is marked
 
+    def test_a_checkbox_captcha_is_clicked_and_a_puzzle_left_to_the_user(self):
+        chal = make_challenge(self.root, "web-1")
+        checker = self.checker()
+        checker.tick()
+        agents = (chal / "AGENTS.md").read_text()
+        self.assertIn(native.CAPTCHA_CLICK, agents)
+        self.assertIn("퍼즐 캡차·휴대폰 인증", agents)
+        self.assertIn(native.CAPTCHA_CLICK, native.login_steps(checker.contest, "s", "x"))
+
     def test_the_signup_account_is_chromes_default_profile(self):
         out = json.dumps({"success": True, "data": {"browsers": [{"email": "other@example.com", "default": False},
                                                                 {"email": "me@example.com", "default": True}]}})

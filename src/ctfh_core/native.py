@@ -417,7 +417,8 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
   {account}
   비밀번호는 매번 새로 무작위로 만들어 사이트·아이디와 함께 `work/ACCOUNTS.md`에 적는다 (writeup에는 적지 않는다).
   인증 메일은 chrome-use로 Gmail을 열어 그 메일만 확인한다. 다른 메일, Google 계정 설정, 저장된 비밀번호는 건드리지 않는다.
-- 캡차·휴대폰 인증·결제처럼 사람만 할 수 있는 입력이 꼭 필요하면, 무엇을 해 달라는지 한 줄로 `needs_user.txt`에 적고
+- 캡차가 체크박스 하나("로봇이 아닙니다", Cloudflare의 "사람인지 확인")면 한 번 클릭하고 몇 초 뒤 통과됐는지 본다. 그림 고르기 같은 퍼즐로 넘어가면 풀지 않는다.
+- 퍼즐 캡차·휴대폰 인증·결제처럼 사람만 할 수 있는 입력이 꼭 필요하면, 무엇을 해 달라는지 한 줄로 `needs_user.txt`에 적고
   기다린다. 보드에 "입력 필요"로 뜨고, 그동안 검사기는 재촉하지 않는다. 처리됐으면 이 파일을 지우고 이어서 푼다.
 - 다른 문제 폴더는 건드리지 않는다.
 - 대회 규칙을 지킨다. 서버에 부하를 주는 무차별 대입·스캐너는 문제가 요구할 때만, 느리게 쓴다.
@@ -936,12 +937,17 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
 2. 다 받았으면 challenges/{slug}/files/{FILES_DONE} 빈 파일을 만든다. 검사기는 이 파일을 보는 즉시 풀이를 시작한다.
    사이트나 challenge.json에 크기가 있으면 맞는지 대조한다. 크기가 없으면 다운로드가 오류 없이 끝났고 파일이 비어 있지
    않을 때 다 받은 것으로 본다 (크기를 확인할 수 없다는 이유로 멈추지 마라). 덜 받았거나 빈 파일이면 만들지 마라.
-3. 받지 못했으면 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고
+3. {CAPTCHA_CLICK}
+   받지 못했으면 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·퍼즐 캡차가 나오면 비밀번호를 묻거나 추측하지 말고
    failed로 적고 끝낸다.
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
     work = chal / ".ctfh-check"
     work.mkdir(parents=True, exist_ok=True)
     return runner(opts, contest.root, prompt, DOWNLOAD_SCHEMA, work, "download", DOWNLOAD_TIMEOUT)
+
+
+CAPTCHA_CLICK = ('캡차가 체크박스 하나("로봇이 아닙니다", Cloudflare의 "사람인지 확인")면 한 번 '
+                 '클릭하고 몇 초 뒤 통과됐는지 본다. 그림 고르기 같은 퍼즐로 넘어가면 풀지 않는다.')
 
 
 def login_steps(contest: Contest, session: str, give_up: str) -> str:
@@ -950,13 +956,13 @@ def login_steps(contest: Contest, session: str, give_up: str) -> str:
     autofill = ("로그인 페이지를 열고, 칸이 비어 보여도 아무것도 입력하지 말고 로그인 버튼을 한 번 누른다 "
                 "(Chrome이 저장된 계정을 자동완성해 두며, 값은 화면에 안 보여도 클릭할 때 넘어간다). ")
     if credential(urlparse(contest.url).hostname or "") is None:
-        return (autofill + "그래도 로그인되지 않거나 2FA·캡차가 나오면 비밀번호를 묻거나 추측하지 말고 "
+        return (autofill + CAPTCHA_CLICK + " 그래도 로그인되지 않거나 2FA·퍼즐 캡차가 나오면 비밀번호를 묻거나 추측하지 말고 "
                 f"{give_up}로 바로 끝낸다.")
     helper = shlex.join(self_command("secret-fill", str(contest.root), "<username|password>", "<@ref>",
                                      "--session", session))
-    return (autofill + "그래도 안 되면 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
+    return (autofill + CAPTCHA_CLICK + " 그래도 안 되면 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
             f"(값은 너에게 보이지 않는다): `{helper}`. 그다음 로그인 버튼을 누른다. "
-            f"2FA·캡차가 나오거나 실패하면 {give_up}로 바로 끝낸다. 비밀번호를 직접 입력하거나 출력하지 마라.")
+            f"2FA·퍼즐 캡차가 나오거나 실패하면 {give_up}로 바로 끝낸다. 비밀번호를 직접 입력하거나 출력하지 마라.")
 
 
 def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -> dict:
