@@ -902,6 +902,19 @@ def _size(path: Path) -> int:
         return -1
 
 
+# Nothing recorded and no download element: click the element showing the challenge's title (its card or list
+# entry) and say a selector for it, so the next time opens it straight away.
+REVEAL_JS = ("(()=>{const t=%s.trim().toLowerCase();if(!t)return 'none';"
+             "const c=[...document.querySelectorAll('a,button,[role=button],[data-toggle],[data-bs-toggle],[onclick],"
+             "h1,h2,h3,h4,h5,h6,.card-header,[class*=chal]')].filter(e=>(e.innerText||'').trim().toLowerCase().includes(t))"
+             ".sort((a,b)=>a.innerText.length-b.innerText.length);if(!c.length)return 'none';"
+             "const el=c[0].closest('a,button,[role=button],[data-toggle],[data-bs-toggle],[onclick]')||c[0];"
+             "const parts=[];for(let n=el;n&&n!==document.body;n=n.parentElement){if(n.id){parts.unshift('#'+CSS.escape(n.id));break}"
+             "const same=[...n.parentElement.children].filter(x=>x.tagName===n.tagName);"
+             "parts.unshift(n.tagName.toLowerCase()+(same.length>1?':nth-of-type('+(same.indexOf(n)+1)+')':''))}"
+             "el.click();return 'opener '+parts.join('>')})()")
+
+
 class DownloadWatch:
     """Browser downloads: every challenge's links are clicked one after another in the one download window without
     waiting, and one watcher follows Chrome's download folder, handing each finished file to the challenge whose link
@@ -913,9 +926,10 @@ class DownloadWatch:
         self.known: set[str] = set()
         self.sizes: dict[str, int] = {}
         self.moved_at, self.down_until, self.opened, self.thread, self.hangs = 0.0, 0.0, "", None, 0
+        self.openers: dict[str, str] = {}  # page -> the click that showed its challenge, learned this run
 
     def fetch(self, url: str, folder: Path, name: str, total: int | None, page: str,
-              opener: str = "", button: str = "") -> str | None:
+              opener: str = "", button: str = "", title: str = "") -> str | None:
         link = urlparse(url)
         name = Path(name or unquote(link.path)).name
         if link.scheme not in ("http", "https") or not name.strip("."):
@@ -928,7 +942,7 @@ class DownloadWatch:
                 self.known = set(os.listdir(downloads)) if downloads.is_dir() else set()
                 self.sizes, self.moved_at = {}, time.time()
             self.pending.append(entry)
-        if not self.click(url, name, page, opener, button):
+        if not self.click(url, name, page, opener, button, title):
             with self.lock:
                 if entry in self.pending:
                     self.pending.remove(entry)
@@ -937,7 +951,7 @@ class DownloadWatch:
         entry["done"].wait()
         return name if entry["ok"] else None
 
-    def click(self, url: str, name: str, page: str, opener: str = "", button: str = "") -> bool:
+    def click(self, url: str, name: str, page: str, opener: str = "", button: str = "", title: str = "") -> bool:
         """A real click on the challenge's own page, so the login cookies go along; returns at once. Opens the
         challenge first when it needs a click to show (a card or modal loaded on click), then clicks the download
         element itself (a JS button with no href works too), else a link made from the URL."""
@@ -948,7 +962,9 @@ class DownloadWatch:
                 "el.click();return 'clicked'})()") % (json.dumps(button), json.dumps(url), json.dumps(name))
         made = ("(()=>{const a=document.createElement('a');a.href=%s;a.download=%s;document.body.appendChild(a);"
                 "a.click();a.remove();return 'clicked'})()") % (json.dumps(url), json.dumps(name))
+        opener = opener or self.openers.get(page, "")
         open_it = "(()=>{const o=document.querySelector(%s);if(o)o.click();return 'opened '+!!o})()" % json.dumps(opener)
+        reveal = REVEAL_JS % json.dumps(title)
         def chrome(*args: str, timeout: int = 30) -> bytes:
             return subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, *args],
                                   capture_output=True, timeout=timeout).stdout or b""
@@ -964,12 +980,13 @@ class DownloadWatch:
                         self.opened = page
                     if opener:
                         chrome("eval", open_it)
-                    for _ in range(5):  # content loaded on the open click may take a moment
-                        out = chrome("eval", find)
-                        if b"clicked" in out:
-                            self.hangs = 0
+                    if self.find(chrome, find):
+                        return True
+                    if not opener and b"opener " in (out := chrome("eval", reveal)):
+                        learned = out.split(b"opener ", 1)[1].splitlines()[0].decode(errors="replace").strip()
+                        if self.find(chrome, find):
+                            self.openers[page] = learned
                             return True
-                        time.sleep(1)
                     if b"clicked" in chrome("eval", made):
                         self.hangs = 0
                         return True
@@ -979,6 +996,14 @@ class DownloadWatch:
                 except OSError:
                     return False
             return False
+
+    def find(self, chrome, find: str) -> bool:
+        for _ in range(5):  # content loaded on the open click may take a moment
+            if b"clicked" in chrome("eval", find):
+                self.hangs = 0
+                return True
+            time.sleep(1)
+        return False
 
     def start(self) -> None:
         with self.lock:
@@ -1038,8 +1063,8 @@ DOWNLOADS = DownloadWatch()
 
 
 def browser_fetch(url: str, folder: Path, name: str = "", total: int | None = None, page: str = "",
-                  opener: str = "", button: str = "") -> str | None:
-    return DOWNLOADS.fetch(url, folder, name, total, page or url, opener, button)
+                  opener: str = "", button: str = "", title: str = "") -> str | None:
+    return DOWNLOADS.fetch(url, folder, name, total, page or url, opener, button, title)
 
 def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json, fetched=()) -> dict:
     slug = chal.name
@@ -1661,9 +1686,13 @@ class Checker:
         info = info if isinstance(info, dict) else {}
         opens = info.get("open") if isinstance(info.get("open"), dict) else {}
         page = str(opens.get("url") or info.get("url") or self.contest.url)
-        return browser_fetch(str(item.get("url", "")), chal / "files", str(item.get("name") or ""),
-                             item["size"] if isinstance(item.get("size"), int) else None, page,
-                             str(opens.get("click") or ""), str(item.get("click") or ""))
+        got = browser_fetch(str(item.get("url", "")), chal / "files", str(item.get("name") or ""),
+                            item["size"] if isinstance(item.get("size"), int) else None, page,
+                            str(opens.get("click") or ""), str(item.get("click") or ""), str(info.get("name") or ""))
+        if got and not opens.get("click") and (learned := DOWNLOADS.openers.get(page)):  # found by clicking its title
+            info["open"] = {"url": page, "click": learned}
+            _write_atomic(chal / "challenge.json", json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+        return got
 
     def count_download_try(self, chal: Path, result: dict) -> None:
         reason = next((str(item.get("reason", "")) for item in result.get("failed", [])

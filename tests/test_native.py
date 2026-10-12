@@ -961,6 +961,22 @@ class CheckerFlowTests(Base):
         self.assertIn("#chall42-header", steps[1][4])  # opened by a click: its content is loaded only then
         self.assertIn("#dl-42", steps[2][4])  # the download element itself, waited for until it shows
         self.assertEqual(waited.call_count, 1)
+        none = subprocess.CompletedProcess([], 0, b"none")
+        hidden = MagicMock(side_effect=[subprocess.CompletedProcess([], 0, b""), *[none] * 5,  # nothing recorded, no link
+                                        subprocess.CompletedProcess([], 0, b"eval @ x\nopener #chall42-flag-header\n"),
+                                        subprocess.CompletedProcess([], 0, b"clicked")])
+        watch = native.DownloadWatch()
+        with patch.object(native.subprocess, "run", hidden), patch.object(native.time, "sleep"):
+            self.assertTrue(watch.click("https://ctf.example.com/download/42", "a.zip", "https://ctf.example.com/#42",
+                                        title="00ps, my WiFi disconnected"))
+        self.assertIn("00ps, my WiFi disconnected", hidden.call_args_list[6].args[0][4])  # its title was clicked
+        self.assertEqual(watch.openers, {"https://ctf.example.com/#42": "#chall42-flag-header"})
+        chal = make_challenge(self.root, "wifi")
+        (chal / "challenge.json").write_text(json.dumps({"name": "00ps", "url": "https://ctf.example.com/#42"}))
+        with patch.object(native, "DOWNLOADS", watch), patch.object(native, "browser_fetch", return_value="a.zip"):
+            self.assertEqual(self.checker().browser_get(chal, {"url": "https://ctf.example.com/download/42"}), "a.zip")
+        self.assertEqual(json.loads((chal / "challenge.json").read_text())["open"],  # remembered for the next time
+                         {"url": "https://ctf.example.com/#42", "click": "#chall42-flag-header"})
 
     def test_a_closed_chrome_is_started_again_and_said_on_the_board(self):
         make_challenge(self.root, "web-1")
