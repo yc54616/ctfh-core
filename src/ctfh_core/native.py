@@ -69,6 +69,7 @@ class Options:
     submit_effort: str | None = "low"  # submitting is a few clicks; None: same as effort
     review_effort: str | None = "medium"  # writeup review; None: same as effort
     max_parallel: int = 0  # 0: every unsolved challenge at once
+    max_instances: int = 3  # challenges that start an instance on the site, open at once; 0: no limit
     submit: bool = True
     rescan_seconds: int = 3600
     idle_seconds: int = 180
@@ -79,7 +80,7 @@ class Options:
     plain: bool = False  # text board instead of the keyboard dashboard
 
     def to_args(self) -> list[str]:
-        args = ["--codex", self.binary, "--max-parallel", str(self.max_parallel),
+        args = ["--codex", self.binary, "--max-parallel", str(self.max_parallel), "--instances", str(self.max_instances),
                 "--rescan-minutes", str(self.rescan_seconds // 60),
                 "--idle-seconds", str(self.idle_seconds), "--nudge-limit", str(self.nudge_limit),
                 "--solve-timeout", str(self.solve_timeout), "--memory-max", self.memory_max]
@@ -411,6 +412,8 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 - 사이트에서 VM/인스턴스를 켜거나 접속 정보를 읽기 전에, 열린 문제 창의 제목이 challenge.json의 name과 같은지
   먼저 확인한다. 다른 문제의 창·인스턴스·서비스면 쓰지 않고 닫은 뒤 이 문제를 다시 연다.
   받은 접속 정보는 어느 문제 창에서 얻었는지와 함께 `work/NOTES.md`에 적는다.
+- 사이트에서 인스턴스를 켰으면, 풀이를 마치거나 그만둘 때 사이트에서 그 인스턴스를 끈다. 동시에 켤 수 있는 수가
+  정해져 있어서 다른 문제가 그 자리를 기다린다.
 - 원격 서버 주소를 알면 `remote.txt`에 한 줄에 하나씩 적는다 (`host:port`, `nc host port`, URL). 주소가 바뀌면 고친다.
   서버가 닫혀 있으면 검사기가 이 주소를 지켜보다가 열리는 순간 알려 준다.
 - 문제 서비스(문제 웹앱, 문제가 쓰는 외부 서비스)에 회원가입·로그인이 필요하면 묻지 말고 직접 가입한다.
@@ -746,6 +749,21 @@ def attachment_urls(chal: Path) -> frozenset[str]:
     info = _read_json(chal / "challenge.json", {})
     items = info.get("attachments") if isinstance(info, dict) else None
     return frozenset(str(item["url"]) for item in items or [] if isinstance(item, dict) and item.get("url"))
+
+
+INSTANCE_TEXT = re.compile(r"start challenge|(launch|start|spawn|deploy) (an |the )?instance|인스턴스를 (켜|시작|생성|띄우)", re.I)
+
+
+def needs_instance(chal: Path) -> bool:
+    """Whether solving the challenge starts an instance on the site (a "Start Challenge" button and the like):
+    challenge.json says so, or else its notes do."""
+    info = _read_json(chal / "challenge.json", {})
+    if isinstance(info, dict) and isinstance(info.get("instance"), bool):
+        return info["instance"]
+    try:
+        return bool(INSTANCE_TEXT.search((chal / "challenge.md").read_text(errors="replace")))
+    except OSError:
+        return False
 
 
 def files_ready(chal: Path, status: dict) -> bool:
@@ -1192,7 +1210,8 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
    - 같은 시리즈의 다른 문제(#0 등)에만 붙은 파일을 이 문제도 쓰면 (설명이 그 파일을 가리키거나 시리즈가 같은 증거를
      나눠 쓰면) 이 문제의 attachments에도 같은 url로 적는다. 그래야 검사기가 그 파일을 받은 뒤 풀이를 시작한다.
    - 첨부 파일은 내려받지 않는다. 검사기가 따로 받으므로 목록만 attachments에 적는다.
-   인스턴스를 켜야 하는 문제는 켜지 말고 challenge.md에 그 사실과 방법만 적는다.
+   인스턴스를 켜야 하는 문제는 켜지 말고 challenge.md에 그 사실과 방법만 적고, challenge.json에 "instance": true를
+   적는다 (아니면 false. 고정 주소로 늘 열려 있는 서버는 false).
 5. flag 형식(정규식)과 제출 방법(어느 페이지의 어떤 입력창/버튼인지)을 알아낸다.
 6. 대회 규칙(Rules/FAQ/공지)을 읽고 풀이에 영향을 주는 것만 한국어로 짧게 rules에 적는다: 자동화 도구·AI 사용 제한,
    공격 허용 범위, 무차별 대입·스캐너 금지, 제출 횟수 제한, flag 공유 금지. 자동화나 AI 사용을 금지하면 맨 앞에
@@ -1530,6 +1549,10 @@ class Checker:
         limit, self.base_parallel = saved.get("max_parallel") or {}, opts.max_parallel
         if isinstance(limit, dict) and limit.get("base") == opts.max_parallel and isinstance(limit.get("live"), int):
             self.opts = replace(self.opts, max_parallel=max(0, limit["live"]))  # a live +/- outlives a restart
+        limit, self.base_instances = saved.get("max_instances") or {}, opts.max_instances
+        if isinstance(limit, dict) and limit.get("base") == opts.max_instances and isinstance(limit.get("live"), int):
+            self.opts = replace(self.opts, max_instances=max(0, limit["live"]))
+        self.instance_wait = 0  # challenges held back only by the instance limit
         self.end_handled = saved.get("end_handled")  # the end time already handled, so r after the end sticks
         self.last_view: tuple[list[str], list[dict]] = ([], [])
 
@@ -1996,6 +2019,8 @@ class Checker:
         """Start pending solvers and restart exited ones, up to max_parallel windows (0: no limit)."""
         challenges = self.contest.challenges()
         running = sum(1 for chal in challenges if window_name(chal.name) in windows)
+        instances = sum(1 for chal in challenges if window_name(chal.name) in windows
+                        and load_status(chal).get("state") not in FINISHED and needs_instance(chal))
         restart, fresh = [], []
         for chal in challenges:
             if window_name(chal.name) in windows or chal.name in self.jobs:
@@ -2015,16 +2040,21 @@ class Checker:
                     save_status(chal, status)
         if self.opts.max_parallel:  # limited slots: the most-solved (easiest) new challenges first
             fresh.sort(key=lambda item: -_solves(item[0]))
-        self.memory_wait = False
+        self.memory_wait, self.instance_wait = False, 0
         for chal, status in restart + fresh:
             if self.opts.max_parallel and running >= self.opts.max_parallel:
                 return
+            instance = bool(self.opts.max_instances) and needs_instance(chal)
+            if instance and instances >= self.opts.max_instances:  # the site lets only so many run at once:
+                self.instance_wait += 1  # the rest wait while challenges without one go ahead
+                continue
             total, available = _meminfo("MemTotal"), _meminfo("MemAvailable")
             if total and available and available < total * (1 - MEMORY_SHARE):
                 self.memory_wait = True
                 return
             self.launch(chal, status, resume=status.get("state") not in ("pending", "blocked"))
             running += 1
+            instances += instance
 
     def view(self) -> tuple[list[str], list[dict]]:
         """Head lines and one row per challenge; challenges waiting for the user come first."""
@@ -2056,7 +2086,7 @@ class Checker:
         solved = sum(row["group"] == "✓" for row in rows)
         spent = f"{total / 10000:,.0f}만" if total >= 10000 else f"{total:,}"
         head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 {spent}"
-                f"  동시 창 {self.opts.max_parallel or '전체'}",
+                f"  동시 창 {self.opts.max_parallel or '전체'}  인스턴스 {self.opts.max_instances or '무제한'}",
                 f"✓ 푼 문제 {solved}/{len(rows)}   ● 풀이 {count('solving', 'needs_fix')}"
                 f"   ◐ 검사 {count('checking')}   ↑ 제출 {count('verified', 'submitting')}"
                 f"   ⏳ 대기 {count('pending', 'hold')}   ! 확인 필요 {sum(row['group'] == '!' for row in rows)}"]
@@ -2099,6 +2129,8 @@ class Checker:
                         f" (문제 {self.list_seen[1]}개, {datetime.fromtimestamp(self.list_seen[0]):%H:%M:%S})")
         elif self.contest.site().get("collected_at") and not list_api(self.contest) and not list_page(self.contest)[0]:
             head.append(f"새 문제 감시: 목록을 읽을 방법을 못 찾아 {self.opts.rescan_seconds // 60}분마다 재수집으로만 확인")
+        if self.instance_wait:
+            head.append(f"인스턴스 한도({self.opts.max_instances}개)로 {self.instance_wait}개 대기: ] 키로 늘릴 수 있음")
         downloading = sum(k.startswith("__download_") and not f.done() for k, f in self.jobs.items())
         if downloading:
             with DOWNLOADS.lock:
@@ -2223,6 +2255,7 @@ class Checker:
         """What the checker must remember across restarts; a new --max-parallel replaces the live limit."""
         _write_atomic(self.contest.state_dir / "checker.json", json.dumps({
             "max_parallel": {"base": self.base_parallel, "live": self.opts.max_parallel},
+            "max_instances": {"base": self.base_instances, "live": self.opts.max_instances},
             "end_handled": self.end_handled}) + "\n")
 
     def set_parallel(self, delta: int) -> str:
@@ -2232,6 +2265,14 @@ class Checker:
             self.opts = replace(self.opts, max_parallel=limit)
             self.save_state()
             return f"동시 풀이 창: {limit or '전체'}" + (" (이미 열린 창은 그대로, 새 창만 제한)" if delta < 0 and limit else "")
+
+    def set_instances(self, delta: int) -> str:
+        """Change how many instance challenges may run at once; 0 means no limit. Open windows are never closed."""
+        with self.lock:
+            limit = max(0, self.opts.max_instances + delta)
+            self.opts = replace(self.opts, max_instances=limit)
+            self.save_state()
+            return f"동시 인스턴스 문제: {limit or '무제한'}" + (" (이미 열린 창은 그대로)" if delta < 0 and limit else "")
 
     def rescan_now(self) -> str:
         """Dashboard key: re-collect the site now (new challenges, solved marks); restarts the rescan timer."""

@@ -88,6 +88,8 @@ class CheckerApp(App):
         Binding("t", "sort_next", "정렬"),
         Binding("plus,equals_sign", "parallel(1)", "창 +1"),
         Binding("minus", "parallel(-1)", "창 -1"),
+        Binding("right_square_bracket", "instances(1)", "인스턴스 +1"),
+        Binding("left_square_bracket", "instances(-1)", "인스턴스 -1"),
         Binding("q", "quit", "검사기 종료"),
         Binding("ctrl+c", "quit", "검사기 종료", show=False, priority=True),
     ]
@@ -251,6 +253,13 @@ class CheckerApp(App):
     def action_parallel(self, delta: int) -> None:
         def work() -> None:
             message = self.checker.set_parallel(delta)
+            self.call_from_thread(self.notify, message)
+            self.wake.set()
+        threading.Thread(target=work, daemon=True).start()
+
+    def action_instances(self, delta: int) -> None:
+        def work() -> None:
+            message = self.checker.set_instances(delta)
             self.call_from_thread(self.notify, message)
             self.wake.set()
         threading.Thread(target=work, daemon=True).start()

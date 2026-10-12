@@ -1200,6 +1200,26 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("heap")["state"], "solving")  # the end is not handled twice
         self.assertEqual(self.checker(max_parallel=5).opts.max_parallel, 5)  # a new setting wins over the live one
 
+    def test_instance_challenges_wait_for_the_instance_limit_while_others_go_ahead(self):
+        for slug in ("vm1", "vm2", "vm3", "plain"):
+            chal = make_challenge(self.root, slug)
+            if slug != "plain":  # the collector's flag; the notes' "Start Challenge" counts as well
+                (chal / "challenge.md").write_text("문제 카드의 `Start Challenge` 버튼을 눌러 인스턴스를 켠다.\n")
+        (self.root / "challenges" / "vm3" / "challenge.json").write_text(json.dumps({"name": "vm3", "instance": True}))
+        checker = self.checker(max_instances=2)
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"vm1", "vm2", "plain"})
+        self.assertIn("인스턴스 2", checker.board())
+        self.assertTrue(any("인스턴스 한도(2개)로 1개 대기" in line for line in checker.view()[0]))
+        native.mark_done(self.root, ["vm1"])  # solved: its instance no longer counts
+        checker.tick()
+        self.assertIn("vm3", checker.tmux.windows())
+        self.assertEqual(checker.set_instances(-2), "동시 인스턴스 문제: 무제한")
+        self.assertEqual(self.checker(max_instances=2).opts.max_instances, 0)  # the live setting outlives a restart
+        self.assertEqual(self.checker(max_instances=4).opts.max_instances, 4)  # a new setting wins over it
+        self.assertIn("--instances", native.Options().to_args())
+        self.assertEqual(native.Options().max_instances, 3)
+
     def test_limited_slots_open_easiest_first_and_limit_changes_live(self):
         for slug, solves in (("hard", 5), ("easy", 50), ("unknown", None)):
             chal = make_challenge(self.root, slug)

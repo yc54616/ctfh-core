@@ -410,6 +410,7 @@ def _native_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--thinking", "--reasoning-effort", dest="reasoning_effort", choices=ctfh_native.EFFORTS,
                         help="Codex 추론 강도 (생략하면 계정 기본값)")
     parser.add_argument("--max-parallel", type=int, help="동시에 여는 풀이 창 수 (기본 0: 전체 문제)")
+    parser.add_argument("--instances", type=int, help="사이트에서 인스턴스를 켜는 문제를 동시에 여는 수 (기본 3, 0: 무제한)")
     parser.add_argument("--no-submit", action="store_true", help="flag 자동 제출 끔 (검증·writeup 검토만)")
     parser.add_argument("--plain", action="store_true", help="검사기 화면을 키 조작 없는 텍스트 표로 표시")
     parser.add_argument("--rescan-model",
@@ -446,6 +447,7 @@ def _native_settings(args) -> ctfh_native.Options:
         submit_effort=None if (submit_effort := pick("submit_thinking", "submit_thinking", "low")) == "same" else submit_effort,
         review_effort=None if (review_effort := pick("review_thinking", "review_thinking", "medium")) == "same" else review_effort,
         max_parallel=max(0, int(pick("max_parallel", "max_parallel", 0))),
+        max_instances=max(0, int(pick("instances", "max_instances", 3))),
         submit=not args.no_submit and bool(config.get("submit", True)),
         plain=args.plain or bool(config.get("plain", False)),
         rescan_seconds=max(0, int(rescan)) * 60, idle_seconds=int(pick("idle_seconds", "idle_seconds", 180)),
