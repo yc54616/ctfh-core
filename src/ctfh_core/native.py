@@ -969,8 +969,8 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
    사이트나 challenge.json에 크기가 있으면 맞는지 대조한다. 크기가 없으면 다운로드가 오류 없이 끝났고 파일이 비어 있지
    않을 때 다 받은 것으로 본다 (크기를 확인할 수 없다는 이유로 멈추지 마라). 덜 받았거나 빈 파일이면 만들지 마라.
 3. {CAPTCHA_CLICK}
-   받지 못했으면 failed에 이유와 함께 적는다. 로그인이 풀렸거나 2FA·퍼즐 캡차가 나오면 비밀번호를 묻거나 추측하지 말고
-   failed로 적고 끝낸다.
+   로그인되어 있지 않으면 {login_steps(contest, session, "failed")}
+   받지 못했으면 failed에 이유와 함께 적는다.
 최종 응답은 주어진 스키마의 JSON으로만 한다."""
     work = chal / ".ctfh-check"
     work.mkdir(parents=True, exist_ok=True)
@@ -1341,6 +1341,7 @@ class Checker:
         self.last_solved_poll = 0.0
         self.list_probe = site_list
         self.chrome_note, self.last_chrome_check = "", 0.0
+        self.download_lock = threading.Lock()  # one browser download run at a time: the first logs in for the rest
         self.last_list_poll = 0.0
         self.list_seen: tuple[float, int] | None = None  # when the list was last read, and how many it had
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
@@ -1527,6 +1528,7 @@ class Checker:
         try:
             info = _read_json(chal / "challenge.json", {})
             attachments = [item for item in (info.get("attachments") or []) if isinstance(item, dict)]
+            left = []
             for item in attachments:  # the checker tries each itself first; the browser gets only what is left
                 url = str(item.get("url", ""))
                 if DRIVE_FILE.search(url):
@@ -1535,11 +1537,20 @@ class Checker:
                     except (OSError, RuntimeError) as exc:
                         result = {"downloaded": [], "failed": [{"slug": chal.name, "reason": f"Google Drive: {exc}"}]}
                         return
-                elif got := (direct_fetch(url, chal / "files", str(item.get("name") or ""))
-                             or browser_fetch(url, chal / "files", str(item.get("name") or ""),
-                                              item["size"] if isinstance(item.get("size"), int) else None)):
+                elif got := direct_fetch(url, chal / "files", str(item.get("name") or "")) or self.browser_get(chal, item):
                     fetched.append(got)
-            if attachments and len(fetched) == len(attachments):
+                else:
+                    left.append(item)
+            if left or not attachments:
+                with self.download_lock:
+                    for item in list(left):  # a run before this one may have logged in meanwhile
+                        if got := self.browser_get(chal, item):
+                            fetched.append(got)
+                            left.remove(item)
+                    if left or not attachments:
+                        result = download(self.contest, opts, chal, session, self.runner, fetched)
+                        return
+            if attachments:
                 (chal / "files" / FILES_DONE).touch()
                 result = {"downloaded": [chal.name], "failed": []}
                 return
@@ -1547,6 +1558,11 @@ class Checker:
         finally:  # a crashed or timed-out run counts as a try too
             close_browser(session)
             self.count_download_try(chal, result)
+
+    @staticmethod
+    def browser_get(chal: Path, item: dict) -> str | None:
+        return browser_fetch(str(item.get("url", "")), chal / "files", str(item.get("name") or ""),
+                             item["size"] if isinstance(item.get("size"), int) else None)
 
     def count_download_try(self, chal: Path, result: dict) -> None:
         reason = next((str(item.get("reason", "")) for item in result.get("failed", [])

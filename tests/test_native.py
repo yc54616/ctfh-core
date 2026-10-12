@@ -882,6 +882,10 @@ class CheckerFlowTests(Base):
             self.assertEqual(sorted(p.name for p in (chal / "files").iterdir()), ["Memory1.mans"])
             self.assertEqual(len(runner.calls), 1)  # only the login-walled file goes to the browser run
             self.assertIn("다시 받지 마라: Memory1.mans", runner.calls[0][2])
+            self.assertIn("로그인되어 있지 않으면 로그인 페이지를 열고", runner.calls[0][2])  # the download run logs in
+            with patch.object(native, "browser_fetch", side_effect=[None, "notes.txt"]):  # logged in by then
+                checker.job_download(chal)
+            self.assertEqual(len(runner.calls), 1)  # the retry got it: no second Codex run
             (chal / "challenge.json").write_text(json.dumps({"name": "mem", "attachments": [
                 {"name": "../../evil", "url": "https://ctf.example.com/files/ab/x?token=t"}]}))
             checker.job_download(chal)
