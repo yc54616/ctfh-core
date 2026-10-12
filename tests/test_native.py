@@ -1225,6 +1225,32 @@ class CheckerFlowTests(Base):
         self.assertIn("--instances", native.Options().to_args())
         self.assertEqual(native.Options().max_instances, 3)
 
+    def test_a_picked_instance_challenge_makes_the_lowest_unpicked_one_yield(self):
+        for slug, solves in (("easy", 50), ("hard", 5), ("mine", 1)):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({"name": slug, "instance": True, "solves": solves}))
+        checker = self.checker(max_instances=2)
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"easy", "hard"})  # the easiest first
+        self.assertEqual(next(row for row in checker.view()[1] if row["name"] == "mine")["queue"], "대기 1")
+        make_challenge(self.root, "plain")
+        self.assertIn("인스턴스 문제가 아닙니다", checker.refusal("pick", "plain"))
+        self.assertIn("우선 지정했습니다", checker.act("pick", "mine"))
+        checker.tick()
+        self.assertTrue(self.status("hard").get("yielding"))  # the lowest unpicked one is asked to make room
+        self.assertFalse(self.status("easy").get("yielding"))
+        self.assertTrue(any(name == "hard" and "인스턴스를 끈 뒤" in text for name, text in checker.tmux.sent))
+        checker.tick()
+        self.assertEqual(sum("인스턴스를 끈 뒤" in text for _, text in checker.tmux.sent), 1)  # asked once
+        status = self.status("hard")
+        status["yielding"] -= native.YIELD_SECONDS + 1
+        native.save_status(self.root / "challenges" / "hard", status)
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"easy", "mine", "plain"})  # plain: no instance, no limit
+        self.assertTrue(self.status("hard").get("queued"))
+        self.assertEqual(self.status("hard").get("nudges", 0), 0)
+        self.assertIn("우선 지정을 풀었습니다", checker.act("pick", "mine"))
+
     def test_limited_slots_open_easiest_first_and_limit_changes_live(self):
         for slug, solves in (("hard", 5), ("easy", 50), ("unknown", None)):
             chal = make_challenge(self.root, slug)
@@ -1325,7 +1351,7 @@ class CheckerFlowTests(Base):
                     table = app.query_one(DataTable)
                     checker.last_view = checker.view()
                     app.show(checker.last_view)
-                    self.assertEqual(table.get_row_at(0)[3].plain, "◆")  # found from the notes, marked from the start
+                    self.assertEqual(table.get_row_at(0)[3].plain, "대기 1")  # found from the notes, queued from the start
                     await pilot.press("space")
                     self.assertIsInstance(app.screen, MenuScreen)
                     menu = app.screen.query_one("#menu")
@@ -1333,7 +1359,7 @@ class CheckerFlowTests(Base):
                     await pilot.press("enter")
                     await pilot.pause(0.1)
                     self.assertIsInstance(app.screen, NotesScreen)
-                    await pilot.press("escape", "m", "i")  # straight from the menu by its key
+                    await pilot.press("escape", "m", "I")  # straight from the menu by its key
                     for _ in range(30):
                         await pilot.pause(0.05)
                         if not native.needs_instance(chal):

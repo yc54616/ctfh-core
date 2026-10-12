@@ -24,7 +24,8 @@ STYLES = {"needs_user": "bold red", "manual": "bold yellow", "hold": "blue", "un
 COLUMNS = [("group", ""), ("name", "문제"), ("category", "분류"), ("instance", "인스턴스"), ("label", "상태"), ("tokens", "토큰"),
            ("elapsed", "시간"), ("activity", "활동"), ("reason", "메모")]
 SORT_KEYS = {"name": lambda row: row["name"], "category": lambda row: (row["category"], row["name"]),
-             "instance": lambda row: (not row.get("instance"), row["name"]),
+             "instance": lambda row: (not row.get("instance"), not row["queue"].startswith("실행"),
+                                      int(row["queue"].split()[-1]) if row["queue"].startswith("대기") else 0, row["name"]),
              "label": lambda row: (row["label"], row["name"]), "tokens": lambda row: row["tokens_n"],
              "elapsed": lambda row: row["elapsed_n"],
              "activity": lambda row: (row["activity"] == "", row["activity"]),
@@ -78,13 +79,16 @@ ACTIONS = [("jump", "enter", "창으로 이동", "이 문제의 풀이 창(tmux)
            ("notes", "o", "노트 보기", "work/NOTES.md를 읽는다"),
            ("nudge", "n", "재촉", "풀이 창에 계속하라고 알린다"),
            ("restart", "r", "다시 열기", "닫힌 풀이 창을 다시 연다 (보류·직접 확인도 재개)"),
-           ("instance", "i", "인스턴스 지정/해제", "인스턴스 한도를 따르는 문제인지 바꾼다"),
+           ("pick", "i", "인스턴스 우선 지정/해제", "인스턴스 큐 맨 앞으로 (한도가 차 있으면 하나를 쉬게 하고 연다)"),
+           ("instance", "I", "인스턴스 문제 맞음/아님", "자동 판단이 틀렸을 때 고친다"),
            ("hold", "p", "보류", "풀이 창을 닫고 멈춘다 (r로 재개)"),
            ("done", "d", "해결 표시", "팀원이 풀었다고 표시하고 창을 닫는다")]
 HELP = """표
   ↑/↓  문제 고르기        Enter  풀이 창으로 이동     Space/m  문제 메뉴
   o    노트 보기          n  재촉     r  다시 열기     p  보류     d  해결 표시
-  i    인스턴스 문제로 지정/해제
+  i    인스턴스 우선 지정/해제: 큐 맨 앞으로. 한도가 차 있으면 지정 안 된 문제 하나가
+       노트를 적고 인스턴스를 끈 뒤 2분 안에 쉬고, 자리가 나면 이어서 연다
+  I    인스턴스 문제 맞음/아님 (자동 판단이 틀렸을 때)
   t    정렬 바꾸기 (머리글을 눌러도 됨)
 
 전체
@@ -204,7 +208,8 @@ class CheckerApp(App):
         Binding("r", "restart", "다시 열기", show=False),
         Binding("d", "done", "해결 표시", show=False),
         Binding("p", "hold", "보류", show=False),
-        Binding("i", "instance", "인스턴스 지정", show=False),
+        Binding("i", "pick", "인스턴스 우선 지정", show=False),
+        Binding("I", "instance", "인스턴스 문제 맞음/아님", show=False),
         Binding("plus,equals_sign", "parallel(1)", "창 +1", show=False),
         Binding("minus", "parallel(-1)", "창 -1", show=False),
         Binding("right_square_bracket", "instances(1)", "인스턴스 +1", show=False),
@@ -270,7 +275,8 @@ class CheckerApp(App):
             finished = row["group"] == "✓"
             table.add_row(Text(row["group"], style=style), Text(row["name"], style=style + (" dim" if finished else "")),
                           Text(row["category"], style="dim"),
-                          Text("◆" if row.get("instance") else "", justify="center", style="cyan"),
+                          Text(("★" if row.get("picked") else "") + row.get("queue", ""), justify="center",
+                               style="bold cyan" if row.get("picked") else "cyan"),
                           Text(row["label"], style=style),
                           Text(row["tokens"], justify="right", style="dim" if finished else ""),
                           Text(row["elapsed"], justify="right", style="dim" if finished else ""),
@@ -320,7 +326,8 @@ class CheckerApp(App):
         text = Text()
         if row:
             text.append(f"{row['name']}", style="bold")
-            text.append(f"  {row['category'] or '-'}{' · 인스턴스 문제' if row.get('instance') else ''} · {row['label']}"
+            queue = f" · 인스턴스 {'우선 ' if row.get('picked') else ''}{row.get('queue', '')}" if row.get("instance") else ""
+            text.append(f"  {row['category'] or '-'}{queue} · {row['label']}"
                         f" · 토큰 {row['tokens']} · 시간 {row['elapsed']}\n", style="dim")
             if row["activity"]:
                 text.append(f"활동: {row['activity']}\n")
@@ -347,7 +354,7 @@ class CheckerApp(App):
         name = self.selected()
         if name is None:
             return
-        refusals = {action: self.checker.refusal(action, name) for action in ("nudge", "restart", "done", "hold", "instance")}
+        refusals = {action: self.checker.refusal(action, name) for action in ("nudge", "restart", "done", "hold", "instance", "pick")}
         if window_name(name) not in self.checker.tmux.windows():
             refusals["jump"] = "열린 풀이 창이 없음 (다시 열기로 연다)"
         self.push_screen(MenuScreen(name, refusals), lambda action: self.run_menu(action, name))
@@ -372,6 +379,9 @@ class CheckerApp(App):
 
     def action_instance(self) -> None:
         self.request("instance")
+
+    def action_pick(self) -> None:
+        self.request("pick")
 
     def action_restart(self) -> None:
         self.request("restart")

@@ -770,6 +770,23 @@ def needs_instance(chal: Path) -> bool:
         return False
 
 
+YIELD_SECONDS = 120  # a solver asked to make room gets this long to save its notes and turn its instance off
+
+
+def instance_pick(chal: Path) -> float | None:
+    """When the user put this instance challenge at the front of the queue; None when not."""
+    try:
+        return float((chal / ".instance-pick").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def instance_rank(chal: Path) -> tuple:
+    """Place in the instance queue: the user's picks in the order picked, then the most-solved (easiest) first."""
+    picked = instance_pick(chal)
+    return (0, picked, "") if picked is not None else (1, -_solves(chal), chal.name)
+
+
 def files_ready(chal: Path, status: dict) -> bool:
     """Attachments are in, or there are none to wait for (folders collected before attachment lists count as ready)."""
     info = _read_json(chal / "challenge.json", {})
@@ -2022,9 +2039,19 @@ class Checker:
     def fill_slots(self, windows: set[str]) -> None:
         """Start pending solvers and restart exited ones, up to max_parallel windows (0: no limit)."""
         challenges = self.contest.challenges()
+        for chal in challenges:  # a solver asked to make room has had its time: close it, it comes back from the queue
+            status = load_status(chal)
+            if status.get("yielding") and (window_name(chal.name) not in windows
+                                           or time.time() - status["yielding"] > YIELD_SECONDS):
+                self.close(chal)
+                windows.discard(window_name(chal.name))
+                status.pop("yielding", None)
+                status["queued"] = True
+                save_status(chal, status)
         running = sum(1 for chal in challenges if window_name(chal.name) in windows)
-        instances = sum(1 for chal in challenges if window_name(chal.name) in windows
-                        and load_status(chal).get("state") not in FINISHED and needs_instance(chal))
+        live = [chal for chal in challenges if window_name(chal.name) in windows
+                and load_status(chal).get("state") not in FINISHED and needs_instance(chal)]
+        instances = len(live)
         restart, fresh = [], []
         for chal in challenges:
             if window_name(chal.name) in windows or chal.name in self.jobs:
@@ -2044,8 +2071,23 @@ class Checker:
                     save_status(chal, status)
         if self.opts.max_parallel:  # limited slots: the most-solved (easiest) new challenges first
             fresh.sort(key=lambda item: -_solves(item[0]))
+        items = restart + fresh
+        queue = iter(sorted((item for item in items if needs_instance(item[0])), key=lambda item: instance_rank(item[0])))
+        items = [next(queue) if needs_instance(item[0]) else item for item in items]  # instance ones in queue order
+        if self.opts.max_instances:  # a picked challenge waiting on a full limit: the lowest unpicked one makes room
+            waiting = sum(1 for chal, _ in items if instance_pick(chal) is not None) \
+                - max(0, self.opts.max_instances - instances)
+            waiting -= sum(1 for chal in live if load_status(chal).get("yielding"))
+            for chal in sorted((c for c in live if instance_pick(c) is None and not load_status(c).get("yielding")),
+                               key=instance_rank, reverse=True)[:max(0, waiting)]:
+                status = load_status(chal)
+                status["yielding"] = time.time()
+                save_status(chal, status)
+                self.tell(chal, "사용자가 다른 인스턴스 문제를 먼저 풀도록 지정해서 이 문제는 잠시 쉰다. 지금까지 한 것과 다음에 "
+                                "할 일을 work/NOTES.md에 적고, 사이트에서 이 문제의 인스턴스를 끈 뒤 멈춰라. "
+                                f"{YIELD_SECONDS // 60}분 뒤 창이 닫히고, 자리가 나면 이어서 연다.")
         self.memory_wait, self.instance_wait = False, 0
-        for chal, status in restart + fresh:
+        for chal, status in items:
             if self.opts.max_parallel and running >= self.opts.max_parallel:
                 return
             instance = bool(self.opts.max_instances) and needs_instance(chal)
@@ -2056,7 +2098,8 @@ class Checker:
             if total and available and available < total * (1 - MEMORY_SHARE):
                 self.memory_wait = True
                 return
-            self.launch(chal, status, resume=status.get("state") not in ("pending", "blocked"))
+            queued = bool(status.pop("queued", None))  # made room for a picked one: not a failure, no nudge used
+            self.launch(chal, status, resume=status.get("state") not in ("pending", "blocked"), count=not queued)
             running += 1
             instances += instance
 
@@ -2064,6 +2107,10 @@ class Checker:
         """Head lines and one row per challenge; challenges waiting for the user come first."""
         rows, total = [], 0
         windows = self.tmux.windows()
+        waiting = sorted((chal for chal in self.contest.challenges() if needs_instance(chal)
+                          and window_name(chal.name) not in windows and load_status(chal).get("state") not in FINISHED),
+                         key=instance_rank)
+        place = {chal.name: i + 1 for i, chal in enumerate(waiting)}
         for chal in self.contest.challenges():
             status = load_status(chal)
             tokens = self.tokens.get(chal.name)
@@ -2082,7 +2129,9 @@ class Checker:
                          "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
                          "tokens_n": tokens or 0, "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
                          "activity": "" if activity == "-" else activity, "reason": reason,
-                         "instance": needs_instance(chal)})
+                         "instance": needs_instance(chal), "picked": instance_pick(chal) is not None,
+                         "queue": "" if not needs_instance(chal) else "실행" if window_name(chal.name) in windows
+                         and state not in FINISHED else f"대기 {place[chal.name]}" if chal.name in place else "◆"})
         group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
         rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name
         manual = [row["name"] for row in rows if row["state"] == "manual"]
@@ -2147,7 +2196,7 @@ class Checker:
         head, rows = self.last_view = self.view()
         lines = [f"   {'문제':<28} {'상태':<10} {'토큰':>8} {'시간':>9}  {'활동':<24} 메모"]
         lines += [f"{row['group']}  {row['name'][:28]:<28} {row['label']:<10} {row['tokens']:>8} {row['elapsed']:>9}  "
-                  f"{row['activity']:<24} {('인스턴스 · ' if row['instance'] else '') + row['reason'][:60]}" for row in rows]
+                  f"{row['activity']:<24} {(f"인스턴스 {'★' if row['picked'] else ''}{row['queue']} · " if row['instance'] else '') + row['reason'][:60]}" for row in rows]
         return "\n".join(head + lines) + "\n"
 
     def act(self, action: str, name: str) -> str:
@@ -2163,6 +2212,12 @@ class Checker:
             chal = self.contest.challenges_dir / name
             status = load_status(chal)
             state = status.get("state", "pending")
+            if action == "pick":
+                if instance_pick(chal) is not None:
+                    (chal / ".instance-pick").unlink(missing_ok=True)
+                    return f"{name}: 인스턴스 우선 지정을 풀었습니다. 쉬운 순서로 돌아갑니다."
+                (chal / ".instance-pick").write_text(f"{time.time()}\n")
+                return f"{name}: 인스턴스 우선 지정했습니다. 한도가 차 있으면 지정 안 된 문제 하나를 쉬게 하고 엽니다."
             if action == "instance":
                 instance = not needs_instance(chal)
                 (chal / ".instance").write_text("yes\n" if instance else "no\n")
@@ -2200,6 +2255,11 @@ class Checker:
             return f"{name}: 문제 폴더가 없습니다."
         if action == "instance":  # only how it is scheduled: fine in any state
             return None
+        if action == "pick":
+            if not needs_instance(chal):
+                return f"{name}: 인스턴스 문제가 아닙니다 (I로 인스턴스 문제로 바꿀 수 있음)."
+            state = load_status(chal).get("state", "pending")
+            return f"{name}: 이미 끝난 문제입니다 ({state})." if state in FINISHED else None
         if name in self.jobs and not self.jobs[name].done():
             return f"{name}: 검사·제출 작업 중입니다. 끝난 뒤 다시 시도하세요."
         state = load_status(chal).get("state", "pending")
