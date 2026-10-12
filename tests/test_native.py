@@ -1214,7 +1214,7 @@ class CheckerFlowTests(Base):
         native.mark_done(self.root, ["vm1"])  # solved: its instance no longer counts
         checker.tick()
         self.assertIn("vm3", checker.tmux.windows())
-        self.assertIn("인스턴스 · ", next(row for row in checker.view()[1] if row["name"] == "vm2")["reason"])
+        self.assertTrue(next(row for row in checker.view()[1] if row["name"] == "vm2")["instance"])
         self.assertIn("인스턴스 문제에서 뺐습니다", checker.act("instance", "vm2"))  # the user's call wins over the notes
         self.assertFalse(native.needs_instance(self.root / "challenges" / "vm2"))
         self.assertIn("인스턴스 문제로 지정했습니다", checker.act("instance", "plain"))
@@ -1308,6 +1308,50 @@ class CheckerFlowTests(Base):
                     click()  # third click: back to the board's own order
                     await pilot.pause(0.1)
                     self.assertEqual((names(), app.sort, str(table.columns["tokens"].label)), (["zzz", "aaa"], None, "토큰"))
+
+        asyncio.run(drive())
+
+    def test_dashboard_menu_settings_and_instance_column(self):
+        from textual.widgets import DataTable
+        from ctfh_core.native_tui import CheckerApp, MenuScreen, NotesScreen, SettingsScreen
+        chal = make_challenge(self.root, "vm")
+        (chal / "challenge.md").write_text("문제 카드의 `Start Challenge` 버튼을 누른다.\n")
+        checker = self.checker(max_parallel=2)
+
+        async def drive():
+            with patch.object(CheckerApp, "loop", lambda app: None):
+                app = CheckerApp(checker)
+                async with app.run_test(size=(140, 30)) as pilot:
+                    table = app.query_one(DataTable)
+                    checker.last_view = checker.view()
+                    app.show(checker.last_view)
+                    self.assertEqual(table.get_row_at(0)[3].plain, "◆")  # found from the notes, marked from the start
+                    await pilot.press("space")
+                    self.assertIsInstance(app.screen, MenuScreen)
+                    menu = app.screen.query_one("#menu")
+                    self.assertEqual(menu.highlighted_option.id, "notes")  # no window yet: "go to the window" is greyed out
+                    await pilot.press("enter")
+                    await pilot.pause(0.1)
+                    self.assertIsInstance(app.screen, NotesScreen)
+                    await pilot.press("escape", "m", "i")  # straight from the menu by its key
+                    for _ in range(30):
+                        await pilot.pause(0.05)
+                        if not native.needs_instance(chal):
+                            break
+                    self.assertFalse(native.needs_instance(chal))
+                    self.assertNotIsInstance(app.screen, MenuScreen)
+                    await pilot.press("c")
+                    self.assertIsInstance(app.screen, SettingsScreen)
+                    await pilot.press("right")  # the first setting: solver windows
+                    await pilot.press("down", "left", "left")  # then instances: 3 → 1
+                    for _ in range(30):
+                        await pilot.pause(0.05)
+                        if checker.opts.max_instances == 1 and checker.opts.max_parallel == 3:
+                            break
+                    self.assertEqual((checker.opts.max_parallel, checker.opts.max_instances), (3, 1))
+                    self.assertIn("◀ 1 ▶", str(app.screen.query_one("#settings").get_option_at_index(1).prompt))
+                    await pilot.press("escape", "question_mark")
+                    self.assertIsInstance(app.screen, NotesScreen)
 
         asyncio.run(drive())
 

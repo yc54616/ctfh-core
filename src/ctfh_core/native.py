@@ -2081,8 +2081,8 @@ class Checker:
                          "label": STATE_LABELS.get(state, state),
                          "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
                          "tokens_n": tokens or 0, "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
-                         "activity": "" if activity == "-" else activity,
-                         "reason": f"인스턴스 · {reason}" if needs_instance(chal) else reason})
+                         "activity": "" if activity == "-" else activity, "reason": reason,
+                         "instance": needs_instance(chal)})
         group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
         rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name
         manual = [row["name"] for row in rows if row["state"] == "manual"]
@@ -2147,7 +2147,7 @@ class Checker:
         head, rows = self.last_view = self.view()
         lines = [f"   {'문제':<28} {'상태':<10} {'토큰':>8} {'시간':>9}  {'활동':<24} 메모"]
         lines += [f"{row['group']}  {row['name'][:28]:<28} {row['label']:<10} {row['tokens']:>8} {row['elapsed']:>9}  "
-                  f"{row['activity']:<24} {row['reason'][:60]}" for row in rows]
+                  f"{row['activity']:<24} {('인스턴스 · ' if row['instance'] else '') + row['reason'][:60]}" for row in rows]
         return "\n".join(head + lines) + "\n"
 
     def act(self, action: str, name: str) -> str:
