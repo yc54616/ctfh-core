@@ -951,6 +951,16 @@ class CheckerFlowTests(Base):
                                           subprocess.CompletedProcess([], 0, b""), subprocess.CompletedProcess([], 0, b"clicked")])
         with patch.object(native.subprocess, "run", starting), patch.object(native.time, "sleep"):
             self.assertTrue(native.DownloadWatch().click("https://ctf.example.com/download/1", "a.zip", "https://ctf.example.com/"))
+        card = MagicMock(side_effect=[subprocess.CompletedProcess([], 0, b""), subprocess.CompletedProcess([], 0, b"opened true"),
+                                      subprocess.CompletedProcess([], 0, b"none"), subprocess.CompletedProcess([], 0, b"clicked")])
+        with patch.object(native.subprocess, "run", card), patch.object(native.time, "sleep") as waited:
+            self.assertTrue(native.DownloadWatch().click("https://ctf.example.com/download/42", "a.zip",
+                                                         "https://ctf.example.com/dashboard#42", "#chall42-header", "#dl-42"))
+        steps = [c.args[0] for c in card.call_args_list]
+        self.assertEqual(steps[0][3:], ["open", "https://ctf.example.com/dashboard#42"])  # the challenge's own page
+        self.assertIn("#chall42-header", steps[1][4])  # opened by a click: its content is loaded only then
+        self.assertIn("#dl-42", steps[2][4])  # the download element itself, waited for until it shows
+        self.assertEqual(waited.call_count, 1)
 
     def test_a_closed_chrome_is_started_again_and_said_on_the_board(self):
         make_challenge(self.root, "web-1")

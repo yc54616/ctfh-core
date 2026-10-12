@@ -912,9 +912,10 @@ class DownloadWatch:
         self.pending: list[dict] = []
         self.known: set[str] = set()
         self.sizes: dict[str, int] = {}
-        self.moved_at, self.down_until, self.opened, self.thread, self.hangs = 0.0, 0.0, False, None, 0
+        self.moved_at, self.down_until, self.opened, self.thread, self.hangs = 0.0, 0.0, "", None, 0
 
-    def fetch(self, url: str, folder: Path, name: str, total: int | None, page: str) -> str | None:
+    def fetch(self, url: str, folder: Path, name: str, total: int | None, page: str,
+              opener: str = "", button: str = "") -> str | None:
         link = urlparse(url)
         name = Path(name or unquote(link.path)).name
         if link.scheme not in ("http", "https") or not name.strip("."):
@@ -927,7 +928,7 @@ class DownloadWatch:
                 self.known = set(os.listdir(downloads)) if downloads.is_dir() else set()
                 self.sizes, self.moved_at = {}, time.time()
             self.pending.append(entry)
-        if not self.click(url, name, page):
+        if not self.click(url, name, page, opener, button):
             with self.lock:
                 if entry in self.pending:
                     self.pending.remove(entry)
@@ -936,10 +937,21 @@ class DownloadWatch:
         entry["done"].wait()
         return name if entry["ok"] else None
 
-    def click(self, url: str, name: str, page: str) -> bool:
-        """A real link click on a page of the site, so the login cookies go along; returns at once."""
-        script = ("(()=>{const a=document.createElement('a');a.href=%s;a.download=%s;document.body.appendChild(a);"
-                  "a.click();a.remove();return 'clicked'})()") % (json.dumps(url), json.dumps(name))
+    def click(self, url: str, name: str, page: str, opener: str = "", button: str = "") -> bool:
+        """A real click on the challenge's own page, so the login cookies go along; returns at once. Opens the
+        challenge first when it needs a click to show (a card or modal loaded on click), then clicks the download
+        element itself (a JS button with no href works too), else a link made from the URL."""
+        find = ("(()=>{const sel=%s,want=%s,name=%s;let el=sel&&document.querySelector(sel);"
+                "el=el||[...document.querySelectorAll('a[href]')].find(a=>a.href===want)"
+                "||[...document.querySelectorAll('a,button')].find(a=>a.innerText.trim()===name);"
+                "if(!el)return 'none';if(el.tagName==='A'&&el.href)el.setAttribute('download',name);"
+                "el.click();return 'clicked'})()") % (json.dumps(button), json.dumps(url), json.dumps(name))
+        made = ("(()=>{const a=document.createElement('a');a.href=%s;a.download=%s;document.body.appendChild(a);"
+                "a.click();a.remove();return 'clicked'})()") % (json.dumps(url), json.dumps(name))
+        open_it = "(()=>{const o=document.querySelector(%s);if(o)o.click();return 'opened '+!!o})()" % json.dumps(opener)
+        def chrome(*args: str, timeout: int = 30) -> bytes:
+            return subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, *args],
+                                  capture_output=True, timeout=timeout).stdout or b""
         with self.click_lock:
             for attempt in range(3):
                 if self.hangs >= 3 and time.time() < self.down_until:  # hung again and again: skip it for a while
@@ -947,13 +959,18 @@ class DownloadWatch:
                 if (wait := self.down_until - time.time()) > 0:  # a hang just now (often a Chrome that just started):
                     time.sleep(wait)  # wait it out, since a Codex download would need the same Chrome
                 try:
-                    if not self.opened or attempt:
-                        subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "open", page],
-                                       capture_output=True, timeout=60)
-                        self.opened = True
-                    out = subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "eval", script],
-                                         capture_output=True, timeout=30)
-                    if b"clicked" in (out.stdout or b""):
+                    if self.opened != page or attempt:
+                        chrome("open", page, timeout=60)
+                        self.opened = page
+                    if opener:
+                        chrome("eval", open_it)
+                    for _ in range(5):  # content loaded on the open click may take a moment
+                        out = chrome("eval", find)
+                        if b"clicked" in out:
+                            self.hangs = 0
+                            return True
+                        time.sleep(1)
+                    if b"clicked" in chrome("eval", made):
                         self.hangs = 0
                         return True
                 except subprocess.TimeoutExpired:
@@ -1020,8 +1037,9 @@ class DownloadWatch:
 DOWNLOADS = DownloadWatch()
 
 
-def browser_fetch(url: str, folder: Path, name: str = "", total: int | None = None, page: str = "") -> str | None:
-    return DOWNLOADS.fetch(url, folder, name, total, page or url)
+def browser_fetch(url: str, folder: Path, name: str = "", total: int | None = None, page: str = "",
+                  opener: str = "", button: str = "") -> str | None:
+    return DOWNLOADS.fetch(url, folder, name, total, page or url, opener, button)
 
 def download(contest: Contest, opts: Options, chal: Path, session: str, runner=run_codex_json, fetched=()) -> dict:
     slug = chal.name
@@ -1086,8 +1104,10 @@ def collect(contest: Contest, opts: Options, runner=run_codex_json, show=None) -
    - challenge.md: 제목, 카테고리, 점수, 설명 원문, 접속 정보(nc/URL), 첨부 목록, 문제 페이지 URL,
      그리고 이 문제 창만 정확히 여는 방법(고유 링크, 또는 카드의 고유 CSS 선택자/data 속성)
    - challenge.json: {{"id": 사이트 id, "name", "category", "points", "solves": 푼 팀 수 (모르면 null), "url": 문제 페이지,
-     "solved": 내 계정 기준 해결 여부, "attachments": [{{"name", "url", "size": 사이트에 보이는 크기 (모르면 null)}}]
-     (첨부가 없으면 [])}}
+     "solved": 내 계정 기준 해결 여부, "attachments": [{{"name", "url", "size": 사이트에 보이는 크기 (모르면 null),
+     "click": 다운로드를 시작하는 그 요소의 고유 CSS 선택자 (모르면 "")}}] (첨부가 없으면 []),
+     "open": {{"url": 이 문제를 띄우는 페이지, "click": 그 페이지에서 문제 카드·모달을 펼치려고 눌러야 하는 요소의 고유 CSS
+     선택자 (주소만으로 열리면 "")}}}}. 문제 내용이 클릭해야 불러와지는 사이트면 실제로 눌러서 열고 확인한 선택자를 적는다.
    - 같은 시리즈의 다른 문제(#0 등)에만 붙은 파일을 이 문제도 쓰면 (설명이 그 파일을 가리키거나 시리즈가 같은 증거를
      나눠 쓰면) 이 문제의 attachments에도 같은 url로 적는다. 그래야 검사기가 그 파일을 받은 뒤 풀이를 시작한다.
    - 첨부 파일은 내려받지 않는다. 검사기가 따로 받으므로 목록만 attachments에 적는다.
@@ -1637,8 +1657,13 @@ class Checker:
             self.count_download_try(chal, result)
 
     def browser_get(self, chal: Path, item: dict) -> str | None:
+        info = _read_json(chal / "challenge.json", {})
+        info = info if isinstance(info, dict) else {}
+        opens = info.get("open") if isinstance(info.get("open"), dict) else {}
+        page = str(opens.get("url") or info.get("url") or self.contest.url)
         return browser_fetch(str(item.get("url", "")), chal / "files", str(item.get("name") or ""),
-                             item["size"] if isinstance(item.get("size"), int) else None, self.contest.url)
+                             item["size"] if isinstance(item.get("size"), int) else None, page,
+                             str(opens.get("click") or ""), str(item.get("click") or ""))
 
     def count_download_try(self, chal: Path, result: dict) -> None:
         reason = next((str(item.get("reason", "")) for item in result.get("failed", [])
