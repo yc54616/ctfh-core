@@ -902,13 +902,15 @@ class CheckerFlowTests(Base):
         real_sleep, calls, clicked = time.sleep, [], threading.Barrier(2, timeout=10)
         def run(argv, **kwargs):
             calls.append(argv)
-            if argv[3] == "eval":  # the click: Chrome starts the file and the call returns at once
+            if argv[3] in ("eval", "download-url"):  # Chrome starts the file and the call returns at once
                 name = "Memory1 (1).mans" if "Memory1" in argv[4] else "Memory2.mans"
                 (downloads / f"{name}.crdownload").write_bytes(b"MEM")
+                started.append(argv[3])
             return subprocess.CompletedProcess(argv, 0, b'"clicked"')
+        started = []
         def sleep(seconds):  # Chrome finishes both files once both were clicked
             real_sleep(0.01)
-            if len([c for c in calls if c[3] == "eval"]) == 2 or calls[0][3] == "eval":
+            if len(started) >= 2:
                 for part in downloads.glob("*.crdownload"):
                     part.rename(part.with_suffix(""))
         got = {}
@@ -918,30 +920,35 @@ class CheckerFlowTests(Base):
         with patch.object(native, "DOWNLOADS", native.DownloadWatch()), \
                 patch.object(native, "chrome_download_dir", return_value=downloads), \
                 patch.object(native, "browser_fetch", REAL_BROWSER_FETCH), \
-                patch.object(native.subprocess, "run", side_effect=run), patch.object(native.time, "sleep", side_effect=sleep):
+                patch.object(native.subprocess, "run", side_effect=run), patch.object(native.time, "sleep", side_effect=sleep), \
+                patch.object(native.subprocess, "Popen", side_effect=run):
             workers = [threading.Thread(target=fetch, args=(name,)) for name in ("Memory1.mans", "Memory2.mans")]
             for worker in workers: worker.start()
             for worker in workers: worker.join(10)
             self.assertEqual(got, {"Memory1.mans": "Memory1.mans", "Memory2.mans": "Memory2.mans"})
             self.assertEqual((files / "Memory1.mans").read_bytes(), b"MEM")
             self.assertEqual((downloads / "Memory1.mans").read_bytes(), b"the user's own")
-            self.assertEqual([c[3] for c in calls], ["open", "eval", "eval"])  # one window: opened once, clicked twice
-            self.assertIn("https://ctf.example.com/", calls[0])
+            self.assertEqual([c[3] for c in calls], ["download-url", "download-url"])  # Chrome's own download, no click
             calls.clear()
             self.assertIsNone(native.browser_fetch("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans",
                                                    999, "https://ctf.example.com/"))  # cut short: not taken as done
+        pages = []
         def login_page(argv, **kwargs):
             if argv[3] == "eval":
                 (downloads / "a.zip").write_bytes(b"<!DOCTYPE html><title>Login</title>")
+                pages.append(1)
             return subprocess.CompletedProcess(argv, 0, b'"clicked"')
         with patch.object(native, "DOWNLOADS", native.DownloadWatch()), \
                 patch.object(native, "chrome_download_dir", return_value=downloads), \
                 patch.object(native.subprocess, "run", side_effect=login_page), \
+                patch.object(native.subprocess, "Popen", side_effect=lambda argv, **kw: login_page(["", "", "", "eval"])), \
                 patch.object(native.time, "sleep", side_effect=lambda s: real_sleep(0.01)):
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/73", files, "a.zip"))
             self.assertFalse((downloads / "a.zip").exists() or (files / "a.zip").exists())  # a login page is no file
+            self.assertEqual(len(pages), 2)  # Chrome's download first, then a click on the page
         hung = MagicMock(side_effect=subprocess.TimeoutExpired("chrome-use", 60))
         with patch.object(native, "DOWNLOADS", native.DownloadWatch()), patch.object(native.subprocess, "run", hung), \
+                patch.object(native.subprocess, "Popen", side_effect=OSError), \
                 patch.object(native.time, "sleep") as waited:
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/1", files, "a.zip"))
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/2", files, "b.zip"))
@@ -977,6 +984,27 @@ class CheckerFlowTests(Base):
             self.assertEqual(self.checker().browser_get(chal, {"url": "https://ctf.example.com/download/42"}), "a.zip")
         self.assertEqual(json.loads((chal / "challenge.json").read_text())["open"],  # remembered for the next time
                          {"url": "https://ctf.example.com/#42", "click": "#chall42-flag-header"})
+
+    def test_chrome_holding_back_several_downloads_is_asked_at_start_and_said_on_the_board(self):
+        prefs = self.root / ".config/google-chrome/Default/Preferences"
+        prefs.parent.mkdir(parents=True)
+        def allow(setting):
+            prefs.write_text(json.dumps({"profile": {"content_settings": {"exceptions": {"automatic_downloads": {
+                "https://ctf.example.com:443,*": {"setting": setting}}}}}}))
+        allow(2)
+        with patch.object(native.Path, "home", return_value=self.root), patch.object(native.sys.stdin, "isatty", return_value=True):
+            self.assertFalse(native.downloads_allowed("ctf.example.com"))
+            asked = []
+            native.ask_downloads("ctf.example.com", lambda text: asked.append(text) or allow(1))
+            self.assertEqual(len(asked), 1)
+            self.assertTrue(native.downloads_allowed("ctf.example.com"))
+            native.ask_downloads("ctf.example.com", lambda text: self.fail("asked again"))  # allowed: not asked
+            allow(2)
+            make_challenge(self.root, "web-1")
+            checker = self.checker()
+            with patch.object(native.DOWNLOADS, "clicked", True):
+                checker.tick()
+            self.assertTrue(any("여러 파일 다운로드를 막고" in line for line in checker.view()[0]))
 
     def test_a_closed_chrome_is_started_again_and_said_on_the_board(self):
         make_challenge(self.root, "web-1")

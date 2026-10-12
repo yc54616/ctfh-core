@@ -889,6 +889,36 @@ BROWSER_POLL = 3
 BROWSER_IDLE = 300  # a download that stops growing this long has failed
 
 
+def downloads_allowed(host: str) -> bool | None:
+    """Whether Chrome lets the site download several files in a row (its "automatic downloads" setting); None when
+    Chrome's settings cannot be read. Without it every download after the first one in a tab waits for a click."""
+    try:
+        prefs = json.loads((Path.home() / ".config/google-chrome/Default/Preferences").read_text())
+        settings = prefs["profile"]["content_settings"]["exceptions"].get("automatic_downloads", {})
+        default = prefs["profile"].get("default_content_setting_values", {}).get("automatic_downloads")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    for pattern, value in settings.items():
+        site = pattern.split(",")[0]
+        if host and site.split("://")[-1].split(":")[0].removeprefix("[*.]") in (host, ".".join(host.split(".")[-2:])):
+            return isinstance(value, dict) and value.get("setting") == 1
+    return default == 1
+
+
+def ask_downloads(host: str, ask=input) -> None:
+    """At start: attachments download one after another in one tab, which Chrome holds back unless allowed."""
+    if not host or not sys.stdin.isatty() or downloads_allowed(host) is not False:
+        return
+    print(f"Chrome이 {host}에서 여러 파일을 연달아 받는 것을 허용하지 않았습니다. 이대로면 첫 첨부 뒤로 막힐 수 있습니다.\n"
+          f"  Chrome에서 chrome://settings/content/automaticDownloads 를 열고 '허용' 목록에 https://{host} 를 추가하세요.")
+    try:
+        ask("허용했으면 Enter (건너뛰려면 그냥 Enter): ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    print("허용된 것을 확인했습니다." if downloads_allowed(host) else "아직 허용으로 보이지 않습니다. 보드에 다시 알려 드립니다.")
+
+
 def chrome_download_dir() -> Path:
     prefs = _read_json(Path.home() / ".config" / "google-chrome" / "Default" / "Preferences", {})
     folder = prefs.get("download", {}).get("default_directory") if isinstance(prefs, dict) else None
@@ -926,6 +956,7 @@ class DownloadWatch:
         self.known: set[str] = set()
         self.sizes: dict[str, int] = {}
         self.moved_at, self.down_until, self.opened, self.thread, self.hangs = 0.0, 0.0, "", None, 0
+        self.clicked = False
         self.openers: dict[str, str] = {}  # page -> the click that showed its challenge, learned this run
 
     def fetch(self, url: str, folder: Path, name: str, total: int | None, page: str,
@@ -934,22 +965,37 @@ class DownloadWatch:
         name = Path(name or unquote(link.path)).name
         if link.scheme not in ("http", "https") or not name.strip("."):
             return None
-        entry = {"stem": Path(name).stem, "name": name, "total": total, "dest": folder / name,
-                 "clicked": time.time(), "done": threading.Event(), "ok": False}
-        downloads = chrome_download_dir()
-        with self.lock:
-            if not self.pending:  # nothing of ours is under way: whatever is there now is the user's
-                self.known = set(os.listdir(downloads)) if downloads.is_dir() else set()
-                self.sizes, self.moved_at = {}, time.time()
-            self.pending.append(entry)
-        if not self.click(url, name, page, opener, button, title):
+        # A plain file link goes through Chrome's own download API first: the site's cookies go along and Chrome
+        # never holds it back as one of "multiple automatic downloads". A click on the page is the fallback.
+        for direct in ([True, False] if not (opener or button) else [False]):
+            entry = {"stem": Path(name).stem, "name": name, "total": total, "dest": folder / name,
+                     "clicked": time.time(), "done": threading.Event(), "ok": False}
+            downloads = chrome_download_dir()
             with self.lock:
-                if entry in self.pending:
-                    self.pending.remove(entry)
-            return None
-        self.start()
-        entry["done"].wait()
-        return name if entry["ok"] else None
+                if not self.pending:  # nothing of ours is under way: whatever is there now is the user's
+                    self.known = set(os.listdir(downloads)) if downloads.is_dir() else set()
+                    self.sizes, self.moved_at = {}, time.time()
+                self.pending.append(entry)
+            if not (self.download_url(url) if direct else self.click(url, name, page, opener, button, title)):
+                with self.lock:
+                    if entry in self.pending:
+                        self.pending.remove(entry)
+                continue
+            self.start()
+            entry["done"].wait()
+            if entry["ok"]:
+                return name
+        return None
+
+    def download_url(self, url: str) -> bool:
+        if self.hangs >= 3 and time.time() < self.down_until:
+            return False
+        try:  # returns at once; the watcher sees the file arrive
+            subprocess.Popen(["chrome-use", "--session", DOWNLOAD_SESSION, "download-url", url], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+        except OSError:
+            return False
 
     def click(self, url: str, name: str, page: str, opener: str = "", button: str = "", title: str = "") -> bool:
         """A real click on the challenge's own page, so the login cookies go along; returns at once. Opens the
@@ -980,6 +1026,7 @@ class DownloadWatch:
                         self.opened = page
                     if opener:
                         chrome("eval", open_it)
+                    self.clicked = True  # held back by Chrome unless the site may download several files
                     if self.find(chrome, find):
                         return True
                     if not opener and b"opener " in (out := chrome("eval", reveal)):
@@ -1462,7 +1509,7 @@ class Checker:
         self.solved_probe = site_solved
         self.last_solved_poll = 0.0
         self.list_probe = site_list
-        self.chrome_note, self.last_chrome_check = "", 0.0
+        self.chrome_note, self.last_chrome_check, self.download_note = "", 0.0, ""
         self.download_lock = threading.Lock()  # one browser download run at a time: the first logs in for the rest
         self.last_list_poll = 0.0
         self.list_seen: tuple[float, int] | None = None  # when the list was last read, and how many it had
@@ -2008,6 +2055,8 @@ class Checker:
             head.append("!! 입력 필요 (문제 목록 수집에서 로그인 확인 실패, 풀이 창과 무관): " + alert.read_text().strip())
         if self.chrome_note:
             head.append(self.chrome_note)
+        if self.download_note:
+            head.append(self.download_note)
         limits = max((i for i in self.activity.values() if i.get("limits")), key=lambda i: i["mtime"], default=None)
         if limits:
             resets = limits["limits"]["resets"]
@@ -2239,6 +2288,10 @@ class Checker:
             self.jobs["__solved__"] = self.pool.submit(self.job_solved)
         if time.time() - self.last_chrome_check > 30:
             self.last_chrome_check = time.time()
+            host = urlparse(self.contest.url).hostname or ""
+            self.download_note = (f"!! Chrome이 {host}의 여러 파일 다운로드를 막고 있습니다: chrome://settings/content/"
+                                  f"automaticDownloads 에서 https://{host} 를 허용하세요"
+                                  if DOWNLOADS.clicked and downloads_allowed(host) is False else "")
             if not chrome_running():
                 start_chrome()
                 self.chrome_note = (f"!! Chrome이 꺼져 있어 {datetime.now():%H:%M:%S}에 다시 켰습니다 "
@@ -2386,6 +2439,7 @@ def go(site: str | None, directory: str | None, opts: Options, attach: bool = Tr
     _write_atomic(LAST_CONTEST, f"{root}\n")
     print(f"대회 폴더: {root}")
     ask_credential(urlparse(contest.url).hostname or "")
+    ask_downloads(urlparse(contest.url).hostname or "")
     if not tmux.exists():
         while not contest.challenges():
             print("문제를 수집하는 중입니다 (Codex + chrome-use, 몇 분 걸릴 수 있음)...", flush=True)
