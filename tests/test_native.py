@@ -10,7 +10,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from ctfh_core import native
 from ctfh_core.cli import main
@@ -92,7 +92,7 @@ class Base(unittest.TestCase):
                               ("site_solved", None), ("probe_endpoint", "unknown"),
                               ("api_reachable", True), ("chrome_account", "player@example.com"),
                               ("site_list", None), ("direct_fetch", None),
-                              ("browser_fetch", None)):
+                              ("browser_fetch", None), ("chrome_running", True)):
             patcher = patch(f"ctfh_core.native.{target}", return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -912,6 +912,24 @@ class CheckerFlowTests(Base):
             polls.clear()
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans",
                                                  total=999))  # a wrong size is not taken as done
+        redirected = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"\xe2\x9c\x93 Home\n  https://ctf.example.com/\n")
+        with patch.object(native, "chrome_download_dir", return_value=downloads), \
+                patch.object(native.subprocess, "run", side_effect=redirected), patch.object(native.time, "sleep") as sleep:
+            self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/73", files, "a.zip"))
+            sleep.assert_not_called()  # sent home: no waiting on the folder
+        hung = MagicMock(side_effect=subprocess.TimeoutExpired("chrome-use", 60))
+        with patch.object(native.subprocess, "run", hung), patch.object(native, "_browser_down_until", 0.0):
+            self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/1", files, "a.zip"))
+            self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/2", files, "b.zip"))
+            self.assertEqual(hung.call_count, 1)  # the next one skips the hung browser
+
+    def test_a_closed_chrome_is_started_again_and_said_on_the_board(self):
+        make_challenge(self.root, "web-1")
+        checker = self.checker()
+        with patch.object(native, "chrome_running", return_value=False), patch.object(native, "start_chrome") as start:
+            checker.tick()
+        start.assert_called_once()
+        self.assertTrue(any(line.startswith("!! Chrome이 꺼져 있어") for line in checker.view()[0]))
 
     def test_a_closed_solver_window_closes_its_browser_session(self):
         chal = make_challenge(self.root, "web-1")

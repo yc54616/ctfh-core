@@ -778,6 +778,25 @@ def solver_session(chal: Path) -> str:
     return f"ctfh-{chal.name}"
 
 
+def chrome_running() -> bool:
+    try:
+        return subprocess.run(["pgrep", "-x", "chrome"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # cannot tell: do not start a second one
+
+
+def start_chrome() -> None:
+    """Chrome quits with its last window (background mode is off), which can be the last chrome-use window a job
+    closed; every session then hangs on a relay that is gone. Started the way the desktop starts it."""
+    for argv in (["gtk-launch", "google-chrome"], ["google-chrome"]):
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            return
+        except OSError:
+            continue
+
+
 def close_browser(session: str) -> None:
     """Close what a checker job's own chrome-use session opened; the user's Chrome and other sessions stay."""
     try:
@@ -869,6 +888,7 @@ DOWNLOAD_SESSION = "ctfh-download"  # the one Chrome window attachments are open
 BROWSER_POLL = 3
 BROWSER_IDLE = 300  # a download that stops growing this long has failed
 _browser_lock = threading.Lock()
+_browser_down_until = 0.0  # after an open that hung, the others skip the browser for a while instead of queueing
 
 
 def chrome_download_dir() -> Path:
@@ -895,11 +915,22 @@ def browser_fetch(url: str, folder: Path, name: str = "", total: int | None = No
         return None
     downloads, stem = chrome_download_dir(), Path(name).stem
     with _browser_lock:
+        global _browser_down_until
+        if time.time() < _browser_down_until:
+            return None
         before = set(os.listdir(downloads)) if downloads.is_dir() else set()
         try:
-            subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "open", url], capture_output=True, timeout=120)
-        except (OSError, subprocess.TimeoutExpired):
-            pass  # the download may have started anyway; the folder tells
+            opened = subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "open", url],
+                                    capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            _browser_down_until = time.time() + 300
+            return None
+        except OSError:
+            return None
+        landed = [line.strip() for line in (opened.stdout or b"").decode("utf-8", "replace").splitlines()
+                  if line.strip().startswith(("http://", "https://"))]
+        if opened.returncode == 0 and landed and urlparse(landed[-1]).path.rstrip("/") != link.path.rstrip("/"):
+            return None  # sent to another page (home, login): not a download
         seen, changed = None, time.time()
         opened = changed
         while time.time() - changed < BROWSER_IDLE:
@@ -1309,6 +1340,7 @@ class Checker:
         self.solved_probe = site_solved
         self.last_solved_poll = 0.0
         self.list_probe = site_list
+        self.chrome_note, self.last_chrome_check = "", 0.0
         self.last_list_poll = 0.0
         self.list_seen: tuple[float, int] | None = None  # when the list was last read, and how many it had
         self.lock = threading.RLock()  # one tick or one dashboard action at a time
@@ -1828,6 +1860,8 @@ class Checker:
                 f"   ⏳ 대기 {count('pending', 'hold')}   ! 확인 필요 {sum(row['group'] == '!' for row in rows)}"]
         if alert.exists():
             head.append("!! 입력 필요 (문제 목록 수집에서 로그인 확인 실패, 풀이 창과 무관): " + alert.read_text().strip())
+        if self.chrome_note:
+            head.append(self.chrome_note)
         limits = max((i for i in self.activity.values() if i.get("limits")), key=lambda i: i["mtime"], default=None)
         if limits:
             resets = limits["limits"]["resets"]
@@ -2057,6 +2091,12 @@ class Checker:
         if "__solved__" not in self.jobs and time.time() - self.last_solved_poll > SOLVED_POLL_SECONDS:
             self.last_solved_poll = time.time()
             self.jobs["__solved__"] = self.pool.submit(self.job_solved)
+        if time.time() - self.last_chrome_check > 30:
+            self.last_chrome_check = time.time()
+            if not chrome_running():
+                start_chrome()
+                self.chrome_note = (f"!! Chrome이 꺼져 있어 {datetime.now():%H:%M:%S}에 다시 켰습니다 "
+                                    "(Chrome 창을 하나 열어 두면 꺼지지 않습니다)")
         if not ended and "__list__" not in self.jobs and time.time() - self.last_list_poll > LIST_POLL_SECONDS:
             self.last_list_poll = time.time()
             self.jobs["__list__"] = self.pool.submit(self.job_list)
