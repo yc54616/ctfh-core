@@ -417,7 +417,7 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
   {account}
   비밀번호는 매번 새로 무작위로 만들어 사이트·아이디와 함께 `work/ACCOUNTS.md`에 적는다 (writeup에는 적지 않는다).
   인증 메일은 chrome-use로 Gmail을 열어 그 메일만 확인한다. 다른 메일, Google 계정 설정, 저장된 비밀번호는 건드리지 않는다.
-- 캡차가 체크박스 하나("로봇이 아닙니다", Cloudflare의 "사람인지 확인")면 한 번 클릭하고 몇 초 뒤 통과됐는지 본다. 그림 고르기 같은 퍼즐로 넘어가면 풀지 않는다.
+- {captcha}
 - 퍼즐 캡차·휴대폰 인증·결제처럼 사람만 할 수 있는 입력이 꼭 필요하면, 무엇을 해 달라는지 한 줄로 `needs_user.txt`에 적고
   기다린다. 보드에 "입력 필요"로 뜨고, 그동안 검사기는 재촉하지 않는다. 처리됐으면 이 파일을 지우고 이어서 푼다.
 - 다른 문제 폴더는 건드리지 않는다.
@@ -572,7 +572,7 @@ def ensure_challenge(contest: Contest, chal: Path) -> dict:
         save_status(chal, status)
     (chal / "work").mkdir(exist_ok=True)
     agents = chal / "AGENTS.md"
-    rules = CHALLENGE_AGENTS.format(url=contest.url, slug=chal.name, account=account_rule(chrome_account()),
+    rules = CHALLENGE_AGENTS.format(url=contest.url, slug=chal.name, captcha=CAPTCHA_CLICK.strip(), account=account_rule(chrome_account()),
                                     rules=_short(contest.site().get("rules") or "(규칙 페이지를 찾지 못함)", 600))
     current = agents.read_text() if agents.exists() else None
     # Refresh our own generated rules when the template changes; leave a user-written file alone.
@@ -1046,22 +1046,27 @@ def download(contest: Contest, opts: Options, chal: Path, session: str, runner=r
     return runner(opts, contest.root, prompt, DOWNLOAD_SCHEMA, work, "download", DOWNLOAD_TIMEOUT)
 
 
-CAPTCHA_CLICK = ('캡차가 체크박스 하나("로봇이 아닙니다", Cloudflare의 "사람인지 확인")면 한 번 '
-                 '클릭하고 몇 초 뒤 통과됐는지 본다. 그림 고르기 같은 퍼즐로 넘어가면 풀지 않는다.')
+CAPTCHA_CLICK = ('폼에 캡차 체크박스("로봇이 아닙니다" reCAPTCHA, Cloudflare의 "사람인지 확인")가 있으면 로그인·제출 '
+                 '버튼보다 먼저 한 번 클릭한다. 체크박스는 iframe 안에 있어 snapshot에 안 보일 수 있으니 eval '
+                 '`(()=>{const f=document.querySelector(\'iframe[title*="reCAPTCHA"],iframe[src*="challenges.cloudflare"]\');'
+                 'f.scrollIntoView({block:"center"});const r=f.getBoundingClientRect();return [r.left+28,r.top+r.height/2]})()`'
+                 '로 좌표를 얻어 `click x y`로 누른다. 몇 초 뒤 체크 표시가 됐는지(reCAPTCHA면 eval '
+                 '`grecaptcha.getResponse().length>0`) 확인한다. 그림 고르기 같은 퍼즐로 넘어가면 풀지 않는다. ')
 
 
 def login_steps(contest: Contest, session: str, give_up: str) -> str:
     """How a collect or submit run logs back in: Chrome's saved-password autofill first (tested: the values reach
     the form on a real click though the page and the snapshot show empty fields), then the credentials file."""
-    autofill = ("로그인 페이지를 열고, 칸이 비어 보여도 아무것도 입력하지 말고 로그인 버튼을 한 번 누른다 "
-                "(Chrome이 저장된 계정을 자동완성해 두며, 값은 화면에 안 보여도 클릭할 때 넘어간다). ")
+    autofill = ("로그인 페이지를 열고, 칸이 비어 보여도 아무것도 입력하지 않는다 (Chrome이 저장된 계정을 자동완성해 "
+                "두며, 값은 화면에 안 보여도 클릭할 때 넘어간다). " + CAPTCHA_CLICK +
+                "그다음 아무것도 입력하지 말고 로그인 버튼을 한 번 누른다. ")
     if credential(urlparse(contest.url).hostname or "") is None:
-        return (autofill + CAPTCHA_CLICK + " 그래도 로그인되지 않거나 2FA·퍼즐 캡차가 나오면 비밀번호를 묻거나 추측하지 말고 "
+        return (autofill + "그래도 로그인되지 않거나 2FA·퍼즐 캡차가 나오면 비밀번호를 묻거나 추측하지 말고 "
                 f"{give_up}로 바로 끝낸다.")
     helper = shlex.join(self_command("secret-fill", str(contest.root), "<username|password>", "<@ref>",
                                      "--session", session))
-    return (autofill + CAPTCHA_CLICK + " 그래도 안 되면 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
-            f"(값은 너에게 보이지 않는다): `{helper}`. 그다음 로그인 버튼을 누른다. "
+    return (autofill + "그래도 안 되면 아이디·비밀번호 입력창의 ref를 찾아 다음 명령으로 채운다 "
+            f"(값은 너에게 보이지 않는다): `{helper}`. 캡차 체크가 풀렸으면 다시 누른 뒤 로그인 버튼을 누른다. "
             f"2FA·퍼즐 캡차가 나오거나 실패하면 {give_up}로 바로 끝낸다. 비밀번호를 직접 입력하거나 출력하지 마라.")
 
 

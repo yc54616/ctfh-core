@@ -532,9 +532,11 @@ class CheckerFlowTests(Base):
         checker = self.checker()
         checker.tick()
         agents = (chal / "AGENTS.md").read_text()
-        self.assertIn(native.CAPTCHA_CLICK, agents)
+        self.assertIn(native.CAPTCHA_CLICK.strip(), agents)
         self.assertIn("퍼즐 캡차·휴대폰 인증", agents)
         self.assertIn(native.CAPTCHA_CLICK, native.login_steps(checker.contest, "s", "x"))
+        steps = native.login_steps(checker.contest, "s", "x")
+        self.assertLess(steps.index("iframe"), steps.index("로그인 버튼을 한 번"))  # the box is ticked before submitting
 
     def test_the_signup_account_is_chromes_default_profile(self):
         out = json.dumps({"success": True, "data": {"browsers": [{"email": "other@example.com", "default": False},
