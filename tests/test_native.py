@@ -941,10 +941,16 @@ class CheckerFlowTests(Base):
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/73", files, "a.zip"))
             self.assertFalse((downloads / "a.zip").exists() or (files / "a.zip").exists())  # a login page is no file
         hung = MagicMock(side_effect=subprocess.TimeoutExpired("chrome-use", 60))
-        with patch.object(native, "DOWNLOADS", native.DownloadWatch()), patch.object(native.subprocess, "run", hung):
+        with patch.object(native, "DOWNLOADS", native.DownloadWatch()), patch.object(native.subprocess, "run", hung), \
+                patch.object(native.time, "sleep") as waited:
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/1", files, "a.zip"))
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/2", files, "b.zip"))
-            self.assertEqual(hung.call_count, 1)  # the next one skips the hung browser
+            self.assertEqual(hung.call_count, 3)  # tried three times, then the next one skips the hung browser
+            self.assertEqual(waited.call_count, 2)
+        starting = MagicMock(side_effect=[subprocess.TimeoutExpired("chrome-use", 60),  # Chrome still starting up
+                                          subprocess.CompletedProcess([], 0, b""), subprocess.CompletedProcess([], 0, b"clicked")])
+        with patch.object(native.subprocess, "run", starting), patch.object(native.time, "sleep"):
+            self.assertTrue(native.DownloadWatch().click("https://ctf.example.com/download/1", "a.zip", "https://ctf.example.com/"))
 
     def test_a_closed_chrome_is_started_again_and_said_on_the_board(self):
         make_challenge(self.root, "web-1")

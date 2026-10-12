@@ -912,7 +912,7 @@ class DownloadWatch:
         self.pending: list[dict] = []
         self.known: set[str] = set()
         self.sizes: dict[str, int] = {}
-        self.moved_at, self.down_until, self.opened, self.thread = 0.0, 0.0, False, None
+        self.moved_at, self.down_until, self.opened, self.thread, self.hangs = 0.0, 0.0, False, None, 0
 
     def fetch(self, url: str, folder: Path, name: str, total: int | None, page: str) -> str | None:
         link = urlparse(url)
@@ -941,9 +941,11 @@ class DownloadWatch:
         script = ("(()=>{const a=document.createElement('a');a.href=%s;a.download=%s;document.body.appendChild(a);"
                   "a.click();a.remove();return 'clicked'})()") % (json.dumps(url), json.dumps(name))
         with self.click_lock:
-            if time.time() < self.down_until:
-                return False
-            for attempt in range(2):
+            for attempt in range(3):
+                if self.hangs >= 3 and time.time() < self.down_until:  # hung again and again: skip it for a while
+                    return False
+                if (wait := self.down_until - time.time()) > 0:  # a hang just now (often a Chrome that just started):
+                    time.sleep(wait)  # wait it out, since a Codex download would need the same Chrome
                 try:
                     if not self.opened or attempt:
                         subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "open", page],
@@ -952,10 +954,11 @@ class DownloadWatch:
                     out = subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "eval", script],
                                          capture_output=True, timeout=30)
                     if b"clicked" in (out.stdout or b""):
+                        self.hangs = 0
                         return True
-                except subprocess.TimeoutExpired:  # Chrome hangs or is gone: the others skip it for a while
-                    self.down_until = time.time() + 300
-                    return False
+                except subprocess.TimeoutExpired:
+                    self.hangs += 1
+                    self.down_until = time.time() + (300 if self.hangs >= 3 else 20)
                 except OSError:
                     return False
             return False
