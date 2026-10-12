@@ -756,7 +756,11 @@ INSTANCE_TEXT = re.compile(r"start challenge|(launch|start|spawn|deploy) (an |th
 
 def needs_instance(chal: Path) -> bool:
     """Whether solving the challenge starts an instance on the site (a "Start Challenge" button and the like):
-    challenge.json says so, or else its notes do."""
+    the user's choice on the board first (kept apart, so a rescan does not undo it), then challenge.json, then its notes."""
+    try:
+        return (chal / ".instance").read_text().strip() == "yes"
+    except OSError:
+        pass
     info = _read_json(chal / "challenge.json", {})
     if isinstance(info, dict) and isinstance(info.get("instance"), bool):
         return info["instance"]
@@ -2077,7 +2081,8 @@ class Checker:
                          "label": STATE_LABELS.get(state, state),
                          "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
                          "tokens_n": tokens or 0, "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
-                         "activity": "" if activity == "-" else activity, "reason": reason})
+                         "activity": "" if activity == "-" else activity,
+                         "reason": f"인스턴스 · {reason}" if needs_instance(chal) else reason})
         group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
         rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name
         manual = [row["name"] for row in rows if row["state"] == "manual"]
@@ -2158,6 +2163,11 @@ class Checker:
             chal = self.contest.challenges_dir / name
             status = load_status(chal)
             state = status.get("state", "pending")
+            if action == "instance":
+                instance = not needs_instance(chal)
+                (chal / ".instance").write_text("yes\n" if instance else "no\n")
+                return f"{name}: " + ("인스턴스 문제로 지정했습니다. 인스턴스 한도 안에서만 열립니다." if instance
+                                      else "인스턴스 문제에서 뺐습니다. 한도 없이 열립니다.")
             if action == "done":
                 (chal / "USER_SOLVED").write_text(_now() + "\n")
                 status.update(state="user_solved", reason="사용자가 해결로 표시 (팀원 풀이 등).")
@@ -2188,6 +2198,8 @@ class Checker:
         chal = self.contest.challenges_dir / name
         if not chal.is_dir():
             return f"{name}: 문제 폴더가 없습니다."
+        if action == "instance":  # only how it is scheduled: fine in any state
+            return None
         if name in self.jobs and not self.jobs[name].done():
             return f"{name}: 검사·제출 작업 중입니다. 끝난 뒤 다시 시도하세요."
         state = load_status(chal).get("state", "pending")

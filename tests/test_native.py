@@ -1214,6 +1214,11 @@ class CheckerFlowTests(Base):
         native.mark_done(self.root, ["vm1"])  # solved: its instance no longer counts
         checker.tick()
         self.assertIn("vm3", checker.tmux.windows())
+        self.assertIn("인스턴스 · ", next(row for row in checker.view()[1] if row["name"] == "vm2")["reason"])
+        self.assertIn("인스턴스 문제에서 뺐습니다", checker.act("instance", "vm2"))  # the user's call wins over the notes
+        self.assertFalse(native.needs_instance(self.root / "challenges" / "vm2"))
+        self.assertIn("인스턴스 문제로 지정했습니다", checker.act("instance", "plain"))
+        self.assertTrue(native.needs_instance(self.root / "challenges" / "plain"))
         self.assertEqual(checker.set_instances(-2), "동시 인스턴스 문제: 무제한")
         self.assertEqual(self.checker(max_instances=2).opts.max_instances, 0)  # the live setting outlives a restart
         self.assertEqual(self.checker(max_instances=4).opts.max_instances, 4)  # a new setting wins over it

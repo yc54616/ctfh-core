@@ -88,6 +88,7 @@ class CheckerApp(App):
         Binding("t", "sort_next", "정렬"),
         Binding("plus,equals_sign", "parallel(1)", "창 +1"),
         Binding("minus", "parallel(-1)", "창 -1"),
+        Binding("i", "instance", "인스턴스 지정"),
         Binding("right_square_bracket", "instances(1)", "인스턴스 +1"),
         Binding("left_square_bracket", "instances(-1)", "인스턴스 -1"),
         Binding("q", "quit", "검사기 종료"),
@@ -228,6 +229,9 @@ class CheckerApp(App):
 
     def action_nudge(self) -> None:
         self.request("nudge")
+
+    def action_instance(self) -> None:
+        self.request("instance")
 
     def action_restart(self) -> None:
         self.request("restart")
