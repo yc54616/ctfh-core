@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -892,37 +893,53 @@ class CheckerFlowTests(Base):
         self.assertEqual(sorted(p.name for p in (chal / "files").iterdir()), sorted(["Memory1.mans", native.FILES_DONE, "evil"]))
         self.assertEqual(len(runner.calls), 1)  # all fetched: no Codex run
 
-    def test_a_login_walled_attachment_is_clicked_in_one_window_and_watched_until_done(self):
+    def test_login_walled_attachments_are_all_clicked_then_picked_up_from_the_download_folder(self):
         downloads, files = self.root / "dl", self.root / "files"
         downloads.mkdir()
         (downloads / "Memory1.mans").write_bytes(b"the user's own")  # already there: never taken
-        opened = []
+        real_sleep, calls, clicked = time.sleep, [], threading.Barrier(2, timeout=10)
         def run(argv, **kwargs):
-            opened.append(argv)
-            (downloads / "Memory1 (1).mans.crdownload").write_bytes(b"MEM")
-            return subprocess.CompletedProcess(argv, 0)
-        polls = []
-        def sleep(seconds):  # Chrome finishes the file after a few polls
-            polls.append(seconds)
-            if len(polls) == 2:
-                (downloads / "Memory1 (1).mans.crdownload").rename(downloads / "Memory1 (1).mans")
-        with patch.object(native, "chrome_download_dir", return_value=downloads), \
+            calls.append(argv)
+            if argv[3] == "eval":  # the click: Chrome starts the file and the call returns at once
+                name = "Memory1 (1).mans" if "Memory1" in argv[4] else "Memory2.mans"
+                (downloads / f"{name}.crdownload").write_bytes(b"MEM")
+            return subprocess.CompletedProcess(argv, 0, b'"clicked"')
+        def sleep(seconds):  # Chrome finishes both files once both were clicked
+            real_sleep(0.01)
+            if len([c for c in calls if c[3] == "eval"]) == 2 or calls[0][3] == "eval":
+                for part in downloads.glob("*.crdownload"):
+                    part.rename(part.with_suffix(""))
+        got = {}
+        def fetch(name):
+            got[name] = native.browser_fetch(f"https://ctf.example.com/files/a/{name}", files, name, None,
+                                             "https://ctf.example.com/")
+        with patch.object(native, "DOWNLOADS", native.DownloadWatch()), \
+                patch.object(native, "chrome_download_dir", return_value=downloads), \
+                patch.object(native, "browser_fetch", REAL_BROWSER_FETCH), \
                 patch.object(native.subprocess, "run", side_effect=run), patch.object(native.time, "sleep", side_effect=sleep):
-            self.assertEqual(REAL_BROWSER_FETCH("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans"),
-                             "Memory1.mans")
+            workers = [threading.Thread(target=fetch, args=(name,)) for name in ("Memory1.mans", "Memory2.mans")]
+            for worker in workers: worker.start()
+            for worker in workers: worker.join(10)
+            self.assertEqual(got, {"Memory1.mans": "Memory1.mans", "Memory2.mans": "Memory2.mans"})
             self.assertEqual((files / "Memory1.mans").read_bytes(), b"MEM")
             self.assertEqual((downloads / "Memory1.mans").read_bytes(), b"the user's own")
-            self.assertEqual(opened[0][:4], ["chrome-use", "--session", native.DOWNLOAD_SESSION, "open"])
-            polls.clear()
-            self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans",
-                                                 total=999))  # a wrong size is not taken as done
-        redirected = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"\xe2\x9c\x93 Home\n  https://ctf.example.com/\n")
-        with patch.object(native, "chrome_download_dir", return_value=downloads), \
-                patch.object(native.subprocess, "run", side_effect=redirected), patch.object(native.time, "sleep") as sleep:
+            self.assertEqual([c[3] for c in calls], ["open", "eval", "eval"])  # one window: opened once, clicked twice
+            self.assertIn("https://ctf.example.com/", calls[0])
+            calls.clear()
+            self.assertIsNone(native.browser_fetch("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans",
+                                                   999, "https://ctf.example.com/"))  # cut short: not taken as done
+        def login_page(argv, **kwargs):
+            if argv[3] == "eval":
+                (downloads / "a.zip").write_bytes(b"<!DOCTYPE html><title>Login</title>")
+            return subprocess.CompletedProcess(argv, 0, b'"clicked"')
+        with patch.object(native, "DOWNLOADS", native.DownloadWatch()), \
+                patch.object(native, "chrome_download_dir", return_value=downloads), \
+                patch.object(native.subprocess, "run", side_effect=login_page), \
+                patch.object(native.time, "sleep", side_effect=lambda s: real_sleep(0.01)):
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/73", files, "a.zip"))
-            sleep.assert_not_called()  # sent home: no waiting on the folder
+            self.assertFalse((downloads / "a.zip").exists() or (files / "a.zip").exists())  # a login page is no file
         hung = MagicMock(side_effect=subprocess.TimeoutExpired("chrome-use", 60))
-        with patch.object(native.subprocess, "run", hung), patch.object(native, "_browser_down_until", 0.0):
+        with patch.object(native, "DOWNLOADS", native.DownloadWatch()), patch.object(native.subprocess, "run", hung):
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/1", files, "a.zip"))
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/2", files, "b.zip"))
             self.assertEqual(hung.call_count, 1)  # the next one skips the hung browser
