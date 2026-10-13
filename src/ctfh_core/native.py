@@ -1835,8 +1835,8 @@ class Checker:
         status.pop("needs_user", None)
         if outcome in ("accepted", "already_solved"):
             status.update(state="accepted", reason="사이트가 정답 처리했습니다.")
-            self.tell(chal, "정답 처리됨. 인스턴스를 켜 두었으면 사이트에서 끄고 "
-                            f"{INSTANCE_REQUEST}·{READY_REQUEST}를 지운 뒤 writeup.md를 마무리해라.")
+            self.tell(chal, "정답 처리됨. 인스턴스 자리는 다음 문제에 넘겼다. 이 문제의 인스턴스를 켜 두었으면 "
+                            "지금 사이트에서 끈 뒤 writeup.md를 마무리해라. 인스턴스를 다시 요청하지 마라.")
         elif outcome == "wrong":
             status.update(state="needs_fix", reason="사이트가 오답 처리했습니다. 다른 flag를 찾아야 합니다.")
             self.tell(chal, "사이트가 오답 처리했다. 풀이를 다시 확인해라.")
@@ -2239,9 +2239,12 @@ class Checker:
                 continue
             opened = window_name(chal.name) in windows
             asked = remote_ready(chal) if status.get("instance_test") else wants_instance(chal)
-            if opened and (status.get("state") in FINISHED or not asked):
+            if status.get("state") == "accepted" or (opened and (status.get("state") in FINISHED or not asked)):
                 for key in ("instance_slot", "instance_test", "yielding", "returning"):
                     status.pop(key, None)
+                if status.get("state") == "accepted":  # solved: the next challenge gets the slot at once
+                    (chal / INSTANCE_REQUEST).unlink(missing_ok=True)
+                    (chal / READY_REQUEST).unlink(missing_ok=True)
             elif opened and status.get("instance_test"):  # a test slot: a run that works, or back to local analysis
                 if "returning" in status and time.time() - status["returning"] > YIELD_SECONDS:
                     (chal / READY_REQUEST).unlink(missing_ok=True)

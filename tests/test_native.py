@@ -1385,6 +1385,24 @@ class CheckerFlowTests(Base):
         row = next(row for row in checker.view()[1] if row["name"] == "jail")
         self.assertEqual((row["queue"], row["activity"]), ("대기 1", "인스턴스 자리 대기 (1번째)"))
 
+    def test_an_accepted_challenge_hands_its_instance_slot_on_at_once(self):
+        for slug, solves in (("easy", 50), ("jail", 5)):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({"name": slug, "instance": True, "solves": solves}))
+        checker = self.checker(max_instances=1)
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"easy"})
+        easy = self.root / "challenges" / "easy"
+        (easy / native.INSTANCE_REQUEST).write_text("원격\n")
+        status = self.status("easy")
+        status["state"] = "accepted"  # the solver is still writing its writeup and has not turned anything off
+        native.save_status(easy, status)
+        checker.tick()
+        self.assertNotIn("instance_slot", self.status("easy"))
+        self.assertFalse((easy / native.INSTANCE_REQUEST).exists())
+        self.assertIn("instance_slot", self.status("jail"))
+        self.assertEqual(checker.tmux.windows(), {"easy", "jail"})
+
     def test_a_picked_instance_challenge_makes_the_lowest_unpicked_one_yield(self):
         for slug, solves in (("easy", 50), ("hard", 5), ("mine", 1)):
             chal = make_challenge(self.root, slug)
