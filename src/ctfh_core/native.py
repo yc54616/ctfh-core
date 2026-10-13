@@ -407,6 +407,12 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 (이 규칙은 풀이 세션용이다. 프롬프트가 `[검사기 작업]`으로 시작하면 그 지시가 우선한다.)
 - 공격 대상은 문제에서 주어진 파일과 서버뿐이다. 대회 플랫폼(로그인, 점수판, 다른 참가자)은 공격하지 않는다.
 - 호스트 도구(gdb, pwntools, qemu, 퍼저 등)를 자유롭게 쓴다. 오래 걸리는 명령에는 timeout을 건다.
+- 바이너리·라이브러리·APK·.NET/JVM·펌웨어·웹 번들을 분석할 때는 rea MCP 도구(`mcp__rea__*`)를 먼저 쓴다.
+  `binary_overview`·`open_binary`로 열고, `procedure_pseudo_code`·`batch_decompile`로 디컴파일하고, `xrefs`·`search_strings`·
+  `get_call_graph`로 흐름을 잡는다. APK·관리 코드·웹 번들은 `inspect_artifact`·`inspect_managed_artifact`·`analyze_web_bundle`로
+  시작한다. objdump·strings 같은 셸 도구는 빠른 확인이나 rea로 안 되는 부분에만 쓴다. Ghidra가 메모리를 쓰니 다 본
+  바이너리는 `close_binary`로 닫는다.
+- 라이브러리 동작, CVE, 알려진 기법은 짐작하지 말고 웹 검색 MCP(`mcp__parallel_search__web_search`)로 확인한다.
 - 웹 확인이 필요하면 `chrome-use`를 쓴다. 세션은 환경변수 AGENT_BROWSER_SESSION=ctfh-{slug}로 정해져 있으니
   `--session`이나 `--session-name`을 따로 주지 마라 (창이 닫힐 때 검사기가 이 세션의 탭을 닫는다).
 - 사이트에서 VM/인스턴스를 켜거나 접속 정보를 읽기 전에, 열린 문제 창의 제목이 challenge.json의 name과 같은지
