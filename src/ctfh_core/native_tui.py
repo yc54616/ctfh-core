@@ -24,8 +24,8 @@ STYLES = {"needs_user": "bold red", "manual": "bold yellow", "hold": "blue", "un
 COLUMNS = [("group", ""), ("name", "문제"), ("category", "분류"), ("instance", "인스턴스"), ("label", "상태"), ("tokens", "토큰"),
            ("elapsed", "시간"), ("activity", "활동"), ("reason", "메모")]
 SORT_KEYS = {"name": lambda row: row["name"], "category": lambda row: (row["category"], row["name"]),
-             "instance": lambda row: (not row.get("instance"), not row["queue"].startswith("사용"),
-                                      int(row["queue"].split()[-1]) if row["queue"].startswith("대기") else 0, row["name"]),
+             "instance": lambda row: (not row.get("instance"), not row["queue"].startswith(("확인", "사용")),
+                                      int(row["queue"].split()[-1]) if row["queue"].startswith(("대기", "원격만")) else 0, row["name"]),
              "label": lambda row: (row["label"], row["name"]), "tokens": lambda row: row["tokens_n"],
              "elapsed": lambda row: row["elapsed_n"],
              "activity": lambda row: (row["activity"] == "", row["activity"]),
@@ -89,6 +89,7 @@ HELP = """표
   i    인스턴스 우선 지정/해제: 자리 큐 맨 앞으로. 한도가 차 있으면 지정 안 된 문제 하나가
        노트를 적고 인스턴스를 끈 뒤 2분 안에 자리를 넘긴다 (첨부 없는 문제는 창을 닫고, 자리가 나면 이어서 연다)
        인스턴스 칸: 사용 = 자리 받음 · 대기 n = 자리 순서 · 분석 = 자리 없이 첨부를 보는 중
+                   원격만 n = 로컬 재현 끝, 원격 실행만 남음 · 확인 = 확인 전용 자리에서 원격 실행 중 (안 되면 분석으로)
   I    인스턴스 문제 맞음/아님 (자동 판단이 틀렸을 때)
   t    정렬 바꾸기 (머리글을 눌러도 됨)
 

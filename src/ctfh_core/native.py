@@ -414,9 +414,12 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
   받은 접속 정보는 어느 문제 창에서 얻었는지와 함께 `work/NOTES.md`에 적는다.
 - 사이트 인스턴스는 동시에 켤 수 있는 수가 정해져 있어서 검사기가 자리를 나눠 준다. 검사기가 "인스턴스 자리를 받았다"고
   알려 주기 전에는 켜지 않는다. 그전에는 첨부 분석, 로컬 재현, 익스플로잇 작성처럼 인스턴스 없이 할 수 있는 일을 한다.
-  원격이 필요해지면 `need-instance` 파일에 이유를 한 줄 쓰고, 로컬 일을 하며 차례를 기다린다.
-- 자리를 받아 인스턴스를 켰으면 원격 작업을 하고, 검사기가 solve.py로 flag를 다시 확인할 때까지 켜 둔다. 원격이 더
-  필요 없으면 (확인이 끝났거나 그만둘 때) 사이트에서 인스턴스를 끄고 `need-instance`를 지운다. 다른 문제가 그 자리를 기다린다.
+  원격을 살펴봐야 하면 `need-instance` 파일에 이유를 한 줄 쓰고, 로컬 일을 하며 차례를 기다린다.
+- 로컬에서 익스플로잇이 통해 solve.py를 원격에 돌리기만 하면 되면 `remote-ready` 파일을 만든다. 확인 전용 자리가 있어
+  금방 차례가 온다. 그 자리에서는 원격에서 디버깅하지 않는다: 켜고 solve.py를 한 번 돌려 통하면 검사기 재현 확인까지
+  마치고, 통하지 않으면 바로 인스턴스를 끄고 `remote-ready`를 지운 뒤 로컬 분석으로 돌아간다.
+- 자리를 받아 인스턴스를 켰으면 검사기가 solve.py로 flag를 다시 확인할 때까지 켜 둔다. 원격이 더 필요 없으면 (확인이
+  끝났거나 그만둘 때) 사이트에서 인스턴스를 끄고 `need-instance`·`remote-ready`를 지운다. 다른 문제가 그 자리를 기다린다.
 - 원격 서버 주소를 알면 `remote.txt`에 한 줄에 하나씩 적는다 (`host:port`, `nc host port`, URL). 주소가 바뀌면 고친다.
   서버가 닫혀 있으면 검사기가 이 주소를 지켜보다가 열리는 순간 알려 준다.
 - 문제 서비스(문제 웹앱, 문제가 쓰는 외부 서비스)에 회원가입·로그인이 필요하면 묻지 말고 직접 가입한다.
@@ -791,6 +794,25 @@ def instance_rank(chal: Path) -> tuple:
 
 
 INSTANCE_REQUEST = "need-instance"  # a solver asks here for an instance slot; it goes back once the file is gone
+
+
+READY_REQUEST = "remote-ready"  # the exploit works locally: only a run of solve.py on the remote is left
+BACK_TO_ANALYSIS = (f"사이트에서 이 문제의 인스턴스를 끄고 {READY_REQUEST} 파일을 지운 뒤 로컬 분석으로 돌아가라. 원격에서 본 것은 "
+                    f"work/NOTES.md에 적고, 로컬에서 고쳐 다시 통하면 {READY_REQUEST}로 다시 요청해라.")
+
+
+def remote_ready(chal: Path) -> bool:
+    return (chal / READY_REQUEST).exists()
+
+
+def wants_instance(chal: Path) -> bool:
+    return (chal / INSTANCE_REQUEST).exists() or remote_ready(chal)
+
+
+def slot_order(chal: Path) -> tuple:
+    """Instance slot queue: the user's picks, then exploits that only need a run on the remote, then the easiest."""
+    rank = instance_rank(chal)
+    return rank[0], not remote_ready(chal), rank
 
 
 def starts_on_instance(chal: Path) -> bool:
@@ -1644,8 +1666,9 @@ class Checker:
         if "instance_slot" in status:
             prompt += " 이 문제의 인스턴스 자리를 받았다. 사이트에서 인스턴스를 켜고 풀어도 된다."
         elif needs_instance(chal):
-            prompt += (" 인스턴스는 아직 켜지 마라. 첨부부터 분석하고, 원격이 필요해지면 "
-                       f"{INSTANCE_REQUEST} 파일에 이유를 한 줄 쓴 뒤 검사기가 알려 줄 때까지 로컬 일을 해라.")
+            prompt += (f" 인스턴스는 아직 켜지 마라. 첨부부터 분석하고, 원격을 살펴봐야 하면 {INSTANCE_REQUEST}, 로컬에서 "
+                       f"익스플로잇이 통해 solve.py를 원격에 돌리기만 하면 되면 {READY_REQUEST} 파일에 이유를 한 줄 쓴 뒤 "
+                       "검사기가 알려 줄 때까지 로컬 일을 해라.")
         argv = memory_prefix(self.opts, chal) + ["env", f"AGENT_BROWSER_SESSION={solver_session(chal)}"] \
             + env_prefix(self.opts.binary) \
             + codex_argv(self.opts, chal, prompt, interactive=True)
@@ -1661,13 +1684,20 @@ class Checker:
         status.setdefault("first_launched_ts", status["launched_ts"])
         save_status(chal, status)
 
-    def grant(self, chal: Path) -> None:
+    def grant(self, chal: Path, test: bool = False) -> None:
         status = load_status(chal)
         status["instance_slot"] = time.time()
+        if test:
+            status["instance_test"] = True
         save_status(chal, status)
+        if test:
+            self.tell(chal, "확인 전용 인스턴스 자리를 받았다. 사이트에서 이 문제의 인스턴스를 켜고 remote.txt를 적은 뒤 "
+                            "solve.py를 원격에 한 번 돌려라. 원격에서 디버깅하지 마라. 통하면 검사기가 재현 "
+                            f"확인을 마칠 때까지 켜 두었다가 끄고 {READY_REQUEST}를 지워라. 통하지 않으면 " + BACK_TO_ANALYSIS)
+            return
         self.tell(chal, "인스턴스 자리를 받았다. 사이트에서 이 문제의 인스턴스를 켜고 remote.txt를 적은 뒤 원격 작업을 해라. "
                         "검사기가 solve.py로 flag를 다시 확인할 때까지 켜 두고, 원격이 더 필요 없으면 사이트에서 "
-                        f"인스턴스를 끄고 {INSTANCE_REQUEST} 파일을 지워라.")
+                        f"인스턴스를 끄고 {INSTANCE_REQUEST}·{READY_REQUEST} 파일을 지워라.")
 
     def tell(self, chal: Path, text: str) -> None:
         if window_name(chal.name) in self.tmux.windows():
@@ -1697,10 +1727,14 @@ class Checker:
         if result.rerun and (remote := self.remote_state(chal))[0] == "down":
             self.wait_remote(chal, status, remote[1])  # the instance closed under the rerun, not a wrong solve
             return
+        test = bool(status.get("instance_test"))
+        if not result.ok and test:
+            status.setdefault("returning", time.time())  # a test slot is for a run that works: back to local analysis
         save_status(chal, status)
         if not result.ok:
             self.tell(chal, f"flag 검증 실패: {result.reason} status.json을 보고 고쳐라. "
-                            "flag.txt나 solve.py를 고치면 다시 검사한다.")
+                            "flag.txt나 solve.py를 고치면 다시 검사한다." + (" 확인 전용 자리에서는 원격에서 고치지 마라. "
+                                                                    + BACK_TO_ANALYSIS if test else ""))
         elif not self.opts.submit:
             self.tell(chal, "flag 재현 확인됨 (자동 제출 꺼짐). writeup.md를 마무리해라.")
 
@@ -2119,25 +2153,40 @@ class Checker:
             if "instance_slot" not in status and not status.get("yielding"):
                 continue
             opened = window_name(chal.name) in windows
-            if opened and (status.get("state") in FINISHED or not (chal / INSTANCE_REQUEST).exists()):
-                status.pop("instance_slot", None)
-                status.pop("yielding", None)
+            asked = remote_ready(chal) if status.get("instance_test") else wants_instance(chal)
+            if opened and (status.get("state") in FINISHED or not asked):
+                for key in ("instance_slot", "instance_test", "yielding", "returning"):
+                    status.pop(key, None)
+            elif opened and status.get("instance_test"):  # a test slot: a run that works, or back to local analysis
+                if "returning" in status and time.time() - status["returning"] > YIELD_SECONDS:
+                    (chal / READY_REQUEST).unlink(missing_ok=True)
+                    for key in ("instance_slot", "instance_test", "yielding", "returning"):
+                        status.pop(key, None)
+                    self.tell(chal, "확인 전용 인스턴스 자리를 거뒀다. 이 문제의 인스턴스가 켜져 있으면 지금 사이트에서 끄고 "
+                                    "로컬 분석을 이어 가라.")
+                else:
+                    continue
             elif status.get("yielding") and (not opened or time.time() - status["yielding"] > YIELD_SECONDS):
                 self.close(chal)  # asked to make room and had its time: it comes back from the queue
                 windows.discard(window_name(chal.name))
-                status.pop("instance_slot", None)
-                status.pop("yielding", None)
+                for key in ("instance_slot", "instance_test", "yielding", "returning"):
+                    status.pop(key, None)
                 status["queued"] = True
                 (chal / INSTANCE_REQUEST).unlink(missing_ok=True)
+                (chal / READY_REQUEST).unlink(missing_ok=True)
             elif not opened:
-                status.pop("instance_slot", None)
+                for key in ("instance_slot", "instance_test", "yielding", "returning"):
+                    status.pop(key, None)
                 (chal / INSTANCE_REQUEST).unlink(missing_ok=True)
+                (chal / READY_REQUEST).unlink(missing_ok=True)
             else:
                 continue
             save_status(chal, status)
         running = sum(1 for chal in challenges if window_name(chal.name) in windows)
         live = [chal for chal in challenges if "instance_slot" in load_status(chal)]
-        asking = [chal for chal in challenges if window_name(chal.name) in windows and (chal / INSTANCE_REQUEST).exists()
+        tests = [chal for chal in live if load_status(chal).get("instance_test")]  # the test slot, kept apart
+        live = [chal for chal in live if chal not in tests]
+        asking = [chal for chal in challenges if window_name(chal.name) in windows and wants_instance(chal)
                   and "instance_slot" not in load_status(chal) and load_status(chal).get("state") not in FINISHED]
         restart, fresh = [], []
         for chal in challenges:
@@ -2164,9 +2213,14 @@ class Checker:
         items = [next(queue) if item[0].name in upfront else item for item in items]  # instance ones in queue order
         # One queue for instance slots: running solvers that asked for one, and challenges that need one to start.
         # Challenges with attachments start without a slot and ask once they need the remote.
+        # With room for two or more, one slot is kept for exploits that work locally: a short run, then it is back.
+        test_slots = 1 if self.opts.max_instances >= 2 else 0
+        for chal in sorted((chal for chal in asking if remote_ready(chal)), key=instance_rank)[:max(0, test_slots - len(tests))]:
+            self.grant(chal, test=True)
+            asking.remove(chal)
         wanting = sorted([(chal, None) for chal in asking] + [item for item in items if item[0].name in upfront],
-                         key=lambda item: instance_rank(item[0]))
-        free = self.opts.max_instances - len(live) if self.opts.max_instances else len(wanting)
+                         key=lambda item: slot_order(item[0]))
+        free = self.opts.max_instances - test_slots - len(live) if self.opts.max_instances else len(wanting)
         allowed = set()
         for chal, status in wanting[:max(0, free)]:
             if status is None:
@@ -2217,9 +2271,9 @@ class Checker:
             if status.get("state") in FINISHED or "instance_slot" in status:
                 return False
             if window_name(chal.name) in windows:
-                return (chal / INSTANCE_REQUEST).exists()
+                return wants_instance(chal)
             return starts_on_instance(chal)
-        waiting = sorted((chal for chal in self.contest.challenges() if asks(chal)), key=instance_rank)
+        waiting = sorted((chal for chal in self.contest.challenges() if asks(chal)), key=slot_order)
         place = {chal.name: i + 1 for i, chal in enumerate(waiting)}
         for chal in self.contest.challenges():
             status = load_status(chal)
@@ -2242,8 +2296,9 @@ class Checker:
                          "instance": needs_instance(chal) or "instance_slot" in status or chal.name in place,
                          "picked": instance_pick(chal) is not None,
                          "queue": "" if not needs_instance(chal) and "instance_slot" not in status
-                         and chal.name not in place else "사용" if "instance_slot" in status
-                         else f"대기 {place[chal.name]}" if chal.name in place
+                         and chal.name not in place else ("확인" if status.get("instance_test") else "사용")
+                         if "instance_slot" in status
+                         else f"{'원격만' if remote_ready(chal) else '대기'} {place[chal.name]}" if chal.name in place
                          else "분석" if window_name(chal.name) in windows and state not in FINISHED else "◆"})
         group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
         rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name

@@ -1262,11 +1262,11 @@ class CheckerFlowTests(Base):
             if slug != "plain":  # the collector's flag; the notes' "Start Challenge" counts as well
                 (chal / "challenge.md").write_text("문제 카드의 `Start Challenge` 버튼을 눌러 인스턴스를 켠다.\n")
         (self.root / "challenges" / "vm3" / "challenge.json").write_text(json.dumps({"name": "vm3", "instance": True}))
-        checker = self.checker(max_instances=2)
+        checker = self.checker(max_instances=3)  # one of the three is kept for tests of working exploits
         checker.tick()
         self.assertEqual(checker.tmux.windows(), {"vm1", "vm2", "plain"})
-        self.assertIn("인스턴스 2", checker.board())
-        self.assertTrue(any("인스턴스 한도(2개)로 1개 대기" in line for line in checker.view()[0]))
+        self.assertIn("인스턴스 3", checker.board())
+        self.assertTrue(any("인스턴스 한도(3개)로 1개 대기" in line for line in checker.view()[0]))
         native.mark_done(self.root, ["vm1"])  # solved: its instance no longer counts
         checker.tick()
         self.assertIn("vm3", checker.tmux.windows())
@@ -1275,8 +1275,8 @@ class CheckerFlowTests(Base):
         self.assertFalse(native.needs_instance(self.root / "challenges" / "vm2"))
         self.assertIn("인스턴스 문제로 지정했습니다", checker.act("instance", "plain"))
         self.assertTrue(native.needs_instance(self.root / "challenges" / "plain"))
-        self.assertEqual(checker.set_instances(-2), "동시 인스턴스 문제: 무제한")
-        self.assertEqual(self.checker(max_instances=2).opts.max_instances, 0)  # the live setting outlives a restart
+        self.assertEqual(checker.set_instances(-3), "동시 인스턴스 문제: 무제한")
+        self.assertEqual(self.checker(max_instances=3).opts.max_instances, 0)  # the live setting outlives a restart
         self.assertEqual(self.checker(max_instances=4).opts.max_instances, 4)  # a new setting wins over it
         self.assertIn("--instances", native.Options().to_args())
         self.assertEqual(native.Options().max_instances, 3)
@@ -1285,7 +1285,7 @@ class CheckerFlowTests(Base):
         for slug, solves in (("easy", 50), ("hard", 5), ("mine", 1)):
             chal = make_challenge(self.root, slug)
             (chal / "challenge.json").write_text(json.dumps({"name": slug, "instance": True, "solves": solves}))
-        checker = self.checker(max_instances=2)
+        checker = self.checker(max_instances=3)  # two to share, one kept for tests
         checker.tick()
         self.assertEqual(checker.tmux.windows(), {"easy", "hard"})  # the easiest first
         self.assertEqual(next(row for row in checker.view()[1] if row["name"] == "mine")["queue"], "대기 1")
@@ -1338,6 +1338,41 @@ class CheckerFlowTests(Base):
         self.assertEqual(checker.tmux.windows(), {"vm", "web", "web2"})
         self.assertEqual(queue(), {"vm": "분석", "web": "분석", "web2": "사용"})
         self.assertFalse(self.status("vm").get("yielding"))
+
+    def test_a_locally_working_exploit_gets_the_test_slot_and_goes_back_to_analysis_when_it_fails(self):
+        for slug, solves in (("vm", 90), ("pwn", 50), ("rev", 10)):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({
+                "name": slug, "instance": True, "solves": solves,
+                "attachments": [{"url": f"https://ctf.example.com/files/{slug}.zip", "name": f"{slug}.zip"}]}))
+            (chal / "files" / native.FILES_DONE).write_text("")
+        checker = self.checker(max_instances=2)  # one to share, one kept for tests
+        queue = lambda: {row["name"]: row["queue"] for row in checker.view()[1]}
+        checker.tick()
+        vm, pwn, rev = (self.root / "challenges" / slug for slug in ("vm", "pwn", "rev"))
+        (vm / native.INSTANCE_REQUEST).write_text("원격 동작 확인\n")
+        (pwn / native.INSTANCE_REQUEST).write_text("원격 libc 확인\n")
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "사용", "pwn": "대기 1", "rev": "분석"})  # the test slot is not lent out
+        (rev / native.READY_REQUEST).write_text("로컬에서 flag 나옴\n")
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "사용", "pwn": "대기 1", "rev": "확인"})  # straight past the queue
+        self.assertTrue(any(name == "rev" and "확인 전용" in text for name, text in checker.tmux.sent))
+        (pwn / native.INSTANCE_REQUEST).unlink()
+        (pwn / native.READY_REQUEST).write_text("로컬에서 flag 나옴\n")
+        checker.tick()
+        self.assertEqual(queue()["pwn"], "원격만 1")  # the test slot is taken: first in line for a shared one
+        write_solution(rev, reproduce=False)  # the run on the remote did not give the flag
+        checker.tick()
+        checker.jobs["rev"].result(timeout=10)
+        self.assertIn("로컬 분석으로 돌아가라", next(text for name, text in reversed(checker.tmux.sent) if name == "rev"))
+        status = self.status("rev")
+        status["returning"] -= native.YIELD_SECONDS + 1  # it did not give the slot back by itself
+        native.save_status(rev, status)
+        checker.tick()
+        self.assertFalse((rev / native.READY_REQUEST).exists())
+        self.assertIn("rev", checker.tmux.windows())  # its window stays: back to analysis, not closed
+        self.assertEqual(queue(), {"vm": "사용", "pwn": "확인", "rev": "분석"})
 
     def test_limited_slots_open_easiest_first_and_limit_changes_live(self):
         for slug, solves in (("hard", 5), ("easy", 50), ("unknown", None)):
