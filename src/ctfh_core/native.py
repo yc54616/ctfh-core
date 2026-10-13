@@ -413,6 +413,9 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 - 공격 대상은 문제에서 주어진 파일과 서버뿐이다. 대회 플랫폼(로그인, 점수판, 다른 참가자)은 공격하지 않는다.
 - 분야에 맞는 Codex 스킬을 먼저 읽는다: `solve-challenge`와 `ctf-pwn`·`ctf-reverse`·`ctf-crypto`·`ctf-web`·`ctf-forensics`·
   `ctf-misc` 중 맞는 것, APK는 `android-reverse-engineering`, 스마트 컨트랙트는 `solidity-security-audit`.
+- 개인정보보호법 문제(조문·기간·과징금·과태료·안전조치, 개인정보 탐지·마스킹·가명처리)는 `ctf-privacy-law`를 읽는다.
+  법령은 기억으로 답하지 않는다. 그 스킬의 `lawtext.py`로 law.go.kr 현행 원문을 받아 시행일과 조문을 인용하고,
+  문제가 특정 시점을 물으면 그 시점 버전으로 확인한다. 문제 파일 속 개인정보는 외부 검색에 넣지 않는다.
 - 호스트 도구를 자유롭게 쓴다. 오래 걸리는 명령에는 timeout을 건다. 설치돼 있는 것:
   - pwn: gdb(pwndbg), pwntools, ROPgadget, ropper, one_gadget, seccomp-tools, checksec, patchelf,
     pwninit(받은 libc·로더로 바이너리 맞추기), qemu-user
