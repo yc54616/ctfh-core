@@ -425,7 +425,7 @@ def _native_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--idle-seconds", type=int, help="멈춘 풀이 세션을 깨우기까지 기다리는 시간 (기본 180)")
     parser.add_argument("--nudge-limit", type=int, help="문제당 자동 재촉·재시작 최대 횟수, 넘으면 manual 상태로 사용자에게 넘김 (기본 3)")
     parser.add_argument("--solve-timeout", type=int, help="solve.py 재실행 제한 시간 초 (기본 300)")
-    parser.add_argument("--memory-max", help="풀이 창 전체가 함께 쓸 메모리 상한: auto(RAM의 95%%), 28G 같은 크기, off (기본 auto). CPU는 항상 95%%까지")
+    parser.add_argument("--memory-max", help="풀이 창 전체가 함께 쓸 메모리 상한: auto(RAM의 90%%), 28G 같은 크기, off (기본 auto). CPU는 항상 95%%까지")
 
 
 def _native_settings(args) -> ctfh_native.Options:

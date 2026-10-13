@@ -1670,7 +1670,7 @@ class CheckerFlowTests(Base):
                 patch("ctfh_core.native.set_slice_limits") as slice_limit:
             checker = self.checker(memory_max="auto")
             checker.tick()
-        slice_limit.assert_called_once_with("31129M")  # 95% of 32G, shared by every solver window
+        slice_limit.assert_called_once_with("29491M")  # 90% of 32G, shared by every solver window
         argv = checker.tmux.open["fuzz"]
         self.assertEqual(argv[:4], ["systemd-run", "--user", "--scope", "--quiet"])
         self.assertIn("--slice=ctfh.slice", argv)

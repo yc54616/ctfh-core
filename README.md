@@ -204,7 +204,7 @@ ctfh2 checker --help                         # Checker options.
 | `--idle-seconds N` | `180` | Wait before nudging an idle solver. |
 | `--nudge-limit N` | `3` | Automatic nudge/restart limit before handing control to you. |
 | `--solve-timeout N` | `300` | Seconds allowed for a `solve.py` reproduction. |
-| `--memory-max SIZE` | `auto` | Shared solver memory cap via systemd; `auto` is 95% of RAM, leaving the rest for Chrome and the desktop. Examples: `8G`, `off`. Not a per-window cap. The same slice always holds the solver windows to 95% of the CPUs. |
+| `--memory-max SIZE` | `auto` | Shared solver memory cap via systemd; `auto` is 90% of RAM, leaving the rest for Chrome and the desktop. Examples: `8G`, `off`. Not a per-window cap. The same slice always holds the solver windows to 95% of the CPUs. |
 | `--plain` | Not set | Text board instead of the interactive dashboard. |
 | `--no-attach` | Not set | Create the tmux session without attaching. |
 | `--secondary` | Not set | Use an existing `codex-secondary` executable. CTFH does not install this account wrapper. |

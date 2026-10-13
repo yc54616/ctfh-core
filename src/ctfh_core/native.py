@@ -99,7 +99,7 @@ class Options:
 
 # ---------------------------------------------------------------- memory
 
-MEMORY_SHARE = 0.95  # all solver windows together may use this much of RAM; the rest stays for Chrome and the desktop
+MEMORY_SHARE = 0.90  # all solver windows together may use this much of RAM; the rest stays for Chrome and the desktop
 CPU_SHARE = 0.95  # and this much of all CPUs, so the desktop and the checker stay responsive
 MEMORY_SLICE = "ctfh.slice"
 SWAP_PER_SOLVER = "512M"
@@ -117,7 +117,7 @@ def _meminfo(key: str) -> int:
 
 
 def memory_limit(setting: str | None) -> str | None:
-    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (95% of RAM)."""
+    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (90% of RAM)."""
     value = (setting or "auto").strip()
     if value.lower() in ("off", "none", "0"):
         return None
