@@ -422,7 +422,7 @@ def _native_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--review-thinking", choices=(*ctfh_native.EFFORTS, "same"),
                         help="writeup 검토 작업의 추론 강도 (same이면 --thinking과 같음, 기본 medium)")
     parser.add_argument("--rescan-minutes", type=int, help="새 문제·해결 상태 재수집 주기 (0이면 끔, 기본 60)")
-    parser.add_argument("--idle-seconds", type=int, help="멈춘 풀이 세션을 깨우기까지 기다리는 시간 (기본 180)")
+    parser.add_argument("--idle-seconds", type=int, help="멈춘 풀이 세션을 깨우기까지 기다리는 시간 (기본 30)")
     parser.add_argument("--nudge-limit", type=int, help="문제당 자동 재촉·재시작 최대 횟수, 넘으면 manual 상태로 사용자에게 넘김 (기본 3)")
     parser.add_argument("--solve-timeout", type=int, help="solve.py 재실행 제한 시간 초 (기본 300)")
     parser.add_argument("--memory-max", help="풀이 창 전체가 함께 쓸 메모리 상한: auto(RAM의 90%%), 28G 같은 크기, off (기본 auto)")
@@ -450,7 +450,7 @@ def _native_settings(args) -> ctfh_native.Options:
         max_instances=max(0, int(pick("instances", "max_instances", 3))),
         submit=not args.no_submit and bool(config.get("submit", True)),
         plain=args.plain or bool(config.get("plain", False)),
-        rescan_seconds=max(0, int(rescan)) * 60, idle_seconds=int(pick("idle_seconds", "idle_seconds", 180)),
+        rescan_seconds=max(0, int(rescan)) * 60, idle_seconds=int(pick("idle_seconds", "idle_seconds", 30)),
         nudge_limit=int(pick("nudge_limit", "nudge_limit", 3)),
         solve_timeout=int(pick("solve_timeout", "solve_timeout", 300)),
         memory_max=str(pick("memory_max", "memory_max", "auto")),

@@ -201,7 +201,7 @@ ctfh2 checker --help                         # Checker options.
 | `--submit-thinking LEVEL` | `low` | Submission reasoning, on the main model. |
 | `--review-thinking LEVEL` | `medium` | Write-up review reasoning, on the main model. |
 | `--rescan-minutes N` | `60` | Full discovery interval; `0` disables periodic full rescans. Other checker checks continue. Newly released challenges are also caught within minutes: see below the table. |
-| `--idle-seconds N` | `180` | Wait before nudging an idle solver. |
+| `--idle-seconds N` | `30` | Wait before nudging an idle solver. |
 | `--nudge-limit N` | `3` | Automatic nudge/restart limit before handing control to you. |
 | `--solve-timeout N` | `300` | Seconds allowed for a `solve.py` reproduction. |
 | `--memory-max SIZE` | `auto` | Shared solver memory cap via systemd; `auto` is 90% of RAM, leaving the rest for Chrome and the desktop. Examples: `8G`, `off`. Not a per-window cap. |
@@ -229,7 +229,7 @@ rescan_thinking = "low"
 submit_thinking = "low"
 review_thinking = "medium"
 rescan_minutes = 60
-idle_seconds = 180
+idle_seconds = 30
 nudge_limit = 3
 solve_timeout = 300
 memory_max = "8G"

@@ -201,7 +201,7 @@ ctfh2 checker --help                         # 검사기 옵션 보기
 | `--submit-thinking LEVEL` | `low` | 제출 작업 추론 강도. 모델은 주 모델 사용. |
 | `--review-thinking LEVEL` | `medium` | 풀이 문서 검토 추론 강도. 모델은 주 모델 사용. |
 | `--rescan-minutes N` | `60` | 전체 문제 목록 재수집 간격. `0`이면 주기적 전체 재수집을 끔. 다른 검사기 확인 작업은 계속됨. |
-| `--idle-seconds N` | `180` | 멈춘 풀이 창을 재촉하기 전 대기 시간(초). |
+| `--idle-seconds N` | `30` | 멈춘 풀이 창을 재촉하기 전 대기 시간(초). |
 | `--nudge-limit N` | `3` | 사용자에게 넘기기 전 자동 재촉·재시작 최대 횟수. |
 | `--solve-timeout N` | `300` | `solve.py` 재현 제한 시간(초). |
 | `--memory-max SIZE` | `auto` | systemd로 제한하는 풀이 창 전체의 공유 메모리 상한. `auto`는 RAM의 98%. 예: `8G`, `off`. 창 하나당 제한이 아님. |
@@ -227,7 +227,7 @@ rescan_thinking = "low"
 submit_thinking = "low"
 review_thinking = "medium"
 rescan_minutes = 60
-idle_seconds = 180
+idle_seconds = 30
 nudge_limit = 3
 solve_timeout = 300
 memory_max = "8G"

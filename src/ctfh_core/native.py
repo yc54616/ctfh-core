@@ -72,7 +72,7 @@ class Options:
     max_instances: int = 3  # challenges that start an instance on the site, open at once; 0: no limit
     submit: bool = True
     rescan_seconds: int = 3600
-    idle_seconds: int = 180
+    idle_seconds: int = 30
     nudge_limit: int = 3
     solve_timeout: int = 300
     memory_max: str = "auto"
