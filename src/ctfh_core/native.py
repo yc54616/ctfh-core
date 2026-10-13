@@ -412,8 +412,11 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 - 사이트에서 VM/인스턴스를 켜거나 접속 정보를 읽기 전에, 열린 문제 창의 제목이 challenge.json의 name과 같은지
   먼저 확인한다. 다른 문제의 창·인스턴스·서비스면 쓰지 않고 닫은 뒤 이 문제를 다시 연다.
   받은 접속 정보는 어느 문제 창에서 얻었는지와 함께 `work/NOTES.md`에 적는다.
-- 사이트에서 인스턴스를 켰으면, 풀이를 마치거나 그만둘 때 사이트에서 그 인스턴스를 끈다. 동시에 켤 수 있는 수가
-  정해져 있어서 다른 문제가 그 자리를 기다린다.
+- 사이트 인스턴스는 동시에 켤 수 있는 수가 정해져 있어서 검사기가 자리를 나눠 준다. 검사기가 "인스턴스 자리를 받았다"고
+  알려 주기 전에는 켜지 않는다. 그전에는 첨부 분석, 로컬 재현, 익스플로잇 작성처럼 인스턴스 없이 할 수 있는 일을 한다.
+  원격이 필요해지면 `need-instance` 파일에 이유를 한 줄 쓰고, 로컬 일을 하며 차례를 기다린다.
+- 자리를 받아 인스턴스를 켰으면 원격 작업을 하고, 검사기가 solve.py로 flag를 다시 확인할 때까지 켜 둔다. 원격이 더
+  필요 없으면 (확인이 끝났거나 그만둘 때) 사이트에서 인스턴스를 끄고 `need-instance`를 지운다. 다른 문제가 그 자리를 기다린다.
 - 원격 서버 주소를 알면 `remote.txt`에 한 줄에 하나씩 적는다 (`host:port`, `nc host port`, URL). 주소가 바뀌면 고친다.
   서버가 닫혀 있으면 검사기가 이 주소를 지켜보다가 열리는 순간 알려 준다.
 - 문제 서비스(문제 웹앱, 문제가 쓰는 외부 서비스)에 회원가입·로그인이 필요하면 묻지 말고 직접 가입한다.
@@ -785,6 +788,15 @@ def instance_rank(chal: Path) -> tuple:
     """Place in the instance queue: the user's picks in the order picked, then the most-solved (easiest) first."""
     picked = instance_pick(chal)
     return (0, picked, "") if picked is not None else (1, -_solves(chal), chal.name)
+
+
+INSTANCE_REQUEST = "need-instance"  # a solver asks here for an instance slot; it goes back once the file is gone
+
+
+def starts_on_instance(chal: Path) -> bool:
+    """An instance challenge with no attachments to study first: its solver holds an instance slot from the start."""
+    info = _read_json(chal / "challenge.json", {})
+    return needs_instance(chal) and not (isinstance(info, dict) and info.get("attachments"))
 
 
 def files_ready(chal: Path, status: dict) -> bool:
@@ -1629,6 +1641,11 @@ class Checker:
     # -- solver windows
     def launch(self, chal: Path, status: dict, resume: bool = False, count: bool = True) -> None:
         prompt = SOLVER_PROMPT + (" 세션이 다시 시작됐다. status.json도 확인해라." if resume else "")
+        if "instance_slot" in status:
+            prompt += " 이 문제의 인스턴스 자리를 받았다. 사이트에서 인스턴스를 켜고 풀어도 된다."
+        elif needs_instance(chal):
+            prompt += (" 인스턴스는 아직 켜지 마라. 첨부부터 분석하고, 원격이 필요해지면 "
+                       f"{INSTANCE_REQUEST} 파일에 이유를 한 줄 쓴 뒤 검사기가 알려 줄 때까지 로컬 일을 해라.")
         argv = memory_prefix(self.opts, chal) + ["env", f"AGENT_BROWSER_SESSION={solver_session(chal)}"] \
             + env_prefix(self.opts.binary) \
             + codex_argv(self.opts, chal, prompt, interactive=True)
@@ -1643,6 +1660,14 @@ class Checker:
         status.update(launched_at=_now(), launched_ts=time.time())
         status.setdefault("first_launched_ts", status["launched_ts"])
         save_status(chal, status)
+
+    def grant(self, chal: Path) -> None:
+        status = load_status(chal)
+        status["instance_slot"] = time.time()
+        save_status(chal, status)
+        self.tell(chal, "인스턴스 자리를 받았다. 사이트에서 이 문제의 인스턴스를 켜고 remote.txt를 적은 뒤 원격 작업을 해라. "
+                        "검사기가 solve.py로 flag를 다시 확인할 때까지 켜 두고, 원격이 더 필요 없으면 사이트에서 "
+                        f"인스턴스를 끄고 {INSTANCE_REQUEST} 파일을 지워라.")
 
     def tell(self, chal: Path, text: str) -> None:
         if window_name(chal.name) in self.tmux.windows():
@@ -1946,8 +1971,9 @@ class Checker:
                       reason=f"{REMOTE_DOWN_REASON}: {', '.join(endpoints)}")
         save_status(chal, status)
         self.tell(chal, f"서버가 닫혀 있다 ({', '.join(endpoints)}). 원격 재시도는 멈추고 기다려라. "
-                        "로컬에서 할 일이 남았으면 마치고 work/NOTES.md에 적어라. 인스턴스를 켜야 하는 "
-                        "문제면 사이트에서 이 문제의 인스턴스를 다시 켜고 remote.txt를 고쳐라. "
+                        "로컬에서 할 일이 남았으면 마치고 work/NOTES.md에 적어라. 인스턴스 자리를 받은 "
+                        "문제면 사이트에서 이 문제의 인스턴스를 다시 켜고 remote.txt를 고쳐라. 자리가 없으면 "
+                        f"{INSTANCE_REQUEST} 파일로 요청해라. "
                         "서버가 열리면 검사기가 알려 준다.")
 
     def watch_remote(self, chal: Path, status: dict) -> None:
@@ -2088,19 +2114,31 @@ class Checker:
     def fill_slots(self, windows: set[str]) -> None:
         """Start pending solvers and restart exited ones, up to max_parallel windows (0: no limit)."""
         challenges = self.contest.challenges()
-        for chal in challenges:  # a solver asked to make room has had its time: close it, it comes back from the queue
+        for chal in challenges:  # instance slots: give back the ones done with, close solvers that would not make room
             status = load_status(chal)
-            if status.get("yielding") and (window_name(chal.name) not in windows
-                                           or time.time() - status["yielding"] > YIELD_SECONDS):
-                self.close(chal)
+            if "instance_slot" not in status and not status.get("yielding"):
+                continue
+            opened = window_name(chal.name) in windows
+            if opened and (status.get("state") in FINISHED or not (chal / INSTANCE_REQUEST).exists()):
+                status.pop("instance_slot", None)
+                status.pop("yielding", None)
+            elif status.get("yielding") and (not opened or time.time() - status["yielding"] > YIELD_SECONDS):
+                self.close(chal)  # asked to make room and had its time: it comes back from the queue
                 windows.discard(window_name(chal.name))
+                status.pop("instance_slot", None)
                 status.pop("yielding", None)
                 status["queued"] = True
-                save_status(chal, status)
+                (chal / INSTANCE_REQUEST).unlink(missing_ok=True)
+            elif not opened:
+                status.pop("instance_slot", None)
+                (chal / INSTANCE_REQUEST).unlink(missing_ok=True)
+            else:
+                continue
+            save_status(chal, status)
         running = sum(1 for chal in challenges if window_name(chal.name) in windows)
-        live = [chal for chal in challenges if window_name(chal.name) in windows
-                and load_status(chal).get("state") not in FINISHED and needs_instance(chal)]
-        instances = len(live)
+        live = [chal for chal in challenges if "instance_slot" in load_status(chal)]
+        asking = [chal for chal in challenges if window_name(chal.name) in windows and (chal / INSTANCE_REQUEST).exists()
+                  and "instance_slot" not in load_status(chal) and load_status(chal).get("state") not in FINISHED]
         restart, fresh = [], []
         for chal in challenges:
             if window_name(chal.name) in windows or chal.name in self.jobs:
@@ -2121,44 +2159,67 @@ class Checker:
         if self.opts.max_parallel:  # limited slots: the most-solved (easiest) new challenges first
             fresh.sort(key=lambda item: -_solves(item[0]))
         items = restart + fresh
-        queue = iter(sorted((item for item in items if needs_instance(item[0])), key=lambda item: instance_rank(item[0])))
-        items = [next(queue) if needs_instance(item[0]) else item for item in items]  # instance ones in queue order
+        upfront = {chal.name for chal, _ in items if starts_on_instance(chal)}
+        queue = iter(sorted((item for item in items if item[0].name in upfront), key=lambda item: instance_rank(item[0])))
+        items = [next(queue) if item[0].name in upfront else item for item in items]  # instance ones in queue order
+        # One queue for instance slots: running solvers that asked for one, and challenges that need one to start.
+        # Challenges with attachments start without a slot and ask once they need the remote.
+        wanting = sorted([(chal, None) for chal in asking] + [item for item in items if item[0].name in upfront],
+                         key=lambda item: instance_rank(item[0]))
+        free = self.opts.max_instances - len(live) if self.opts.max_instances else len(wanting)
+        allowed = set()
+        for chal, status in wanting[:max(0, free)]:
+            if status is None:
+                self.grant(chal)
+            else:
+                allowed.add(chal.name)
+        left = wanting[max(0, free):]
+        self.memory_wait, self.instance_wait = False, len(left)
         if self.opts.max_instances:  # a picked challenge waiting on a full limit: the lowest unpicked one makes room
-            waiting = sum(1 for chal, _ in items if instance_pick(chal) is not None) \
-                - max(0, self.opts.max_instances - instances)
+            waiting = sum(1 for chal, _ in left if instance_pick(chal) is not None)
             waiting -= sum(1 for chal in live if load_status(chal).get("yielding"))
             for chal in sorted((c for c in live if instance_pick(c) is None and not load_status(c).get("yielding")),
                                key=instance_rank, reverse=True)[:max(0, waiting)]:
                 status = load_status(chal)
                 status["yielding"] = time.time()
                 save_status(chal, status)
-                self.tell(chal, "사용자가 다른 인스턴스 문제를 먼저 풀도록 지정해서 이 문제는 잠시 쉰다. 지금까지 한 것과 다음에 "
-                                "할 일을 work/NOTES.md에 적고, 사이트에서 이 문제의 인스턴스를 끈 뒤 멈춰라. "
-                                f"{YIELD_SECONDS // 60}분 뒤 창이 닫히고, 자리가 나면 이어서 연다.")
-        self.memory_wait, self.instance_wait = False, 0
+                if starts_on_instance(chal):
+                    self.tell(chal, "사용자가 다른 인스턴스 문제를 먼저 풀도록 지정해서 이 문제는 잠시 쉰다. 지금까지 한 것과 다음에 "
+                                    "할 일을 work/NOTES.md에 적고, 사이트에서 이 문제의 인스턴스를 끈 뒤 멈춰라. "
+                                    f"{YIELD_SECONDS // 60}분 뒤 창이 닫히고, 자리가 나면 이어서 연다.")
+                else:
+                    self.tell(chal, "사용자가 다른 인스턴스 문제를 먼저 풀도록 지정해서 인스턴스 자리를 넘긴다. 원격에서 알아낸 것을 "
+                                    f"work/NOTES.md에 적고, 사이트에서 이 문제의 인스턴스를 끈 뒤 {INSTANCE_REQUEST} 파일을 "
+                                    "지워라. 로컬 작업은 계속해도 되고, 원격이 다시 필요하면 그 파일을 다시 만들어 차례를 "
+                                    f"기다려라. {YIELD_SECONDS // 60}분 안에 지우지 않으면 창을 닫는다.")
         for chal, status in items:
             if self.opts.max_parallel and running >= self.opts.max_parallel:
                 return
-            instance = bool(self.opts.max_instances) and needs_instance(chal)
-            if instance and instances >= self.opts.max_instances:  # the site lets only so many run at once:
-                self.instance_wait += 1  # the rest wait while challenges without one go ahead
-                continue
+            if chal.name in upfront and self.opts.max_instances and chal.name not in allowed:
+                continue  # the site lets only so many run at once: the rest wait while the others go ahead
             total, available = _meminfo("MemTotal"), _meminfo("MemAvailable")
             if total and available and available < total * (1 - MEMORY_SHARE):
                 self.memory_wait = True
                 return
             queued = bool(status.pop("queued", None))  # made room for a picked one: not a failure, no nudge used
+            if chal.name in upfront:
+                (chal / INSTANCE_REQUEST).write_text("첨부가 없어 처음부터 인스턴스가 필요함\n")
+                status["instance_slot"] = time.time()
             self.launch(chal, status, resume=status.get("state") not in ("pending", "blocked"), count=not queued)
             running += 1
-            instances += instance
 
     def view(self) -> tuple[list[str], list[dict]]:
         """Head lines and one row per challenge; challenges waiting for the user come first."""
         rows, total = [], 0
         windows = self.tmux.windows()
-        waiting = sorted((chal for chal in self.contest.challenges() if needs_instance(chal)
-                          and window_name(chal.name) not in windows and load_status(chal).get("state") not in FINISHED),
-                         key=instance_rank)
+        def asks(chal: Path) -> bool:  # waits for an instance slot: to start, or while solving
+            status = load_status(chal)
+            if status.get("state") in FINISHED or "instance_slot" in status:
+                return False
+            if window_name(chal.name) in windows:
+                return (chal / INSTANCE_REQUEST).exists()
+            return starts_on_instance(chal)
+        waiting = sorted((chal for chal in self.contest.challenges() if asks(chal)), key=instance_rank)
         place = {chal.name: i + 1 for i, chal in enumerate(waiting)}
         for chal in self.contest.challenges():
             status = load_status(chal)
@@ -2178,9 +2239,12 @@ class Checker:
                          "category": str(_read_json(chal / "challenge.json", {}).get("category") or ""),
                          "tokens_n": tokens or 0, "tokens": (f"{tokens / 10000:.1f}만" if tokens >= 10000 else f"{tokens:,}") if tokens else "-",
                          "activity": "" if activity == "-" else activity, "reason": reason,
-                         "instance": needs_instance(chal), "picked": instance_pick(chal) is not None,
-                         "queue": "" if not needs_instance(chal) else "실행" if window_name(chal.name) in windows
-                         and state not in FINISHED else f"대기 {place[chal.name]}" if chal.name in place else "◆"})
+                         "instance": needs_instance(chal) or "instance_slot" in status or chal.name in place,
+                         "picked": instance_pick(chal) is not None,
+                         "queue": "" if not needs_instance(chal) and "instance_slot" not in status
+                         and chal.name not in place else "사용" if "instance_slot" in status
+                         else f"대기 {place[chal.name]}" if chal.name in place
+                         else "분석" if window_name(chal.name) in windows and state not in FINISHED else "◆"})
         group_order = {"!": 0, "●": 1, "⏳": 2, "✓": 3}
         rows.sort(key=lambda row: (group_order[row["group"]], BOARD_ORDER.get(row["state"], 2)))  # stable by name
         manual = [row["name"] for row in rows if row["state"] == "manual"]
@@ -2272,7 +2336,7 @@ class Checker:
             if action == "instance":
                 instance = not needs_instance(chal)
                 (chal / ".instance").write_text("yes\n" if instance else "no\n")
-                return f"{name}: " + ("인스턴스 문제로 지정했습니다. 인스턴스 한도 안에서만 열립니다." if instance
+                return f"{name}: " + ("인스턴스 문제로 지정했습니다. 인스턴스는 한도 안에서 차례로 켭니다." if instance
                                       else "인스턴스 문제에서 뺐습니다. 한도 없이 열립니다.")
             if action == "done":
                 (chal / "USER_SOLVED").write_text(_now() + "\n")

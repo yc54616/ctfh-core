@@ -24,7 +24,7 @@ STYLES = {"needs_user": "bold red", "manual": "bold yellow", "hold": "blue", "un
 COLUMNS = [("group", ""), ("name", "문제"), ("category", "분류"), ("instance", "인스턴스"), ("label", "상태"), ("tokens", "토큰"),
            ("elapsed", "시간"), ("activity", "활동"), ("reason", "메모")]
 SORT_KEYS = {"name": lambda row: row["name"], "category": lambda row: (row["category"], row["name"]),
-             "instance": lambda row: (not row.get("instance"), not row["queue"].startswith("실행"),
+             "instance": lambda row: (not row.get("instance"), not row["queue"].startswith("사용"),
                                       int(row["queue"].split()[-1]) if row["queue"].startswith("대기") else 0, row["name"]),
              "label": lambda row: (row["label"], row["name"]), "tokens": lambda row: row["tokens_n"],
              "elapsed": lambda row: row["elapsed_n"],
@@ -86,8 +86,9 @@ ACTIONS = [("jump", "enter", "창으로 이동", "이 문제의 풀이 창(tmux)
 HELP = """표
   ↑/↓  문제 고르기        Enter  풀이 창으로 이동     Space/m  문제 메뉴
   o    노트 보기          n  재촉     r  다시 열기     p  보류     d  해결 표시
-  i    인스턴스 우선 지정/해제: 큐 맨 앞으로. 한도가 차 있으면 지정 안 된 문제 하나가
-       노트를 적고 인스턴스를 끈 뒤 2분 안에 쉬고, 자리가 나면 이어서 연다
+  i    인스턴스 우선 지정/해제: 자리 큐 맨 앞으로. 한도가 차 있으면 지정 안 된 문제 하나가
+       노트를 적고 인스턴스를 끈 뒤 2분 안에 자리를 넘긴다 (첨부 없는 문제는 창을 닫고, 자리가 나면 이어서 연다)
+       인스턴스 칸: 사용 = 자리 받음 · 대기 n = 자리 순서 · 분석 = 자리 없이 첨부를 보는 중
   I    인스턴스 문제 맞음/아님 (자동 판단이 틀렸을 때)
   t    정렬 바꾸기 (머리글을 눌러도 됨)
 

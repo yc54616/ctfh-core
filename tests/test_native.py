@@ -1307,6 +1307,38 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("hard").get("nudges", 0), 0)
         self.assertIn("우선 지정을 풀었습니다", checker.act("pick", "mine"))
 
+    def test_instance_challenges_with_attachments_study_first_and_take_a_slot_only_for_the_remote(self):
+        for slug, solves, attachments in (("vm", 90, True), ("web", 50, False), ("web2", 10, False)):
+            chal = make_challenge(self.root, slug)
+            info = {"name": slug, "instance": True, "solves": solves}
+            if attachments:
+                info["attachments"] = [{"url": "https://ctf.example.com/files/vm.zip", "name": "vm.zip"}]
+                (chal / "files" / native.FILES_DONE).write_text("")
+            (chal / "challenge.json").write_text(json.dumps(info))
+        checker = self.checker(max_instances=1)
+        queue = lambda: {row["name"]: row["queue"] for row in checker.view()[1]}
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"vm", "web"})  # vm opens without a slot, web needs one to start
+        self.assertEqual(queue(), {"vm": "분석", "web": "사용", "web2": "대기 1"})
+        self.assertIn("아직 켜지 마라", " ".join(checker.tmux.open["vm"]))
+        self.assertIn("자리를 받았다", " ".join(checker.tmux.open["web"]))
+        vm, web = self.root / "challenges" / "vm", self.root / "challenges" / "web"
+        (vm / native.INSTANCE_REQUEST).write_text("원격 libc 확인\n")  # vm's solver needs the remote now
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "대기 1", "web": "사용", "web2": "대기 2"})
+        (web / native.INSTANCE_REQUEST).unlink()  # web is done with its instance
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "사용", "web": "분석", "web2": "대기 1"})  # the slot goes to the next in line
+        self.assertTrue(any(name == "vm" and "인스턴스 자리를 받았다" in text for name, text in checker.tmux.sent))
+        self.assertIn("우선 지정했습니다", checker.act("pick", "web2"))
+        checker.tick()
+        self.assertTrue(any(name == "vm" and "자리를 넘긴다" in text for name, text in checker.tmux.sent))
+        (vm / native.INSTANCE_REQUEST).unlink()  # it turned its instance off in time: its window stays
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"vm", "web", "web2"})
+        self.assertEqual(queue(), {"vm": "분석", "web": "분석", "web2": "사용"})
+        self.assertFalse(self.status("vm").get("yielding"))
+
     def test_limited_slots_open_easiest_first_and_limit_changes_live(self):
         for slug, solves in (("hard", 5), ("easy", 50), ("unknown", None)):
             chal = make_challenge(self.root, slug)
