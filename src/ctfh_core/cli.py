@@ -472,7 +472,10 @@ def _native_main(args) -> int:
         if not checker.opts.plain and sys.stdin.isatty() and sys.stdout.isatty():
             from .native_tui import run_dashboard
             run_dashboard(checker)
-            return 0
+            # Submits were waited for; collects, downloads and reviews still running are redone by the next checker.
+            ctfh_native.stop_runs()
+            sys.stdout.flush()
+            os._exit(0)
         try:
             checker.run()
         except KeyboardInterrupt:

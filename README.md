@@ -127,7 +127,7 @@ Select a row with the arrow keys or mouse:
 | `s` | Rescan the site now. |
 | `t` | Sort by the next column; clicking a header also changes sorting. |
 | `+` / `-` | Adjust the solver-window limit. This override survives checker restarts unless the configured `--max-parallel` value changes. |
-| `q` / `Ctrl-c` | Quit the checker. **Solver windows continue running.** |
+| `q` / `Ctrl-c` | Quit the checker. **Solver windows continue running.** A submit in progress is waited for (up to 90 s); press again to quit at once. |
 
 These are dashboard shortcuts. Inside a solver window, interact with Codex normally.
 

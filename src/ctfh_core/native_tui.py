@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -13,7 +14,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
-from .native import Checker, window_name
+from .native import SUBMIT_GRACE, Checker, window_name
 
 STYLES = {"needs_user": "bold red", "manual": "bold yellow", "hold": "blue", "unknown": "bold red", "blocked": "red", "needs_fix": "magenta",
           "checking": "cyan", "verified": "cyan", "submitting": "cyan", "accepted": "green",
@@ -224,6 +225,7 @@ class CheckerApp(App):
         self.checker = checker
         self.stop, self.wake = threading.Event(), threading.Event()
         self.sort: tuple[str, bool] | None = None  # (column, descending); None keeps the board's grouping
+        self.quitting = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="head")
@@ -234,6 +236,28 @@ class CheckerApp(App):
     def on_mount(self) -> None:
         self.set_columns()
         threading.Thread(target=self.loop, name="checker", daemon=True).start()
+
+    def action_quit(self) -> None:
+        """Wait for submits already on their way, so the next checker need not guess whether they were taken."""
+        names = sorted(self.checker.submitting)
+        if not names or self.quitting:  # a second q quits at once
+            self.exit()
+            return
+        self.quitting = True
+        self.stop.set()  # no new submits meanwhile
+        self.wake.set()
+        self.notify(f"제출 중인 {', '.join(names)}의 결과를 기다린 뒤 종료합니다 (최대 {SUBMIT_GRACE}초). "
+                    "q를 한 번 더 누르면 바로 종료합니다.", timeout=SUBMIT_GRACE)
+        threading.Thread(target=self.quit_after_submits, name="quit", daemon=True).start()
+
+    def quit_after_submits(self) -> None:
+        deadline = time.time() + SUBMIT_GRACE
+        while self.checker.submitting and time.time() < deadline:
+            time.sleep(0.2)
+        try:
+            self.call_from_thread(self.exit)
+        except RuntimeError:  # already gone
+            pass
 
     def on_unmount(self) -> None:
         self.stop.set()

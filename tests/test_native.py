@@ -424,6 +424,44 @@ class CheckerFlowTests(Base):
         self.assertEqual(self.status("misc")["state"], "accepted")
         self.assertEqual(len(self.status("misc")["submissions"]), 2)
 
+    def test_quitting_waits_for_a_submit_on_its_way_and_a_second_q_quits_at_once(self):
+        from ctfh_core.native_tui import CheckerApp
+        chal = make_challenge(self.root, "misc")
+        write_solution(chal)
+        native.save_status(chal, {"state": "verified", "flag_sha256": native.flag_hash("FLAG{abc}")})
+        seen = []
+
+        class Watching(FakeRunner):
+            def __call__(self, *args, **kwargs):
+                seen.append(sorted(checker.submitting))
+                return super().__call__(*args, **kwargs)
+
+        checker = self.checker(Watching(submit=[{"result": "accepted", "message": ""}]))
+        checker.job_submit(chal)
+        self.assertEqual((seen, checker.submitting), ([["misc"]], set()))
+
+        async def drive(second_q):
+            exits = []
+            with patch.object(CheckerApp, "loop", lambda app: None):
+                app = CheckerApp(checker)
+                async with app.run_test(size=(140, 30)) as pilot:
+                    app.exit = lambda *args, **kwargs: exits.append(1)
+                    checker.submitting.add("misc")
+                    await pilot.press("q")
+                    await pilot.pause(0.5)
+                    self.assertEqual((exits, app.stop.is_set()), ([], True))  # no new submits start meanwhile
+                    if second_q:
+                        await pilot.press("q")
+                    else:
+                        checker.submitting.discard("misc")
+                        await pilot.pause(0.5)
+                    self.assertEqual(exits, [1])
+                    checker.submitting.clear()
+                    await pilot.pause(0.3)
+
+        asyncio.run(drive(second_q=False))
+        asyncio.run(drive(second_q=True))
+
     def test_unclear_submit_is_resent_three_times_then_left_to_the_user(self):
         chal = make_challenge(self.root, "pwn")
         runner = FakeRunner(submit=[{"result": "unknown", "message": "timeout"}] * 4)

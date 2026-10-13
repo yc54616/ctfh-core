@@ -215,6 +215,7 @@ USAGE_WARN = 90  # weekly Codex usage % shown as a warning on the board
 OUTAGE_CHECK_SECONDS = 60  # how often to look for an outage that stalls every solver at once
 SUBMIT_RETRIES = 3  # resend a flag whose submit outcome stayed unclear this many times
 SUBMIT_RETRY_SECONDS = 120
+SUBMIT_GRACE = 90  # q waits this long for submits already on their way to the site
 OUTAGE_PROBE_SECONDS = 600  # while paused on a usage limit, prod one window this often to see if it lifted
 OFFLINE = "인터넷 또는 Codex 서버에 연결되지 않음"
 OUTAGE_PATTERN = re.compile(r"usage limit|rate limit|stream disconnected|error sending request|Reconnecting\.\.\.|"
@@ -715,6 +716,18 @@ def describe_event(event: dict) -> str | None:
     return None
 
 
+RUNNING: set[subprocess.Popen] = set()  # the checker's codex exec runs, stopped when it quits
+
+
+def stop_runs() -> None:
+    """Kill the checker's codex exec runs: the next checker redoes them, and an orphan would not be read."""
+    for proc in list(RUNNING):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def run_codex_json(opts: Options, cwd: Path, prompt: str, schema: dict, work: Path,
                    name: str, timeout: int = 3600, show=None, redact: tuple[str, ...] = ()) -> dict:
     """Run one ``codex exec`` turn, stream readable progress, return its schema-shaped final message.
@@ -739,6 +752,7 @@ def run_codex_json(opts: Options, cwd: Path, prompt: str, schema: dict, work: Pa
         proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace",
                                 env=codex_environment(opts.binary), start_new_session=True)
+        RUNNING.add(proc)
         timer = threading.Timer(timeout, lambda: (expired.set(), os.killpg(proc.pid, signal.SIGKILL)))
         timer.start()
         try:
@@ -758,6 +772,7 @@ def run_codex_json(opts: Options, cwd: Path, prompt: str, schema: dict, work: Pa
             proc.wait()
         finally:
             timer.cancel()
+            RUNNING.discard(proc)
     if expired.is_set():
         raise RuntimeError(f"{name}: codex exec가 {timeout}초 안에 끝나지 않았습니다")
     if proc.returncode:
@@ -1675,6 +1690,7 @@ class Checker:
         self.contest, self.opts, self.tmux, self.runner = contest, opts, tmux, runner
         self.pool = cf.ThreadPoolExecutor(max_workers=6)  # collect and download may run for long
         self.jobs: dict[str, cf.Future] = {}
+        self.submitting: set[str] = set()  # challenges whose submit job runs now; q waits for them
         # Downloads and submits, all at once and off the check pool: each runs in a Chrome session of its own.
         self.browser_pool = cf.ThreadPoolExecutor(max_workers=256)
         # A site.json from before list_api existed: rescan once now so new challenges can be watched for.
@@ -1810,6 +1826,13 @@ class Checker:
             self.tell(chal, "flag 재현 확인됨 (자동 제출 꺼짐). writeup.md를 마무리해라.")
 
     def job_submit(self, chal: Path) -> None:
+        self.submitting.add(chal.name)
+        try:
+            self.submit_now(chal)
+        finally:
+            self.submitting.discard(chal.name)
+
+    def submit_now(self, chal: Path) -> None:
         status = load_status(chal)
         # Record the attempt before the browser acts, so a restart knows it may have gone out.
         status.update(state="submitting", reason="사이트에 제출하는 중입니다.")
