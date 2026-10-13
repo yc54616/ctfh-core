@@ -583,6 +583,55 @@ class CheckerFlowTests(Base):
         checker.tick()
         self.assertEqual(queue(), {"vm": "사용", "pwn": "분석"})
 
+    def test_reopened_windows_carry_on_their_conversation_and_windows_lost_with_tmux_keep_slot_and_nudges(self):
+        chal = make_challenge(self.root, "heap")
+        checker = self.checker()
+        checker.tick()
+        day = self.home / "sessions" / time.strftime("%Y/%m/%d")
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "rollout-heap.jsonl").write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "sess-1", "cwd": str(chal), "source": "cli"}}) + "\n")
+        checker.tick()
+        self.assertTrue(self.status("heap")["session_file"].endswith("rollout-heap.jsonl"))
+
+        def window_gone(age):
+            checker.tmux.kill("heap")
+            status = self.status("heap")
+            status["launched_ts"] -= age
+            native.save_status(chal, status)
+
+        window_gone(600)  # the window exited by itself
+        checker.tick()
+        argv = checker.tmux.open["heap"]
+        self.assertIn("resume", argv)
+        self.assertEqual(argv[-2], "sess-1")
+        self.assertIn("이어서", argv[-1])
+        self.assertEqual(self.status("heap")["nudges"], 1)
+        window_gone(61)  # the resumed conversation died at once: a new one next time
+        checker.tick()
+        self.assertNotIn("resume", checker.tmux.open["heap"])
+        self.assertEqual(self.status("heap")["nudges"], 2)
+
+        (chal / native.INSTANCE_REQUEST).write_text("원격 확인\n")
+        status = self.status("heap")
+        status.update(instance_slot=time.time(), launched_ts=status["launched_ts"] - 600)
+        native.save_status(chal, status)
+        (day / "rollout-heap.jsonl").touch()
+        again = self.checker()  # tmux went down with the terminal; a new checker starts
+        again.tick()
+        self.assertIn("resume", again.tmux.open["heap"])
+        self.assertIn("자리를 받았다", again.tmux.open["heap"][-1])
+        self.assertEqual(self.status("heap")["nudges"], 2)  # not the solver's doing: no nudge spent
+        self.assertIn("instance_slot", self.status("heap"))
+        self.assertTrue((chal / native.INSTANCE_REQUEST).exists())
+
+    def test_the_tmux_server_starts_in_a_scope_of_its_own(self):
+        with patch.object(native.shutil, "which", return_value="/usr/bin/systemd-run"):
+            scope = native.server_scope(self.root, native.Options())
+        self.assertEqual(scope[:4], ["systemd-run", "--user", "--scope", "--quiet"])
+        self.assertIn("--slice=ctfh.slice", scope)
+        self.assertNotIn("OOMPolicy=continue", scope)
+
     def test_a_solver_waiting_for_the_user_is_shown_and_not_nudged(self):
         chal = make_challenge(self.root, "captcha")
         checker = self.checker(idle_seconds=0)

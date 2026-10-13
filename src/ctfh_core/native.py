@@ -436,10 +436,11 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
   알려 주기 전에는 켜지 않는다. 그전에는 첨부 분석, 로컬 재현, 익스플로잇 작성처럼 인스턴스 없이 할 수 있는 일을 한다.
   원격을 살펴봐야 하면 `need-instance` 파일에 이유를 한 줄 쓰고, 로컬 일을 하며 차례를 기다린다.
 - 로컬에서 익스플로잇이 통해 solve.py를 원격에 돌리기만 하면 되면 `remote-ready` 파일을 만든다. 확인 전용 자리가 있어
-  금방 차례가 온다. 그 자리에서는 원격에서 디버깅하지 않는다: 켜고 solve.py를 한 번 돌려 통하면 검사기 재현 확인까지
-  마치고, 통하지 않으면 바로 인스턴스를 끄고 `remote-ready`를 지운 뒤 로컬 분석으로 돌아간다.
-- 자리를 받아 인스턴스를 켰으면 검사기가 solve.py로 flag를 다시 확인할 때까지 켜 둔다. 원격이 더 필요 없으면 (확인이
-  끝났거나 그만둘 때) 사이트에서 인스턴스를 끄고 `need-instance`·`remote-ready`를 지운다. 다른 문제가 그 자리를 기다린다.
+  금방 차례가 온다. 그 자리에서는 원격에서 디버깅하지 않는다: 켜고 solve.py를 한 번 돌려 통하면 검사기가 제출 결과를
+  알려 줄 때까지 켜 두고, 통하지 않으면 바로 인스턴스를 끄고 `remote-ready`를 지운 뒤 로컬 분석으로 돌아간다.
+- 자리를 받아 인스턴스를 켰으면 검사기가 제출 결과를 알려 줄 때까지 켜 둔다. 인스턴스마다 flag가 다른 문제는 끄면
+  받은 flag가 무효가 될 수 있다. 원격이 더 필요 없으면 (정답 처리됐거나 그만둘 때) 사이트에서 인스턴스를 끄고
+  `need-instance`·`remote-ready`를 지운다. 다른 문제가 그 자리를 기다린다.
 - 원격 서버 주소를 알면 `remote.txt`에 한 줄에 하나씩 적는다 (`host:port`, `nc host port`, URL). 주소가 바뀌면 고친다.
   서버가 닫혀 있으면 검사기가 이 주소를 지켜보다가 열리는 순간 알려 준다.
 - 문제 서비스(문제 웹앱, 문제가 쓰는 외부 서비스)에 회원가입·로그인이 필요하면 묻지 말고 직접 가입한다.
@@ -620,11 +621,12 @@ def env_prefix(binary: str) -> list[str]:
 
 
 def codex_argv(opts: Options, cwd: Path, prompt: str, *, interactive: bool,
-               schema: Path | None = None, output: Path | None = None) -> list[str]:
+               schema: Path | None = None, output: Path | None = None, session: str | None = None) -> list[str]:
     # The TUI's shared background server may demand a restart that would interrupt the
     # user's other sessions; each solver window runs standalone (codex-secondary already does).
     standalone = ["--no-daemon"] if Path(opts.binary).name == "codex" else []
     argv = [opts.binary] + (standalone if interactive else ["exec", "--skip-git-repo-check", "--json"])
+    argv += ["resume"] if session else []
     argv += ["--dangerously-bypass-approvals-and-sandbox", "-C", str(cwd)]
     if opts.model:
         argv += ["-m", opts.model]
@@ -634,7 +636,7 @@ def codex_argv(opts: Options, cwd: Path, prompt: str, *, interactive: bool,
         argv += ["--output-schema", str(schema)]
     if output is not None:
         argv += ["-o", str(output)]
-    return argv + [prompt]
+    return argv + ([session] if session else []) + [prompt]
 
 
 def _strict(properties: dict) -> dict:
@@ -797,6 +799,7 @@ def needs_instance(chal: Path) -> bool:
 
 
 YIELD_SECONDS = 120  # a solver asked to make room gets this long to save its notes and turn its instance off
+RESUME_GRACE = 300  # a resumed conversation that dies sooner than this is not resumed again
 
 
 def instance_pick(chal: Path) -> float | None:
@@ -1539,6 +1542,16 @@ def rollout_homes(binary: str) -> list[Path]:
     return list(dict.fromkeys(homes))
 
 
+def session_id(path: Path) -> str | None:
+    """The Codex session id a rollout file belongs to."""
+    try:
+        with open(path) as handle:
+            payload = json.loads(handle.readline()).get("payload") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    return payload.get("id") if isinstance(payload.get("id"), str) else None
+
+
 def find_rollout(cwd: Path, home: Path, since: float) -> Path | None:
     """Newest Codex session file whose session_meta cwd is ``cwd``."""
     best: tuple[float, Path] | None = None
@@ -1624,8 +1637,10 @@ class Tmux:
         done = self._run("list-windows", "-t", f"={self.session}", "-F", "#{window_name}", check=False)
         return set(done.stdout.split()) if done.returncode == 0 else set()
 
-    def new_session(self, name: str, cwd: Path, argv: list[str]) -> None:
-        self._run("new-session", "-d", "-s", self.session, "-n", name, "-c", str(cwd), shlex.join(argv))
+    def new_session(self, name: str, cwd: Path, argv: list[str], scope: list[str] = ()) -> None:
+        """scope: a command prefix the tmux server starts under, so it outlives the terminal that ran ctfh2."""
+        subprocess.run([*scope, "tmux", "new-session", "-d", "-s", self.session, "-n", name, "-c", str(cwd),
+                        shlex.join(argv)], text=True, capture_output=True, check=True)
 
     def new_window(self, name: str, cwd: Path, argv: list[str]) -> None:
         self._run("new-window", "-d", "-t", f"={self.session}:", "-n", name, "-c", str(cwd), shlex.join(argv))
@@ -1683,11 +1698,35 @@ class Checker:
             self.opts = replace(self.opts, max_instances=max(0, limit["live"]))
         self.instance_wait = 0  # challenges held back only by the instance limit
         self.end_handled = saved.get("end_handled")  # the end time already handled, so r after the end sticks
+        # Windows already gone when the checker starts went down with tmux, not on their own: reopening them spends
+        # no nudge, and they keep their instance slots.
+        windows = tmux.windows()
+        self.lost = {chal.name for chal in contest.challenges() if window_name(chal.name) not in windows
+                     and load_status(chal).get("state") in ("solving", "needs_fix", "accepted")}
         self.last_view: tuple[list[str], list[dict]] = ([], [])
 
     # -- solver windows
+    def previous_session(self, chal: Path, status: dict) -> tuple[str, Path] | None:
+        """The solver's last Codex conversation, to carry on where it stopped."""
+        path = Path(status["session_file"]) if status.get("session_file") else None
+        for home in ([] if path and path.is_file() else rollout_homes(self.opts.binary)):
+            path = find_rollout(chal, home, status.get("launched_ts", time.time()))
+            if path:
+                break
+        sid = session_id(path) if path and path.is_file() else None
+        if sid is None or (status.get("resumed") == sid and time.time() - status.get("launched_ts", 0) < RESUME_GRACE):
+            return None  # nothing to resume, or the resumed one died right away: start a new conversation
+        return sid, path
+
     def launch(self, chal: Path, status: dict, resume: bool = False, count: bool = True) -> None:
-        prompt = SOLVER_PROMPT + (" 세션이 다시 시작됐다. status.json도 확인해라." if resume else "")
+        previous = self.previous_session(chal, status) if resume else None
+        if previous:
+            prompt = "[검사기] 창이 닫혀서 이 대화를 다시 열었다. 하던 일을 이어서 해라. status.json도 확인해라."
+            status.update(resumed=previous[0], session_file=str(previous[1]))
+        else:
+            prompt = SOLVER_PROMPT + (" 세션이 다시 시작됐다. status.json도 확인해라." if resume else "")
+            for key in ("resumed", "session_file"):
+                status.pop(key, None)
         if "instance_slot" in status:
             prompt += " 이 문제의 인스턴스 자리를 받았다. 사이트에서 인스턴스를 켜고 풀어도 된다."
         elif needs_instance(chal):
@@ -1696,9 +1735,11 @@ class Checker:
                        "검사기가 알려 줄 때까지 로컬 일을 해라.")
         argv = memory_prefix(self.opts, chal) + ["env", f"AGENT_BROWSER_SESSION={solver_session(chal)}"] \
             + env_prefix(self.opts.binary) \
-            + codex_argv(self.opts, chal, prompt, interactive=True)
+            + codex_argv(self.opts, chal, prompt, interactive=True, session=previous[0] if previous else None)
         self.tmux.new_window(window_name(chal.name), chal, argv)
         self.rollouts.pop(chal.name, None)
+        count = count and chal.name not in self.lost
+        self.lost.discard(chal.name)
         if status.get("state", "pending") in ("pending", "blocked"):
             for key in ("reason", "blocked_by", "nudges", "nudged_ts", "stalled", "stale_nudges", "notes_sig"):
                 status.pop(key, None)
@@ -1717,11 +1758,11 @@ class Checker:
         save_status(chal, status)
         if test:
             self.tell(chal, "확인 전용 인스턴스 자리를 받았다. 사이트에서 이 문제의 인스턴스를 켜고 remote.txt를 적은 뒤 "
-                            "solve.py를 원격에 한 번 돌려라. 원격에서 디버깅하지 마라. 통하면 검사기가 재현 "
-                            f"확인을 마칠 때까지 켜 두었다가 끄고 {READY_REQUEST}를 지워라. 통하지 않으면 " + BACK_TO_ANALYSIS)
+                            "solve.py를 원격에 한 번 돌려라. 원격에서 디버깅하지 마라. 통하면 검사기가 제출 "
+                            f"결과를 알려 줄 때까지 켜 두었다가 끄고 {READY_REQUEST}를 지워라. 통하지 않으면 " + BACK_TO_ANALYSIS)
             return
         self.tell(chal, "인스턴스 자리를 받았다. 사이트에서 이 문제의 인스턴스를 켜고 remote.txt를 적은 뒤 원격 작업을 해라. "
-                        "검사기가 solve.py로 flag를 다시 확인할 때까지 켜 두고, 원격이 더 필요 없으면 사이트에서 "
+                        "검사기가 제출 결과를 알려 줄 때까지 켜 두고 (인스턴스마다 flag가 다를 수 있다), 원격이 더 필요 없으면 사이트에서 "
                         f"인스턴스를 끄고 {INSTANCE_REQUEST}·{READY_REQUEST} 파일을 지워라.")
 
     def tell(self, chal: Path, text: str) -> None:
@@ -1789,7 +1830,8 @@ class Checker:
         status.pop("needs_user", None)
         if outcome in ("accepted", "already_solved"):
             status.update(state="accepted", reason="사이트가 정답 처리했습니다.")
-            self.tell(chal, "정답 처리됨. writeup.md를 마무리해라.")
+            self.tell(chal, "정답 처리됨. 인스턴스를 켜 두었으면 사이트에서 끄고 "
+                            f"{INSTANCE_REQUEST}·{READY_REQUEST}를 지운 뒤 writeup.md를 마무리해라.")
         elif outcome == "wrong":
             status.update(state="needs_fix", reason="사이트가 오답 처리했습니다. 다른 flag를 찾아야 합니다.")
             self.tell(chal, "사이트가 오답 처리했다. 풀이를 다시 확인해라.")
@@ -2054,14 +2096,20 @@ class Checker:
 
     def track(self, chal: Path, status: dict) -> dict | None:
         """Read the solver's Codex rollout: tokens, and whether/since when it sits idle."""
-        path = self.rollouts.get(chal.name)
+        path, since = self.rollouts.get(chal.name), status.get("launched_ts", time.time())
+        if path is None and status.get("session_file"):  # a resumed conversation writes on in its old file
+            known = Path(status["session_file"])
+            path = known if known.is_file() and known.stat().st_mtime >= since - 60 else None
         for home in ([] if path else rollout_homes(self.opts.binary)):
-            path = find_rollout(chal, home, status.get("launched_ts", time.time()))
+            path = find_rollout(chal, home, since)
             if path:
                 break
         if path is None:
             return None
         self.rollouts[chal.name] = path
+        if status.get("session_file") != str(path):
+            status["session_file"] = str(path)
+            save_status(chal, status)
         info = rollout_info(path)
         self.tokens[chal.name] = info["tokens"]
         self.activity[chal.name] = info
@@ -2203,6 +2251,8 @@ class Checker:
                 status["queued"] = True
                 (chal / INSTANCE_REQUEST).unlink(missing_ok=True)
                 (chal / READY_REQUEST).unlink(missing_ok=True)
+            elif not opened and chal.name in self.lost and status.get("state") not in ("manual", "hold"):
+                continue  # it reopens with its slot
             elif not opened:
                 for key in ("instance_slot", "instance_test", "yielding", "returning"):
                     status.pop(key, None)
@@ -2237,7 +2287,7 @@ class Checker:
         if self.opts.max_parallel:  # limited slots: the most-solved (easiest) new challenges first
             fresh.sort(key=lambda item: -_solves(item[0]))
         items = restart + fresh
-        upfront = {chal.name for chal, _ in items if starts_on_instance(chal)}
+        upfront = {chal.name for chal, status in items if starts_on_instance(chal) and "instance_slot" not in status}
         queue = iter(sorted((item for item in items if item[0].name in upfront), key=lambda item: instance_rank(item[0])))
         items = [next(queue) if item[0].name in upfront else item for item in items]  # instance ones in queue order
         # One queue for instance slots: running solvers that asked for one, and challenges that need one to start.
@@ -2719,6 +2769,16 @@ def restart_loop(argv: list[str], delay: int = 5) -> list[str]:
     return ["sh", "-c", loop, "sh", *argv]
 
 
+def server_scope(root: Path, opts: Options) -> list[str]:
+    """The tmux server forks from its first client: a scope of its own keeps it (and every solver window) alive when
+    the terminal tab that ran ctfh2 closes, and inside the capped slice."""
+    if shutil.which("systemd-run") is None:
+        return []
+    set_slice_limits(memory_limit(opts.memory_max))
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            f"--unit=ctfh-{root.name[:40]}-tmux-{int(time.time())}", f"--slice={MEMORY_SLICE}"]
+
+
 def checker_argv(root: Path, opts: Options) -> list[str]:
     """The checker window, kept in the same slice as the solvers so its Codex runs count toward the cap."""
     return scope_prefix(opts, f"ctfh-{root.name[:40]}-checker") \
@@ -2786,7 +2846,7 @@ def go(site: str | None, directory: str | None, opts: Options, attach: bool = Tr
                 print(f"Chrome에서 {url} 에 로그인한 뒤 다시 실행하세요.")
                 return 3
             input(f"Chrome에서 {url} 에 로그인한 뒤 Enter를 누르세요 (2FA·캡차 포함)... ")
-        tmux.new_session("checker", root, checker_argv(root, opts))
+        tmux.new_session("checker", root, checker_argv(root, opts), server_scope(root, opts))
     elif "checker" not in tmux.windows():  # checker stopped (Ctrl-C): restart it with these options
         tmux.new_window("checker", root, checker_argv(root, opts))
     print(f"tmux 세션: {tmux.session}  (붙기: tmux attach -t {tmux.session})")
