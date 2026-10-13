@@ -406,7 +406,7 @@ def _native_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex", choices=("codex", "codex-secondary", "codex --secondary"), metavar="CODEX",
                         help="codex 실행기 (기본: ctfh.toml [native] binary)")
     parser.add_argument("--secondary", action="store_true", help="codex-secondary 계정으로 실행")
-    parser.add_argument("--model", help=f"Codex 모델 (기본 {ctfh_native.DEFAULT_MODEL})")
+    parser.add_argument("--model", help="Codex 모델 (기본: 쓰는 Codex 계정의 config.toml 설정)")
     parser.add_argument("--thinking", "--reasoning-effort", dest="reasoning_effort", choices=ctfh_native.EFFORTS,
                         help="Codex 추론 강도 (생략하면 계정 기본값)")
     parser.add_argument("--max-parallel", type=int, help="동시에 여는 풀이 창 수 (기본 0: 전체 문제)")
@@ -441,7 +441,7 @@ def _native_settings(args) -> ctfh_native.Options:
     except ValueError as error:
         raise SystemExit(f"ctfh2: {error}")
     return ctfh_native.Options(
-        binary=binary, model=pick("model", "model", ctfh_native.DEFAULT_MODEL), effort=pick("reasoning_effort", "thinking", None),
+        binary=binary, model=pick("model", "model", None), effort=pick("reasoning_effort", "thinking", None),
         rescan_model=None if (rescan_model := pick("rescan_model", "rescan_model", ctfh_native.RESCAN_MODEL)) == "same" else rescan_model,
         rescan_effort=None if (rescan_effort := pick("rescan_thinking", "rescan_thinking", "low")) == "same" else rescan_effort,
         submit_effort=None if (submit_effort := pick("submit_thinking", "submit_thinking", "low")) == "same" else submit_effort,

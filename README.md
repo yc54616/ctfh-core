@@ -194,7 +194,7 @@ ctfh2 checker --help                         # Checker options.
 | `--dir PATH` | `~/Desktop/CTF/<site-slug>/` for a new URL | Contest workspace. |
 | `--max-parallel N` | `0` | Solver-window cap; `0` means no fixed cap. Background jobs are separate. |
 | `--no-submit` | Not set | Disable website submission; keep verification and write-up review. |
-| `--model MODEL` | `gpt-6-sol` | Solver and initial-collection model. |
+| `--model MODEL` | The Codex account's `config.toml` | Solver and initial-collection model. Unset, every launch follows the account's current setting. |
 | `--thinking LEVEL` | Account default | Reasoning effort; alias: `--reasoning-effort`. Model support varies. |
 | `--rescan-model MODEL` | `gpt-6-luna` | Periodic rescan and attachment-download model; `same` uses `--model`. |
 | `--rescan-thinking LEVEL` | `low` | Rescan/download reasoning; `same` follows `--thinking`. |

@@ -194,7 +194,7 @@ ctfh2 checker --help                         # 검사기 옵션 보기
 | `--dir PATH` | 새 URL이면 `~/Desktop/CTF/<site-slug>/` | 대회 작업 폴더. |
 | `--max-parallel N` | `0` | 최대 풀이 창 수. `0`이면 고정된 창 수 제한 없음. 백그라운드 작업 수는 별개. |
 | `--no-submit` | 지정하지 않음 | 사이트 제출을 끄고 재현 검사·풀이 문서 검토만 진행. |
-| `--model MODEL` | `gpt-6-sol` | 풀이와 첫 문제 수집에 사용할 모델. |
+| `--model MODEL` | 쓰는 Codex 계정의 `config.toml` | 풀이와 첫 문제 수집에 사용할 모델. 지정하지 않으면 창을 열 때마다 그 계정의 현재 설정을 따름. |
 | `--thinking LEVEL` | 계정 기본값 | 추론 강도. `--reasoning-effort`와 같음. 지원 여부는 모델에 따라 다름. |
 | `--rescan-model MODEL` | `gpt-6-luna` | 주기적 재수집·첨부 다운로드 모델. `same`이면 `--model`과 같음. |
 | `--rescan-thinking LEVEL` | `low` | 재수집·다운로드 추론 강도. `same`이면 `--thinking`을 따름. |

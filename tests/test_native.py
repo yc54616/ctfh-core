@@ -149,7 +149,7 @@ class LayoutTests(Base):
         checker = self.checker(runner=collector, effort="xhigh")
         checker.job_collect()  # nothing collected yet: login may be needed
         checker.job_collect()
-        self.assertEqual(efforts, [("gpt-6-sol", "xhigh"), ("gpt-6-luna", "low")])
+        self.assertEqual(efforts, [(None, "xhigh"), ("gpt-6-luna", "low")])  # None: the Codex config's model
 
     def test_collect_writes_site_info_and_normalizes_folders(self):
         def collector(cwd):
@@ -745,7 +745,7 @@ class CheckerFlowTests(Base):
         retry = self.checker(binary="codex-secondary")  # default model
         retry.tick()
         argv = retry.tmux.open["kernel"]
-        self.assertEqual(argv[argv.index("-m") + 1], native.DEFAULT_MODEL)
+        self.assertNotIn("-m", argv)  # the Codex config's model
         self.assertEqual(self.status("kernel")["state"], "solving")
         self.assertNotIn("reason", self.status("kernel"))
 
@@ -1372,7 +1372,7 @@ class CheckerFlowTests(Base):
                    seen.append(("review", opts.model, opts.effort)) or {}):
             checker.job_submit(chal)
             checker.job_review(chal, 0)
-        self.assertEqual(seen, [("submit", "gpt-6-sol", "low"), ("review", "gpt-6-sol", "medium")])
+        self.assertEqual(seen, [("submit", None, "low"), ("review", None, "medium")])
 
     def test_a_submit_whose_answer_is_late_looks_again_for_the_solved_mark_before_giving_up(self):
         chal = make_challenge(self.root, "heap")

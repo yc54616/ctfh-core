@@ -47,7 +47,6 @@ BOARD_GROUPS = {"needs_user": "!", "manual": "!", "unknown": "!", "blocked": "!"
                 **{state: "✓" for state in FINISHED | {"accepted"}}}  # others: ● working
 QUIET_REASONS = {"solve.py 재실행으로 같은 flag를 재현했습니다.", "사이트가 정답 처리했습니다.", "사이트에 제출하는 중입니다.",
                  "사이트에 해결됨으로 표시됨.", "writeup 검토 통과."}  # the state already says it
-DEFAULT_MODEL = "gpt-6-sol"
 RESCAN_MODEL = "gpt-6-luna"  # cheap model for periodic rescans; the cost is mostly input tokens
 SOLVE_SETTLE_SECONDS = 20  # recheck a changed solve.py only after it stopped changing
 # Text the Codex TUI shows when the provider's cyber-safety filter refuses a turn.
@@ -62,7 +61,7 @@ NEEDS_USER = "needs_user.txt"  # a solver writes here what only the user can do 
 @dataclass(frozen=True)
 class Options:
     binary: str = "codex"
-    model: str | None = DEFAULT_MODEL
+    model: str | None = None  # None: the account's Codex config.toml decides, read again on every launch
     effort: str | None = None
     rescan_model: str | None = RESCAN_MODEL  # periodic rescans only re-read the list; None: same as model
     rescan_effort: str | None = "low"  # None: same as effort
