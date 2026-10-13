@@ -829,6 +829,11 @@ def wants_instance(chal: Path) -> bool:
     return (chal / INSTANCE_REQUEST).exists() or remote_ready(chal)
 
 
+def waits_for_slot(chal: Path, status: dict) -> bool:
+    """The solver asked for an instance and waits its turn: a quiet window is expected, not a stall."""
+    return wants_instance(chal) and "instance_slot" not in status and status.get("state") not in FINISHED | {"accepted"}
+
+
 def slot_order(chal: Path) -> tuple:
     """Instance slot queue: the user's picks, then exploits that only need a run on the remote, then the easiest."""
     rank = instance_rank(chal)
@@ -2100,6 +2105,8 @@ class Checker:
             return f"{quiet}째 멈춤 · 서버 대기"
         if state == "manual":
             return f"{quiet}째 멈춤 · 수동 대기"
+        if waits_for_slot(chal, status):
+            return f"{quiet}째 인스턴스 자리 대기"
         if nudges >= limit:
             return f"{quiet}째 멈춤 · 재촉 한도 소진"
         return f"{quiet}째 멈춤 (재촉 {nudges}/{limit})"
@@ -2116,6 +2123,8 @@ class Checker:
                 save_status(chal, status)
             return
         if self.outage:  # every window is stuck for the same reason; nudging would only spend the limit
+            return
+        if waits_for_slot(chal, status):  # it gets a message when its slot comes; nudging only spends the limit
             return
         if not info["idle"] or time.time() - info["mtime"] < self.opts.idle_seconds \
                 or time.time() - status.get("nudged_ts", 0) < self.opts.idle_seconds:
@@ -2234,10 +2243,15 @@ class Checker:
         # One queue for instance slots: running solvers that asked for one, and challenges that need one to start.
         # Challenges with attachments start without a slot and ask once they need the remote.
         # With room for two or more, one slot is kept for exploits that work locally: a short run, then it is back.
-        test_slots = 1 if self.opts.max_instances >= 2 else 0
-        for chal in sorted((chal for chal in asking if remote_ready(chal)), key=instance_rank)[:max(0, test_slots - len(tests))]:
+        # With room for one, such an exploit still goes first: the one holding the slot makes room for its run.
+        ready = sorted((chal for chal in asking if remote_ready(chal)), key=instance_rank)
+        limit = self.opts.max_instances
+        test_slots = 1 if limit >= 2 or (limit == 1 and (ready or tests)) else 0
+        room = limit - len(live) - len(tests)
+        for chal in ready[:max(0, min(test_slots - len(tests), room))]:
             self.grant(chal, test=True)
             asking.remove(chal)
+        crowded = 1 - room if limit and ready and not tests and room < 1 else 0  # holders in the way of a test run
         wanting = sorted([(chal, None) for chal in asking] + [item for item in items if item[0].name in upfront],
                          key=lambda item: slot_order(item[0]))
         free = self.opts.max_instances - test_slots - len(live) if self.opts.max_instances else len(wanting)
@@ -2249,8 +2263,8 @@ class Checker:
                 allowed.add(chal.name)
         left = wanting[max(0, free):]
         self.memory_wait, self.instance_wait = False, len(left)
-        if self.opts.max_instances:  # a picked challenge waiting on a full limit: the lowest unpicked one makes room
-            waiting = sum(1 for chal, _ in left if instance_pick(chal) is not None)
+        if self.opts.max_instances:  # a pick or a test run waiting on a full limit: the lowest unpicked one makes room
+            waiting = max(sum(1 for chal, _ in left if instance_pick(chal) is not None), crowded)
             waiting -= sum(1 for chal in live if load_status(chal).get("yielding"))
             for chal in sorted((c for c in live if instance_pick(c) is None and not load_status(c).get("yielding")),
                                key=instance_rank, reverse=True)[:max(0, waiting)]:
@@ -2258,11 +2272,11 @@ class Checker:
                 status["yielding"] = time.time()
                 save_status(chal, status)
                 if starts_on_instance(chal):
-                    self.tell(chal, "사용자가 다른 인스턴스 문제를 먼저 풀도록 지정해서 이 문제는 잠시 쉰다. 지금까지 한 것과 다음에 "
+                    self.tell(chal, "다른 문제가 먼저 인스턴스를 써야 해서 이 문제는 잠시 쉰다. 지금까지 한 것과 다음에 "
                                     "할 일을 work/NOTES.md에 적고, 사이트에서 이 문제의 인스턴스를 끈 뒤 멈춰라. "
                                     f"{YIELD_SECONDS // 60}분 뒤 창이 닫히고, 자리가 나면 이어서 연다.")
                 else:
-                    self.tell(chal, "사용자가 다른 인스턴스 문제를 먼저 풀도록 지정해서 인스턴스 자리를 넘긴다. 원격에서 알아낸 것을 "
+                    self.tell(chal, "다른 문제가 먼저 인스턴스를 써야 해서 인스턴스 자리를 넘긴다. 원격에서 알아낸 것을 "
                                     f"work/NOTES.md에 적고, 사이트에서 이 문제의 인스턴스를 끈 뒤 {INSTANCE_REQUEST} 파일을 "
                                     "지워라. 로컬 작업은 계속해도 되고, 원격이 다시 필요하면 그 파일을 다시 만들어 차례를 "
                                     f"기다려라. {YIELD_SECONDS // 60}분 안에 지우지 않으면 창을 닫는다.")

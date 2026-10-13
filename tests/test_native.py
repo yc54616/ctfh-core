@@ -549,6 +549,40 @@ class CheckerFlowTests(Base):
         self.assertEqual(run.call_count, 1)
         self.assertIn("chrome-use browsers", native.account_rule(""))
 
+    def test_with_one_instance_a_working_exploit_goes_first_and_waiting_is_not_nudged(self):
+        for slug, solves in (("vm", 90), ("pwn", 50)):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({
+                "name": slug, "instance": True, "solves": solves,
+                "attachments": [{"url": f"https://ctf.example.com/files/{slug}.zip", "name": f"{slug}.zip"}]}))
+            (chal / "files" / native.FILES_DONE).write_text("")
+        checker = self.checker(max_instances=1, idle_seconds=0)
+        queue = lambda: {row["name"]: row["queue"] for row in checker.view()[1]}
+        checker.tick()
+        vm, pwn = self.root / "challenges" / "vm", self.root / "challenges" / "pwn"
+        (vm / native.INSTANCE_REQUEST).write_text("원격 동작 확인\n")
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "사용", "pwn": "분석"})
+        (pwn / native.READY_REQUEST).write_text("로컬에서 flag 나옴\n")
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "사용", "pwn": "원격만 1"})
+        self.assertTrue(any(name == "vm" and "자리를 넘긴다" in text for name, text in checker.tmux.sent))
+        self.idle_rollout(pwn)  # quiet while it waits its turn: expected, not a stall
+        checker.tick()
+        self.assertFalse(any(name == "pwn" for name, _ in checker.tmux.sent))
+        self.assertEqual(self.status("pwn").get("nudges", 0), 0)
+        self.assertIn("인스턴스 자리 대기", next(row for row in checker.view()[1] if row["name"] == "pwn")["activity"])
+        (vm / native.INSTANCE_REQUEST).unlink()  # vm turned its instance off
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "분석", "pwn": "확인"})
+        self.assertTrue(any(name == "pwn" and "확인 전용" in text for name, text in checker.tmux.sent))
+        (vm / native.INSTANCE_REQUEST).write_text("원격 동작 다시 확인\n")
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "대기 1", "pwn": "확인"})  # the test run is short: the rest wait for it
+        (pwn / native.READY_REQUEST).unlink()
+        checker.tick()
+        self.assertEqual(queue(), {"vm": "사용", "pwn": "분석"})
+
     def test_a_solver_waiting_for_the_user_is_shown_and_not_nudged(self):
         chal = make_challenge(self.root, "captcha")
         checker = self.checker(idle_seconds=0)
