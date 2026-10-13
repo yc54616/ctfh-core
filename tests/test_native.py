@@ -1140,6 +1140,9 @@ class CheckerFlowTests(Base):
         self.assertEqual(text("rev"), "첨부 받는 중 (2.9KB)")
         self.assertEqual(text("dfir"), "첨부 대기")
         self.assertEqual(text("web"), "시작 대기")
+        for slug in ("rev", "dfir", "web"):
+            native.save_status(self.root / "challenges" / slug, {"state": "pending"})
+        self.assertIn("⬇ 첨부 2   ⏳ 대기 1", checker.view()[0][1])  # the counts on top keep them apart too
         checker.jobs.pop("__download_rev__")
         native.save_status(self.root / "challenges" / "dfir", {"state": "pending", "download_tries": 1})
         self.assertEqual(text("dfir"), "첨부 재시도 대기 (1회 실패)")
@@ -1334,6 +1337,35 @@ class CheckerFlowTests(Base):
                     click()  # third click: back to the board's own order
                     await pilot.pause(0.1)
                     self.assertEqual((names(), app.sort, str(table.columns["tokens"].label)), (["zzz", "aaa"], None, "토큰"))
+
+        asyncio.run(drive())
+
+    def test_dashboard_keeps_its_scroll_and_cursor_across_refreshes(self):
+        from textual.widgets import DataTable
+        from ctfh_core.native_tui import CheckerApp
+        for i in range(40):
+            make_challenge(self.root, f"c{i:02}")
+        checker = self.checker()
+
+        async def drive():
+            with patch.object(CheckerApp, "loop", lambda app: None):
+                app = CheckerApp(checker)
+                async with app.run_test(size=(140, 24)) as pilot:
+                    table = app.query_one(DataTable)
+                    app.show(checker.view())
+                    await pilot.pause()
+                    table.move_cursor(row=30)
+                    await pilot.pause()
+                    table.scroll_to(y=table.scroll_y - 3, animate=False)  # looking a little above the cursor
+                    await pilot.pause()
+                    where = table.scroll_y
+                    self.assertGreater(where, 0)
+                    native.save_status(self.root / "challenges" / "c35", {"state": "done"})  # moves to the bottom
+                    app.show(checker.view())
+                    await pilot.pause()
+                    self.assertEqual(table.scroll_y, where)
+                    self.assertEqual(app.selected(), "c30")
+                    self.assertEqual(table.row_count, 40)
 
         asyncio.run(drive())
 

@@ -266,26 +266,40 @@ class CheckerApp(App):
                 text.append(line + "\n", style="bold" if i == 1 else "dim" if i > 1 else "")
         text.append("Space 문제 메뉴 · c 설정 · ? 도움말 · 풀이 창에서 돌아오기: Ctrl-b w → checker", style="dim")
         self.query_one("#head", Static).update(text)
+        # Change the table in place: clearing it would throw away where the user had scrolled to.
         table = self.query_one(DataTable)
         keep = self.selected()
-        table.clear()
         self.rows = {row["name"]: row for row in rows}
+        present = {key.value for key in table.rows}
+        for name in present - self.rows.keys():
+            table.remove_row(name)
         for row in rows:
-            style = STYLES.get(row["state"], "")
-            finished = row["group"] == "✓"
-            table.add_row(Text(row["group"], style=style), Text(row["name"], style=style + (" dim" if finished else "")),
-                          Text(row["category"], style="dim"),
-                          Text(("★" if row.get("picked") else "") + row.get("queue", ""), justify="center",
-                               style="bold cyan" if row.get("picked") else "cyan"),
-                          Text(row["label"], style=style),
-                          Text(row["tokens"], justify="right", style="dim" if finished else ""),
-                          Text(row["elapsed"], justify="right", style="dim" if finished else ""),
-                          Text(row["activity"], style="dim" if finished or "서버 대기" in row["activity"] else ""),
-                          Text(row["reason"] if len(row["reason"]) <= 48 else row["reason"][:47] + "…",
-                               style="dim" if finished else ""), key=row["name"])
+            if row["name"] not in present:
+                table.add_row(*self.cells(row), key=row["name"])
+                continue
+            for (column, _), cell in zip(COLUMNS, self.cells(row)):
+                if table.get_cell(row["name"], column) != cell:
+                    table.update_cell(row["name"], column, cell, update_width=True)
+        order = {name: i for i, name in enumerate(self.rows)}
+        table.sort("name", key=lambda cell: order[cell.plain])
         if keep in self.rows:
-            table.move_cursor(row=table.get_row_index(keep))
+            table.move_cursor(row=table.get_row_index(keep), scroll=False)
         self.show_detail()
+
+    @staticmethod
+    def cells(row: dict) -> list[Text]:
+        style = STYLES.get(row["state"], "")
+        finished = row["group"] == "✓"
+        return [Text(row["group"], style=style), Text(row["name"], style=style + (" dim" if finished else "")),
+                Text(row["category"], style="dim"),
+                Text(("★" if row.get("picked") else "") + row.get("queue", ""), justify="center",
+                     style="bold cyan" if row.get("picked") else "cyan"),
+                Text(row["label"], style=style),
+                Text(row["tokens"], justify="right", style="dim" if finished else ""),
+                Text(row["elapsed"], justify="right", style="dim" if finished else ""),
+                Text(row["activity"], style="dim" if finished or "서버 대기" in row["activity"] else ""),
+                Text(row["reason"] if len(row["reason"]) <= 48 else row["reason"][:47] + "…",
+                     style="dim" if finished else "")]
 
     def set_columns(self) -> None:
         """Headers with ▲/▼ on the sorted column; clicking a header sorts by it."""

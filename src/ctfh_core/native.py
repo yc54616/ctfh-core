@@ -2138,12 +2138,14 @@ class Checker:
         alert = self.contest.state_dir / "needs_user.txt"
         count = lambda *states: sum(row["state"] in states for row in rows)
         solved = sum(row["group"] == "✓" for row in rows)
+        files = sum(row["state"] == "pending" and row["activity"].startswith("첨부") for row in rows)  # not ready to start yet
         spent = f"{total / 10000:,.0f}만" if total >= 10000 else f"{total:,}"
         head = [f"{self.contest.url}  {datetime.now():%H:%M:%S}  토큰 {spent}"
                 f"  동시 창 {self.opts.max_parallel or '전체'}  인스턴스 {self.opts.max_instances or '무제한'}",
                 f"✓ 푼 문제 {solved}/{len(rows)}   ● 풀이 {count('solving', 'needs_fix')}"
                 f"   ◐ 검사 {count('checking')}   ↑ 제출 {count('verified', 'submitting')}"
-                f"   ⏳ 대기 {count('pending', 'hold')}   ! 확인 필요 {sum(row['group'] == '!' for row in rows)}"]
+                f"   ⬇ 첨부 {files}   ⏳ 대기 {count('pending', 'hold') - files}"
+                f"   ! 확인 필요 {sum(row['group'] == '!' for row in rows)}"]
         if alert.exists():
             head.append("!! 입력 필요 (문제 목록 수집에서 로그인 확인 실패, 풀이 창과 무관): " + alert.read_text().strip())
         if self.chrome_note:
