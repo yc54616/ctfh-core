@@ -645,10 +645,13 @@ class CheckerFlowTests(Base):
         self.assertEqual(argv[-2], "sess-1")
         self.assertIn("이어서", argv[-1])
         self.assertEqual(self.status("heap")["nudges"], 1)
-        window_gone(61)  # the resumed conversation died at once: a new one next time
+        window_gone(61)  # died soon after, but its conversation file is still there: carried on again
         checker.tick()
-        self.assertNotIn("resume", checker.tmux.open["heap"])
+        self.assertIn("resume", checker.tmux.open["heap"])
         self.assertEqual(self.status("heap")["nudges"], 2)
+        (day / "rollout-heap.jsonl").rename(day / "gone.txt")
+        self.assertIsNone(checker.previous_session(chal, self.status("heap")))  # no file left: a new conversation
+        (day / "gone.txt").rename(day / "rollout-heap.jsonl")
 
         (chal / native.INSTANCE_REQUEST).write_text("원격 확인\n")
         status = self.status("heap")

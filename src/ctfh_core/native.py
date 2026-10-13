@@ -814,7 +814,6 @@ def needs_instance(chal: Path) -> bool:
 
 
 YIELD_SECONDS = 120  # a solver asked to make room gets this long to save its notes and turn its instance off
-RESUME_GRACE = 300  # a resumed conversation that dies sooner than this is not resumed again
 
 
 def instance_pick(chal: Path) -> float | None:
@@ -1734,8 +1733,8 @@ class Checker:
             if path:
                 break
         sid = session_id(path) if path and path.is_file() else None
-        if sid is None or (status.get("resumed") == sid and time.time() - status.get("launched_ts", 0) < RESUME_GRACE):
-            return None  # nothing to resume, or the resumed one died right away: start a new conversation
+        if sid is None:  # its conversation file is gone: start a new conversation
+            return None
         return sid, path
 
     def launch(self, chal: Path, status: dict, resume: bool = False, count: bool = True) -> None:
