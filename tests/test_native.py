@@ -1412,6 +1412,7 @@ class CheckerFlowTests(Base):
                     self.assertEqual(names(), ["zzz", "aaa"])
                     await pilot.press("t")  # keyboard: name first
                     self.assertEqual((names(), str(table.columns["name"].label)), (["aaa", "zzz"], "문제 ▲"))
+                    self.assertEqual(app.selected(), "zzz")  # the cursor stays on the challenge it was on
                     click = lambda: table.post_message(DataTable.HeaderSelected(table, table.columns["tokens"].key, 4, Text("토큰")))
                     click()
                     await pilot.pause(0.1)
@@ -1421,7 +1422,7 @@ class CheckerFlowTests(Base):
                     self.assertEqual((names(), str(table.columns["tokens"].label)), (["zzz", "aaa"], "토큰 ▲"))
                     click()  # third click: back to the board's own order
                     await pilot.pause(0.1)
-                    self.assertEqual((names(), app.sort, str(table.columns["tokens"].label)), (["zzz", "aaa"], None, "토큰"))
+                    self.assertEqual((names(), app.sort, str(table.columns["tokens"].label)), (["zzz", "aaa"], None, "토큰  "))
 
         asyncio.run(drive())
 

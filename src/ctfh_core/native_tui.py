@@ -303,12 +303,15 @@ class CheckerApp(App):
                      style="dim" if finished else "")]
 
     def set_columns(self) -> None:
-        """Headers with ▲/▼ on the sorted column; clicking a header sorts by it."""
+        """Headers with ▲/▼ on the sorted column; clicking a header sorts by it. They change in place: clearing the
+        table would jump to its top and draw it at the headers' widths until the rows came back."""
         table = self.query_one(DataTable)
-        table.clear(columns=True)
         for key, title in COLUMNS:
-            arrow = (" ▼" if self.sort[1] else " ▲") if self.sort and self.sort[0] == key else ""
-            table.add_column(title + arrow, key=key)
+            label = Text(title + ((" ▼" if self.sort[1] else " ▲") if self.sort and self.sort[0] == key else "  "))
+            if key in table.columns:
+                table.columns[key].label = label  # as wide with the arrow as without: no column moves
+            else:
+                table.add_column(label, key=key)
 
     def sort_by(self, column: str | None) -> None:
         """Same column again flips the order, and a third time returns to the board's grouping."""
