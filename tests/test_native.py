@@ -902,17 +902,16 @@ class CheckerFlowTests(Base):
         real_sleep, calls, clicked = time.sleep, [], threading.Barrier(2, timeout=10)
         def run(argv, **kwargs):
             calls.append(argv)
-            if argv[3] in ("eval", "download-url"):  # Chrome starts the file and the call returns at once
+            if argv[3] == "download-url":  # Chrome's own download: chrome-use moves the finished file where it is told
+                Path(argv[5]).write_bytes(b"MEM")
+            elif argv[3] == "eval":  # a click: Chrome starts the file and the call returns at once
                 name = "Memory1 (1).mans" if "Memory1" in argv[4] else "Memory2.mans"
                 (downloads / f"{name}.crdownload").write_bytes(b"MEM")
-                started.append(argv[3])
             return subprocess.CompletedProcess(argv, 0, b'"clicked"')
-        started = []
-        def sleep(seconds):  # Chrome finishes both files once both were clicked
+        def sleep(seconds):  # Chrome finishes what was clicked
             real_sleep(0.01)
-            if len(started) >= 2:
-                for part in downloads.glob("*.crdownload"):
-                    part.rename(part.with_suffix(""))
+            for part in downloads.glob("*.crdownload"):
+                part.rename(part.with_suffix(""))
         got = {}
         def fetch(name):
             got[name] = native.browser_fetch(f"https://ctf.example.com/files/a/{name}", files, name, None,
@@ -920,8 +919,7 @@ class CheckerFlowTests(Base):
         with patch.object(native, "DOWNLOADS", native.DownloadWatch()), \
                 patch.object(native, "chrome_download_dir", return_value=downloads), \
                 patch.object(native, "browser_fetch", REAL_BROWSER_FETCH), \
-                patch.object(native.subprocess, "run", side_effect=run), patch.object(native.time, "sleep", side_effect=sleep), \
-                patch.object(native.subprocess, "Popen", side_effect=run):
+                patch.object(native.subprocess, "run", side_effect=run), patch.object(native.time, "sleep", side_effect=sleep):
             workers = [threading.Thread(target=fetch, args=(name,)) for name in ("Memory1.mans", "Memory2.mans")]
             for worker in workers: worker.start()
             for worker in workers: worker.join(10)
@@ -929,30 +927,34 @@ class CheckerFlowTests(Base):
             self.assertEqual((files / "Memory1.mans").read_bytes(), b"MEM")
             self.assertEqual((downloads / "Memory1.mans").read_bytes(), b"the user's own")
             self.assertEqual([c[3] for c in calls], ["download-url", "download-url"])  # Chrome's own download, no click
+            self.assertEqual(sorted(os.listdir(downloads)), ["Memory1.mans"])  # nothing left behind in the folder
             calls.clear()
             self.assertIsNone(native.browser_fetch("https://ctf.example.com/files/a/Memory1.mans", files, "Memory1.mans",
                                                    999, "https://ctf.example.com/"))  # cut short: not taken as done
+            self.assertEqual([c[3] for c in calls][:2], ["download-url", "open"])  # then a click on the page
+            self.assertEqual((files / "Memory1.mans").read_bytes(), b"MEM")  # the good one stays
+            self.assertEqual(sorted(os.listdir(files)), ["Memory1.mans", "Memory2.mans"])
         pages = []
         def login_page(argv, **kwargs):
-            if argv[3] == "eval":
-                (downloads / "a.zip").write_bytes(b"<!DOCTYPE html><title>Login</title>")
+            if argv[3] in ("eval", "download-url"):  # a missing file sends the download to the dashboard: success
+                (Path(argv[5]) if argv[3] == "download-url" else downloads / "a.zip").write_bytes(
+                    b"<!DOCTYPE html><title>Login</title>")
                 pages.append(1)
             return subprocess.CompletedProcess(argv, 0, b'"clicked"')
         with patch.object(native, "DOWNLOADS", native.DownloadWatch()), \
                 patch.object(native, "chrome_download_dir", return_value=downloads), \
                 patch.object(native.subprocess, "run", side_effect=login_page), \
-                patch.object(native.subprocess, "Popen", side_effect=lambda argv, **kw: login_page(["", "", "", "eval"])), \
                 patch.object(native.time, "sleep", side_effect=lambda s: real_sleep(0.01)):
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/73", files, "a.zip"))
             self.assertFalse((downloads / "a.zip").exists() or (files / "a.zip").exists())  # a login page is no file
+            self.assertEqual([p.name for p in files.iterdir() if "a.zip" in p.name], [])
             self.assertEqual(len(pages), 2)  # Chrome's download first, then a click on the page
         hung = MagicMock(side_effect=subprocess.TimeoutExpired("chrome-use", 60))
         with patch.object(native, "DOWNLOADS", native.DownloadWatch()), patch.object(native.subprocess, "run", hung), \
-                patch.object(native.subprocess, "Popen", side_effect=OSError), \
                 patch.object(native.time, "sleep") as waited:
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/1", files, "a.zip"))
             self.assertIsNone(REAL_BROWSER_FETCH("https://ctf.example.com/download/2", files, "b.zip"))
-            self.assertEqual(hung.call_count, 3)  # tried three times, then the next one skips the hung browser
+            self.assertEqual(hung.call_count, 4)  # the download, three clicks, then the next one skips the hung browser
             self.assertEqual(waited.call_count, 2)
         starting = MagicMock(side_effect=[subprocess.TimeoutExpired("chrome-use", 60),  # Chrome still starting up
                                           subprocess.CompletedProcess([], 0, b""), subprocess.CompletedProcess([], 0, b"clicked")])
@@ -985,13 +987,34 @@ class CheckerFlowTests(Base):
         self.assertEqual(json.loads((chal / "challenge.json").read_text())["open"],  # remembered for the next time
                          {"url": "https://ctf.example.com/#42", "click": "#chall42-flag-header"})
 
+    def test_the_download_watcher_keeps_going_when_a_file_cannot_be_moved(self):
+        downloads = self.root / "dl"
+        downloads.mkdir()
+        watch = native.DownloadWatch()
+        entries = [{"stem": stem, "name": f"{stem}.zip", "total": None, "dest": self.root / "files" / f"{stem}.zip",
+                    "clicked": time.time(), "done": threading.Event(), "ok": False} for stem in ("a", "b")]
+        watch.pending = list(entries)
+        for stem in ("a", "b"):
+            (downloads / f"{stem}.zip").write_bytes(b"PK")
+        real_move = shutil.move
+        def move(src, dest):
+            if src.endswith("a.zip"):
+                raise FileNotFoundError(src)  # taken by someone else meanwhile
+            return real_move(src, dest)
+        with patch.object(native, "chrome_download_dir", return_value=downloads), patch.object(native.shutil, "move", move):
+            watch.poll()
+            watch.poll()
+        self.assertTrue(entries[0]["done"].is_set() and not entries[0]["ok"])
+        self.assertTrue(entries[1]["ok"])
+        self.assertEqual((self.root / "files" / "b.zip").read_bytes(), b"PK")
+
     def test_a_link_behind_a_recorded_button_is_downloaded_directly_and_the_open_page_is_reused(self):
         watch = native.DownloadWatch()
         with patch.object(watch, "download_url", return_value=False) as direct, \
                 patch.object(watch, "click", return_value=False) as click:
             self.assertIsNone(watch.fetch("https://ctf.example.com/download/42", self.root, "a.zip", None,
                                           "https://ctf.example.com/dashboard#42", button='a[href="download/42"]'))
-            self.assertEqual(direct.call_args.args, ("https://ctf.example.com/download/42",))
+            self.assertEqual(direct.call_args.args[:2], ("https://ctf.example.com/download/42", self.root / "a.zip"))
             self.assertEqual(click.call_count, 1)  # the page click only when the link brought nothing
             direct.reset_mock()
             watch.fetch("https://ctf.example.com/dashboard#42", self.root, "a.zip", None,

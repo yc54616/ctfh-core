@@ -926,6 +926,7 @@ def direct_fetch(url: str, folder: Path, name: str = "") -> str | None:
 DOWNLOAD_SESSION = "ctfh-download"  # the one Chrome window attachments are opened in, one at a time
 BROWSER_POLL = 3
 BROWSER_IDLE = 300  # a download that stops growing this long has failed
+DIRECT_TIMEOUT = 1800  # Chrome's own download of one file, moved into place by chrome-use when it is done
 
 
 def downloads_allowed(host: str) -> bool | None:
@@ -984,8 +985,20 @@ REVEAL_JS = ("(()=>{const t=%s.trim().toLowerCase();if(!t)return 'none';"
              "el.click();return 'opener '+parts.join('>')})()")
 
 
+def usable_download(path: Path, name: str, total: int | None) -> bool:
+    """A login page saved under the file's name, or a file cut short, is not the attachment."""
+    try:
+        with path.open("rb") as head:
+            page = head.read(512).lstrip().lower().startswith((b"<!doctype html", b"<html"))
+        size = path.stat().st_size
+    except OSError:
+        return False
+    return not (page and not name.lower().endswith((".htm", ".html"))) and not (total and size != total)
+
+
 class DownloadWatch:
-    """Browser downloads: every challenge's links are clicked one after another in the one download window without
+    """Browser downloads: a plain link goes through Chrome's own download API, and chrome-use moves the finished file
+    into the challenge's folder itself. What needs a click on the page is clicked in the one download window without
     waiting, and one watcher follows Chrome's download folder, handing each finished file to the challenge whose link
     it matches (by name, or exact size). Files that were there before, or match nothing, are the user's: left alone."""
 
@@ -1009,35 +1022,43 @@ class DownloadWatch:
         # A recorded button or opener only says how to reach that same link on the page, so the link is tried first
         # unless it is the page itself (a JS button with nothing behind it).
         plain = not (opener or button) or url.split("#")[0] != page.split("#")[0]
-        for direct in ([True, False] if plain else [False]):
-            entry = {"stem": Path(name).stem, "name": name, "total": total, "dest": folder / name,
-                     "clicked": time.time(), "done": threading.Event(), "ok": False}
-            downloads = chrome_download_dir()
+        if plain and self.download_url(url, folder / name, name, total):
+            return name
+        entry = {"stem": Path(name).stem, "name": name, "total": total, "dest": folder / name,
+                 "clicked": time.time(), "done": threading.Event(), "ok": False}
+        downloads = chrome_download_dir()
+        with self.lock:
+            if not self.pending:  # nothing of ours is under way: whatever is there now is the user's
+                self.known = set(os.listdir(downloads)) if downloads.is_dir() else set()
+                self.sizes, self.moved_at = {}, time.time()
+            self.pending.append(entry)
+        if not self.click(url, name, page, opener, button, title):
             with self.lock:
-                if not self.pending:  # nothing of ours is under way: whatever is there now is the user's
-                    self.known = set(os.listdir(downloads)) if downloads.is_dir() else set()
-                    self.sizes, self.moved_at = {}, time.time()
-                self.pending.append(entry)
-            if not (self.download_url(url) if direct else self.click(url, name, page, opener, button, title)):
-                with self.lock:
-                    if entry in self.pending:
-                        self.pending.remove(entry)
-                continue
-            self.start()
-            entry["done"].wait()
-            if entry["ok"]:
-                return name
-        return None
+                if entry in self.pending:
+                    self.pending.remove(entry)
+            return None
+        self.start()
+        entry["done"].wait()
+        return name if entry["ok"] else None
 
-    def download_url(self, url: str) -> bool:
+    def download_url(self, url: str, dest: Path, name: str, total: int | None) -> bool:
+        """Chrome's download API, with the logged-in profile's cookies; the call returns once the file is done and
+        chrome-use has moved it, so nothing is picked out of the shared download folder by name."""
         if self.hangs >= 3 and time.time() < self.down_until:
             return False
-        try:  # returns at once; the watcher sees the file arrive
-            subprocess.Popen(["chrome-use", "--session", DOWNLOAD_SESSION, "download-url", url], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            return True
-        except OSError:
-            return False
+        part = dest.with_name(dest.name + ".ctfh-part")  # a login page or a short file never replaces a good one
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            part.unlink(missing_ok=True)
+            done = subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "download-url", url, str(part)],
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=DIRECT_TIMEOUT)
+            if done.returncode == 0 and usable_download(part, name, total):
+                part.replace(dest)
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        part.unlink(missing_ok=True)
+        return False
 
     def click(self, url: str, name: str, page: str, opener: str = "", button: str = "", title: str = "") -> bool:
         """A real click on the challenge's own page, so the login cookies go along; returns at once. Opens the
@@ -1113,7 +1134,10 @@ class DownloadWatch:
                 if not self.pending:
                     self.thread = None
                     return
-            self.poll()
+            try:
+                self.poll()
+            except Exception:  # noqa: BLE001 - a stopped watcher would leave every waiting download hanging
+                pass
 
     def poll(self) -> None:
         downloads = chrome_download_dir()
@@ -1136,17 +1160,14 @@ class DownloadWatch:
                 self.pending.remove(entry)
                 path = downloads / name
                 try:
-                    with path.open("rb") as head:
-                        page = head.read(512).lstrip().lower().startswith((b"<!doctype html", b"<html"))
-                except OSError:
-                    page = True
-                if (page and not entry["name"].lower().endswith((".htm", ".html"))) or \
-                        (entry["total"] and size != entry["total"]):
-                    path.unlink(missing_ok=True)  # a login page saved under the file's name, or cut short
-                else:
-                    entry["dest"].parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(path), entry["dest"])
-                    entry["ok"] = True
+                    if usable_download(path, entry["name"], entry["total"]):
+                        entry["dest"].parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(path), entry["dest"])
+                        entry["ok"] = True
+                    else:
+                        path.unlink(missing_ok=True)
+                except OSError:  # gone or not movable just now: this one failed, the others go on
+                    pass
                 entry["done"].set()
             for entry in list(self.pending):  # nothing came for it: a login wall or a page shown in the tab
                 if (not busy and now - entry["clicked"] > 60) or now - self.moved_at > BROWSER_IDLE:
