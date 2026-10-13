@@ -1726,16 +1726,15 @@ class Checker:
 
     # -- solver windows
     def previous_session(self, chal: Path, status: dict) -> tuple[str, Path] | None:
-        """The solver's last Codex conversation, to carry on where it stopped."""
-        path = Path(status["session_file"]) if status.get("session_file") else None
-        for home in ([] if path and path.is_file() else rollout_homes(self.opts.binary)):
-            path = find_rollout(chal, home, status.get("launched_ts", time.time()))
-            if path:
-                break
-        sid = session_id(path) if path and path.is_file() else None
-        if sid is None:  # its conversation file is gone: start a new conversation
-            return None
-        return sid, path
+        """The newest Codex conversation opened in this challenge's folder, to carry on where it stopped.
+        Any conversation the challenge has is carried on; only one without any starts anew."""
+        since = status.get("first_launched_ts") or status.get("launched_ts") or time.time()
+        found = [path for home in rollout_homes(self.opts.binary) if (path := find_rollout(chal, home, since))]
+        if status.get("session_file") and Path(status["session_file"]).is_file():
+            found.append(Path(status["session_file"]))
+        path = max(found, key=lambda item: item.stat().st_mtime, default=None)
+        sid = session_id(path) if path else None
+        return (sid, path) if sid else None
 
     def launch(self, chal: Path, status: dict, resume: bool = False, count: bool = True) -> None:
         previous = self.previous_session(chal, status) if resume else None

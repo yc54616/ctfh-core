@@ -652,6 +652,9 @@ class CheckerFlowTests(Base):
         (day / "rollout-heap.jsonl").rename(day / "gone.txt")
         self.assertIsNone(checker.previous_session(chal, self.status("heap")))  # no file left: a new conversation
         (day / "gone.txt").rename(day / "rollout-heap.jsonl")
+        status = self.status("heap")
+        status.pop("session_file")
+        self.assertEqual(checker.previous_session(chal, status)[0], "sess-1")  # found by the challenge's folder
 
         (chal / native.INSTANCE_REQUEST).write_text("원격 확인\n")
         status = self.status("heap")
