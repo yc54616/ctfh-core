@@ -1498,12 +1498,15 @@ def submit(contest: Contest, chal: Path, opts: Options, runner=run_codex_json, s
     prompt = f"""[검사기 작업] 너는 flag 제출 담당이다. 대회: {contest.url}
 문제: {meta.get('name', chal.name)} (문제 페이지: {meta.get('url', '../challenge.md 참고')})
 flag는 ../flag.txt에 있다. 사용자의 로그인된 Chrome에서 이 문제에 flag를 정확히 한 번 제출하고 사이트의 응답을 읽어라.
+제출에 필요 없는 파일(AGENTS.md, 메모, 풀이 파일)은 읽지 말고 바로 제출 페이지로 가라.
 {browser_rules(session)}
 - flag 입력: `printf %s "$(cat ../flag.txt)" | env AGENT_BROWSER_SESSION={session} chrome-use fill @eN --stdin`
   (flag를 명령줄에 직접 쓰지 마라)
 제출 방법 힌트: {contest.site().get('submit_hint') or '(없음)'}
 - 이미 해결됨으로 표시되어 있으면 제출하지 말고 already_solved.
-- 응답이 애매하거나 제출이 너무 잦다고 막히면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 {login_steps(contest, session, 'result="needs_user"')}
+- 제출 뒤 응답 요청이 아직 끝나지 않았거나 정답·오답 알림이 안 보이면, 다시 제출하지 말고 `sleep 3` 뒤 페이지를 다시 읽어라.
+  알림이 사라졌으면 이 문제가 해결됨(SOLVED 표시, 체크 표시, 해결 목록 등)으로 바뀌었는지 보고 바뀌었으면 accepted다.
+- 그렇게 다시 봐도 판단할 수 없거나 제출이 너무 잦다고 막히면 다시 제출하지 말고 unknown. 로그인이 풀렸으면 {login_steps(contest, session, 'result="needs_user"')}
   로그인되면 이 문제로 돌아가 제출한다.
 - message에 flag 원문을 쓰지 마라. 파일은 수정하지 마라. 최종 응답은 스키마 JSON으로만 한다."""
     work = chal / ".ctfh-check"

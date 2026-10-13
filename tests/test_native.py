@@ -1321,6 +1321,16 @@ class CheckerFlowTests(Base):
             checker.job_review(chal, 0)
         self.assertEqual(seen, [("submit", "gpt-6-sol", "low"), ("review", "gpt-6-sol", "medium")])
 
+    def test_a_submit_whose_answer_is_late_looks_again_for_the_solved_mark_before_giving_up(self):
+        chal = make_challenge(self.root, "heap")
+        (chal / "flag.txt").write_text("FLAG{x}\n")
+        prompts = []
+        native.submit(self.contest, chal, native.Options(),
+                      lambda opts, cwd, prompt, *rest, **kw: prompts.append(prompt) or {})
+        self.assertIn("`sleep 3` 뒤 페이지를 다시 읽어라", prompts[0])
+        self.assertIn("SOLVED", prompts[0])
+        self.assertNotIn("FLAG{x}", prompts[0])
+
     def test_live_limit_and_handled_end_survive_a_checker_restart(self):
         from datetime import datetime, timedelta, timezone
         make_challenge(self.root, "heap")
