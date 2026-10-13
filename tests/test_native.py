@@ -1374,6 +1374,17 @@ class CheckerFlowTests(Base):
         self.assertIn("--instances", native.Options().to_args())
         self.assertEqual(native.Options().max_instances, 3)
 
+    def test_a_solver_without_a_window_that_needs_a_slot_to_open_shows_its_turn(self):
+        for slug, solves in (("easy", 50), ("jail", 5)):
+            chal = make_challenge(self.root, slug)
+            (chal / "challenge.json").write_text(json.dumps({"name": slug, "instance": True, "solves": solves}))
+        checker = self.checker(max_instances=2)
+        checker.tick()
+        self.assertEqual(checker.tmux.windows(), {"easy"})
+        native.save_status(self.root / "challenges" / "jail", {"state": "solving", "nudges": 1})  # its window was lost
+        row = next(row for row in checker.view()[1] if row["name"] == "jail")
+        self.assertEqual((row["queue"], row["activity"]), ("대기 1", "인스턴스 자리 대기 (1번째)"))
+
     def test_a_picked_instance_challenge_makes_the_lowest_unpicked_one_yield(self):
         for slug, solves in (("easy", 50), ("hard", 5), ("mine", 1)):
             chal = make_challenge(self.root, slug)

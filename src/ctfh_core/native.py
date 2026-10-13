@@ -2130,8 +2130,9 @@ class Checker:
         tries = status.get("download_tries", 0)
         return f"첨부 재시도 대기 ({tries}회 실패)" if tries else "첨부 대기"
 
-    def activity_text(self, chal: Path, status: dict, windows: set[str]) -> str:
-        """Board column: is this solver working, stalled, out of nudges, or gone?"""
+    def activity_text(self, chal: Path, status: dict, windows: set[str], place: int = 0) -> str:
+        """Board column: is this solver working, stalled, out of nudges, or gone?
+        ``place``: its turn in the instance queue, for a solver that cannot open before it gets a slot."""
         state = status.get("state")
         if state == "pending" and window_name(chal.name) not in windows:
             return "시작 대기" if files_ready(chal, status) else self.files_text(chal, status)
@@ -2147,6 +2148,8 @@ class Checker:
                 return "창 없음 (서버 대기)"
             if state == "manual" or status.get("stalled"):
                 return "창 없음 (수동 대기)"
+            if place and nudges < limit:
+                return f"인스턴스 자리 대기 ({place}번째)"
             return "창 없음 (재시작 한도)" if nudges >= limit else "창 없음 (곧 재시작)"
         info = self.activity.get(chal.name)
         if info is None:
@@ -2368,7 +2371,8 @@ class Checker:
             status = load_status(chal)
             tokens = self.tokens.get(chal.name)
             total += tokens or 0
-            state, activity = status.get("state", "-"), self.activity_text(chal, status, windows)
+            state, activity = status.get("state", "-"), self.activity_text(chal, status, windows,
+                                                                          place.get(chal.name, 0))
             reason = str(status.get("reason", ""))
             need = user_input(chal, status)
             if need:
