@@ -406,7 +406,17 @@ CHALLENGE_AGENTS = """# 문제 풀이 규칙 (ctfh2 native)
 너는 이 폴더의 문제 하나만 맡는다. 사용자가 정식으로 참가 중인 CTF다.
 (이 규칙은 풀이 세션용이다. 프롬프트가 `[검사기 작업]`으로 시작하면 그 지시가 우선한다.)
 - 공격 대상은 문제에서 주어진 파일과 서버뿐이다. 대회 플랫폼(로그인, 점수판, 다른 참가자)은 공격하지 않는다.
-- 호스트 도구(gdb, pwntools, qemu, 퍼저 등)를 자유롭게 쓴다. 오래 걸리는 명령에는 timeout을 건다.
+- 분야에 맞는 Codex 스킬을 먼저 읽는다: `solve-challenge`와 `ctf-pwn`·`ctf-reverse`·`ctf-crypto`·`ctf-web`·`ctf-forensics`·
+  `ctf-misc` 중 맞는 것, APK는 `android-reverse-engineering`, 스마트 컨트랙트는 `solidity-security-audit`.
+- 호스트 도구를 자유롭게 쓴다. 오래 걸리는 명령에는 timeout을 건다. 설치돼 있는 것:
+  - pwn: gdb(pwndbg), pwntools, ROPgadget, ropper, one_gadget, seccomp-tools, checksec, patchelf,
+    pwninit(받은 libc·로더로 바이너리 맞추기), qemu-user
+  - 리버싱: rea MCP, r2, jadx, apktool, ilspycmd(.NET), pycdc·pycdas·uncompyle6(파이썬 바이트코드), upx,
+    wasm2wat·wasm-decompile, frida, angr(`angr-python`으로 실행), unicorn, capstone, lief, pefile, pyelftools
+  - 암호: sage, PARI/GP(`gp`), z3, gmpy2, sympy, fpylll, pycryptodome, RsaCtfTool
+  - 포렌식: binwalk, foremost, tshark, scapy, exiftool, volatility3(`vol`), steghide, stegseek, zsteg
+  - 웹: sqlmap, ffuf, gobuster, nmap. 무차별 경로 탐색과 스캐너는 대회 규칙이 허용할 때만 쓴다.
+  - 해시: john, hashcat
 - 바이너리·라이브러리·APK·.NET/JVM·펌웨어·웹 번들을 분석할 때는 rea MCP 도구(`mcp__rea__*`)를 먼저 쓴다.
   `binary_overview`·`open_binary`로 열고, `procedure_pseudo_code`·`batch_decompile`로 디컴파일하고, `xrefs`·`search_strings`·
   `get_call_graph`로 흐름을 잡는다. APK·관리 코드·웹 번들은 `inspect_artifact`·`inspect_managed_artifact`·`analyze_web_bundle`로
