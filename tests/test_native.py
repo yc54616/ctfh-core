@@ -1679,12 +1679,12 @@ class CheckerFlowTests(Base):
         self.assertEqual((status["state"], status["nudges"]), ("user_solved", 3))
         self.assertNotIn(native.window_name("zzz"), checker.tmux.windows())
 
-    def test_remote_endpoints_come_from_challenge_notes_and_remote_txt(self):
+    def test_remote_endpoints_come_from_the_challenge_and_remote_txt_not_from_notes(self):
         chal = make_challenge(self.root, "web")
         (chal / "challenge.md").write_text("접속: nc 203.0.113.5 31337\nhttp://chal.example.org:8080/\n"
                                            "문제 페이지 https://ctf.example:443/challenges\n")
         (chal / "work").mkdir()
-        (chal / "work" / "NOTES.md").write_text("로컬 테스트 127.0.0.1:5000, localhost:8000\n")
+        (chal / "work" / "NOTES.md").write_text("PCAP의 TCP 대화는 모두 172.17.0.2:1234, nc 198.51.100.7 4444\n")
         (chal / "remote.txt").write_text("https://web.example.org/\n")
         self.assertEqual(native.remote_endpoints(chal, "ctf.example"),
                          [("web.example.org", 443), ("203.0.113.5", 31337), ("chal.example.org", 8080)])

@@ -168,7 +168,8 @@ _URL = re.compile(rf"\b(?P<scheme>https?)://(?P<host>{_HOST})(?::(?P<port>\d{{2,
 
 
 def remote_endpoints(chal: Path, contest_host: str = "") -> list[tuple[str, int]]:
-    """Remote services of one challenge: remote.txt, plus host:port / nc in the challenge text and notes."""
+    """Remote services of one challenge: remote.txt, plus host:port / nc in the challenge text.
+    Not the solver's notes: they also hold addresses seen in attachments, such as a capture's docker hosts."""
     found: list[tuple[str, int]] = []
 
     def add(host: str, port) -> None:
@@ -178,7 +179,7 @@ def remote_endpoints(chal: Path, contest_host: str = "") -> list[tuple[str, int]
         if (host, port) not in found:
             found.append((host, port))
 
-    for name in ("remote.txt", "challenge.md", "challenge.json", "work/NOTES.md"):
+    for name in ("remote.txt", "challenge.md", "challenge.json"):
         try:
             text = (chal / name).read_text(errors="replace")
         except OSError:
