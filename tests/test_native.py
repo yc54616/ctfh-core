@@ -1327,7 +1327,7 @@ class CheckerFlowTests(Base):
         prompts = []
         native.submit(self.contest, chal, native.Options(),
                       lambda opts, cwd, prompt, *rest, **kw: prompts.append(prompt) or {})
-        self.assertIn("`sleep 3` 뒤 페이지를 다시 읽어라", prompts[0])
+        self.assertIn("`sleep 3` 뒤 문제 페이지를\n  같은 주소로 다시 열어라", prompts[0])
         self.assertIn("SOLVED", prompts[0])
         self.assertNotIn("FLAG{x}", prompts[0])
 
