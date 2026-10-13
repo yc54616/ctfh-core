@@ -987,6 +987,36 @@ class CheckerFlowTests(Base):
         self.assertEqual(json.loads((chal / "challenge.json").read_text())["open"],  # remembered for the next time
                          {"url": "https://ctf.example.com/#42", "click": "#chall42-flag-header"})
 
+    def test_a_big_file_chrome_use_stops_waiting_for_is_taken_when_chrome_finishes_it(self):
+        downloads = self.root / "dl"
+        late = downloads / "chrome-use" / "6c1e"
+        late.mkdir(parents=True)
+        (downloads / "chrome-use" / "old").mkdir()
+        old = downloads / "chrome-use" / "old" / "big.zip.zip"
+        old.write_bytes(b"OLD")
+        os.utime(old, (1, 1))  # an earlier run's leftover is not taken
+        timed_out = subprocess.CompletedProcess([], 1, b"", b"CDP error (ABExt.downloadUrl): downloadUrl: timed out after 25000ms")
+        polls = []
+        def sleep(seconds):  # Chrome goes on, then finishes the file in its own folder
+            polls.append(seconds)
+            if len(polls) == 1:
+                (late / "미확인 1.crdownload").write_bytes(b"P")
+            elif len(polls) == 3:
+                (late / "미확인 1.crdownload").rename(late / "big.zip.zip")
+        with patch.object(native, "chrome_download_dir", return_value=downloads), \
+                patch.object(native.subprocess, "run", return_value=timed_out), \
+                patch.object(native.time, "sleep", side_effect=sleep):
+            self.assertTrue(native.DownloadWatch().download_url("https://ctf.example.com/download/59",
+                                                                self.root / "files" / "big.zip", "big.zip", None))
+        self.assertEqual((self.root / "files" / "big.zip").read_bytes(), b"P")
+        self.assertFalse(late.exists())  # its folder is cleared away
+        self.assertTrue(old.exists())
+        with patch.object(native, "chrome_download_dir", return_value=downloads), \
+                patch.object(native.subprocess, "run", return_value=timed_out), \
+                patch.object(native.time, "sleep"), patch.object(native, "BROWSER_IDLE", 0):
+            self.assertFalse(native.DownloadWatch().download_url("https://ctf.example.com/download/60",
+                                                                 self.root / "files" / "gone.zip", "gone.zip", None))
+
     def test_the_download_watcher_keeps_going_when_a_file_cannot_be_moved(self):
         downloads = self.root / "dl"
         downloads.mkdir()

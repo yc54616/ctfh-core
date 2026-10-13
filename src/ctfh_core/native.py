@@ -1047,18 +1047,46 @@ class DownloadWatch:
         if self.hangs >= 3 and time.time() < self.down_until:
             return False
         part = dest.with_name(dest.name + ".ctfh-part")  # a login page or a short file never replaces a good one
+        started = time.time()
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             part.unlink(missing_ok=True)
             done = subprocess.run(["chrome-use", "--session", DOWNLOAD_SESSION, "download-url", url, str(part)],
                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=DIRECT_TIMEOUT)
-            if done.returncode == 0 and usable_download(part, name, total):
+            if done.returncode and b"timed out" in done.stdout + done.stderr:
+                self.finish_late(Path(name).stem, part, started)
+            if part.exists() and usable_download(part, name, total):
                 part.replace(dest)
                 return True
         except (OSError, subprocess.TimeoutExpired):
             pass
         part.unlink(missing_ok=True)
         return False
+
+    def finish_late(self, stem: str, part: Path, started: float) -> None:
+        """chrome-use stops waiting for a download after 25 seconds, but Chrome goes on with it in a folder of its own
+        under chrome-use/ in the download folder: wait there for the finished file while downloads still move."""
+        root = chrome_download_dir() / "chrome-use"
+        sizes, moved = {}, time.time()
+        while time.time() - started < DIRECT_TIMEOUT and time.time() - moved < BROWSER_IDLE:
+            now = {path: _size(path) for path in (root.glob("*/*") if root.is_dir() else [])}
+            for path, size in now.items():
+                if path.name.startswith(stem) and not path.name.endswith(".crdownload") and sizes.get(path) == size:
+                    try:
+                        if path.stat().st_mtime < started - 5:  # an earlier run's leftover
+                            continue
+                        shutil.move(str(path), part)
+                    except OSError:
+                        return
+                    try:
+                        path.parent.rmdir()
+                    except OSError:
+                        pass
+                    return
+            if now != sizes:
+                moved = time.time()
+            sizes = now
+            time.sleep(BROWSER_POLL)
 
     def click(self, url: str, name: str, page: str, opener: str = "", button: str = "", title: str = "") -> bool:
         """A real click on the challenge's own page, so the login cookies go along; returns at once. Opens the
