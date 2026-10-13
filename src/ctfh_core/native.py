@@ -100,7 +100,6 @@ class Options:
 # ---------------------------------------------------------------- memory
 
 MEMORY_SHARE = 0.90  # all solver windows together may use this much of RAM; the rest stays for Chrome and the desktop
-CPU_SHARE = 0.95  # and this much of all CPUs, so the desktop and the checker stay responsive
 MEMORY_SLICE = "ctfh.slice"
 SWAP_PER_SOLVER = "512M"
 
@@ -129,22 +128,16 @@ def memory_limit(setting: str | None) -> str | None:
     return value.upper()
 
 
-def cpu_quota() -> str:
-    """CPUQuota for the slice: 100% is one CPU, so 95% of 16 CPUs is 1520%."""
-    return f"{int((os.cpu_count() or 1) * CPU_SHARE * 100)}%"
-
-
 def set_slice_limits(memory: str | None) -> None:
-    """Cap the slice every solver scope runs in (runtime only; gone after logout)."""
+    """Cap the slice every solver scope runs in (runtime only; gone after logout). CPU stays unlimited."""
     subprocess.run(["systemctl", "--user", "set-property", "--runtime", MEMORY_SLICE, f"MemoryMax={memory or 'infinity'}",
-                    f"CPUQuota={cpu_quota()}"], capture_output=True, check=False, timeout=30)
+                    "CPUQuota="], capture_output=True, check=False, timeout=30)
 
 
 def scope_prefix(opts: Options, unit: str) -> list[str]:
     """Run one tmux window, the checker or a solver, in its own scope inside the shared slice.
 
-    Everything ctfh2 starts lives there, so together it stays under the memory cap and
-    CPU_SHARE of the CPUs (even with the memory cap off). When the slice is full the kernel
+    Everything ctfh2 starts lives there, so together it stays under the memory cap. When the slice is full the kernel
     kills the biggest process inside it (a runaway fuzzer or VM), not the desktop or tmux;
     the window itself keeps running.
     """
@@ -2713,7 +2706,7 @@ def restart_loop(argv: list[str], delay: int = 5) -> list[str]:
 
 
 def checker_argv(root: Path, opts: Options) -> list[str]:
-    """The checker window, kept in the same slice as the solvers so its Codex runs count toward the caps."""
+    """The checker window, kept in the same slice as the solvers so its Codex runs count toward the cap."""
     return scope_prefix(opts, f"ctfh-{root.name[:40]}-checker") \
         + restart_loop(self_command("checker", str(root), *opts.to_args()))
 

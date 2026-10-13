@@ -1686,10 +1686,8 @@ class CheckerFlowTests(Base):
                 patch("ctfh_core.native.set_slice_limits") as slice_limit:
             off = self.checker(memory_max="off")
             off.tick()
-        slice_limit.assert_called_once_with(None)  # no memory cap, but the slice still holds the CPU share
+        slice_limit.assert_called_once_with(None)  # no memory cap; the windows still share the slice
         self.assertIn("--slice=ctfh.slice", off.tmux.open["plain"])
-        with patch("ctfh_core.native.os.cpu_count", return_value=16):
-            self.assertEqual(native.cpu_quota(), "1520%")  # 95% of 16 CPUs
 
     def test_the_checker_window_runs_in_the_same_capped_slice(self):
         with patch("ctfh_core.native.shutil.which", return_value="/usr/bin/systemd-run"), \
