@@ -625,6 +625,21 @@ class CheckerFlowTests(Base):
         self.assertIn("instance_slot", self.status("heap"))
         self.assertTrue((chal / native.INSTANCE_REQUEST).exists())
 
+    def test_windows_lost_with_tmux_reopen_even_out_of_nudges_or_waiting_for_a_server(self):
+        for slug in ("spent", "down"):
+            make_challenge(self.root, slug)
+        checker = self.checker()
+        checker.tick()
+        for slug, extra in (("spent", {"nudges": 3}), ("down", {"nudges": 1, "remote_down": time.time()})):
+            status = self.status(slug)
+            status.update(launched_ts=status["launched_ts"] - 600, **extra)
+            native.save_status(self.root / "challenges" / slug, status)
+        again = self.checker()  # tmux went down; nothing of it is left
+        again.tick()
+        self.assertEqual(again.tmux.windows(), {"spent", "down"})
+        self.assertEqual([self.status(slug)["state"] for slug in ("spent", "down")], ["solving", "solving"])
+        self.assertEqual(self.status("spent")["nudges"], 3)  # reopening spent none
+
     def test_the_tmux_server_starts_in_a_scope_of_its_own(self):
         with patch.object(native.shutil, "which", return_value="/usr/bin/systemd-run"):
             scope = native.server_scope(self.root, native.Options())

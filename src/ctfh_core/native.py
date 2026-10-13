@@ -2287,10 +2287,11 @@ class Checker:
             if (state == "pending" or (state == "blocked" and status.get("blocked_by")
                                        != f"{self.opts.binary}:{self.opts.model or '-'}")) and files_ready(chal, status):
                 fresh.append((chal, status))
-            elif state in ACTIVE | {"accepted"} and not status.get("remote_down") \
+            elif state in ACTIVE | {"accepted"} and (chal.name in self.lost or not status.get("remote_down")) \
                     and time.time() - status.get("launched_ts", 0) > 60:
+                # A window lost with tmux was not the solver's doing: it reopens whatever its nudges or server.
                 if state not in ("manual", "hold") and not status.get("stalled") \
-                        and status.get("nudges", 0) < self.opts.nudge_limit:
+                        and (chal.name in self.lost or status.get("nudges", 0) < self.opts.nudge_limit):
                     restart.append((chal, status))
                 elif state in ("solving", "needs_fix"):
                     status.update(state="manual", reason=f"창 종료, 자동 재시작 {self.opts.nudge_limit}회 다 씀: 직접 확인 필요")
