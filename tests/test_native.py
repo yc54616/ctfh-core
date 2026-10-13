@@ -89,7 +89,7 @@ class Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.home = Path(self.temp.name) / "codex-home"
         for target, value in (("codex_home", self.home), ("rollout_homes", [self.home]),
-                              ("_meminfo", 32 << 30), ("set_memory_slice", None),
+                              ("_meminfo", 32 << 30), ("set_slice_limits", None),
                               ("site_solved", None), ("probe_endpoint", "unknown"),
                               ("api_reachable", True), ("chrome_account", "player@example.com"),
                               ("site_list", None), ("direct_fetch", None),
@@ -1667,10 +1667,10 @@ class CheckerFlowTests(Base):
     def test_solver_window_runs_under_memory_cap(self):
         make_challenge(self.root, "fuzz")
         with patch("ctfh_core.native.shutil.which", return_value="/usr/bin/systemd-run"), \
-                patch("ctfh_core.native.set_memory_slice") as slice_limit:
+                patch("ctfh_core.native.set_slice_limits") as slice_limit:
             checker = self.checker(memory_max="auto")
             checker.tick()
-        slice_limit.assert_called_once_with("29491M")  # 90% of 32G, shared by every solver window
+        slice_limit.assert_called_once_with("31129M")  # 95% of 32G, shared by every solver window
         argv = checker.tmux.open["fuzz"]
         self.assertEqual(argv[:4], ["systemd-run", "--user", "--scope", "--quiet"])
         self.assertIn("--slice=ctfh.slice", argv)
@@ -1682,10 +1682,24 @@ class CheckerFlowTests(Base):
         with self.assertRaises(ValueError):
             native.memory_limit("lots")
         make_challenge(self.root, "plain")
-        with patch("ctfh_core.native.shutil.which", return_value="/usr/bin/systemd-run"):
+        with patch("ctfh_core.native.shutil.which", return_value="/usr/bin/systemd-run"), \
+                patch("ctfh_core.native.set_slice_limits") as slice_limit:
             off = self.checker(memory_max="off")
             off.tick()
-        self.assertNotIn("systemd-run", off.tmux.open["plain"])
+        slice_limit.assert_called_once_with(None)  # no memory cap, but the slice still holds the CPU share
+        self.assertIn("--slice=ctfh.slice", off.tmux.open["plain"])
+        with patch("ctfh_core.native.os.cpu_count", return_value=16):
+            self.assertEqual(native.cpu_quota(), "1520%")  # 95% of 16 CPUs
+
+    def test_the_checker_window_runs_in_the_same_capped_slice(self):
+        with patch("ctfh_core.native.shutil.which", return_value="/usr/bin/systemd-run"), \
+                patch("ctfh_core.native.set_slice_limits") as slice_limit:
+            argv = native.checker_argv(self.root, native.Options(binary="codex"))
+        slice_limit.assert_called_once_with(native.memory_limit("auto"))
+        self.assertEqual(argv[:4], ["systemd-run", "--user", "--scope", "--quiet"])
+        self.assertIn("--slice=ctfh.slice", argv)
+        self.assertEqual(argv[argv.index("OOMPolicy=continue") + 1:][:2], ["sh", "-c"])  # the restart loop runs inside it
+        self.assertIn("checker", argv)
 
     def test_low_memory_delays_new_windows_without_lowering_parallel(self):
         for slug in ("a", "b"):

@@ -99,7 +99,8 @@ class Options:
 
 # ---------------------------------------------------------------- memory
 
-MEMORY_SHARE = 0.90  # all solver windows together may use this much of RAM; the rest stays for Chrome and the desktop
+MEMORY_SHARE = 0.95  # all solver windows together may use this much of RAM; the rest stays for Chrome and the desktop
+CPU_SHARE = 0.95  # and this much of all CPUs, so the desktop and the checker stay responsive
 MEMORY_SLICE = "ctfh.slice"
 SWAP_PER_SOLVER = "512M"
 
@@ -116,7 +117,7 @@ def _meminfo(key: str) -> int:
 
 
 def memory_limit(setting: str | None) -> str | None:
-    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (90% of RAM)."""
+    """MemoryMax shared by all solver windows: 'off', a size like '28G', or 'auto' (95% of RAM)."""
     value = (setting or "auto").strip()
     if value.lower() in ("off", "none", "0"):
         return None
@@ -128,25 +129,35 @@ def memory_limit(setting: str | None) -> str | None:
     return value.upper()
 
 
-def set_memory_slice(limit: str) -> None:
+def cpu_quota() -> str:
+    """CPUQuota for the slice: 100% is one CPU, so 95% of 16 CPUs is 1520%."""
+    return f"{int((os.cpu_count() or 1) * CPU_SHARE * 100)}%"
+
+
+def set_slice_limits(memory: str | None) -> None:
     """Cap the slice every solver scope runs in (runtime only; gone after logout)."""
-    subprocess.run(["systemctl", "--user", "set-property", "--runtime", MEMORY_SLICE, f"MemoryMax={limit}"],
-                   capture_output=True, check=False, timeout=30)
+    subprocess.run(["systemctl", "--user", "set-property", "--runtime", MEMORY_SLICE, f"MemoryMax={memory or 'infinity'}",
+                    f"CPUQuota={cpu_quota()}"], capture_output=True, check=False, timeout=30)
+
+
+def scope_prefix(opts: Options, unit: str) -> list[str]:
+    """Run one tmux window, the checker or a solver, in its own scope inside the shared slice.
+
+    Everything ctfh2 starts lives there, so together it stays under the memory cap and
+    CPU_SHARE of the CPUs (even with the memory cap off). When the slice is full the kernel
+    kills the biggest process inside it (a runaway fuzzer or VM), not the desktop or tmux;
+    the window itself keeps running.
+    """
+    if shutil.which("systemd-run") is None:
+        return []
+    set_slice_limits(memory_limit(opts.memory_max))
+    unit = f"{unit}-{int(time.time())}"
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", f"--slice={MEMORY_SLICE}",
+            "-p", f"MemorySwapMax={SWAP_PER_SOLVER}", "-p", "OOMPolicy=continue"]
 
 
 def memory_prefix(opts: Options, chal: Path) -> list[str]:
-    """Run one solver window in its own scope inside the shared slice.
-
-    When the slice is full the kernel kills the biggest process inside it (a runaway
-    fuzzer or VM), not the desktop, tmux or the checker; the window itself keeps running.
-    """
-    limit = memory_limit(opts.memory_max)
-    if limit is None or shutil.which("systemd-run") is None:
-        return []
-    set_memory_slice(limit)
-    unit = f"ctfh-{chal.parent.parent.name[:40]}-{chal.name}-{int(time.time())}"
-    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", f"--slice={MEMORY_SLICE}",
-            "-p", f"MemorySwapMax={SWAP_PER_SOLVER}", "-p", "OOMPolicy=continue"]
+    return scope_prefix(opts, f"ctfh-{chal.parent.parent.name[:40]}-{chal.name}")
 
 
 # ---------------------------------------------------------------- remote services
@@ -2701,6 +2712,12 @@ def restart_loop(argv: list[str], delay: int = 5) -> list[str]:
     return ["sh", "-c", loop, "sh", *argv]
 
 
+def checker_argv(root: Path, opts: Options) -> list[str]:
+    """The checker window, kept in the same slice as the solvers so its Codex runs count toward the caps."""
+    return scope_prefix(opts, f"ctfh-{root.name[:40]}-checker") \
+        + restart_loop(self_command("checker", str(root), *opts.to_args()))
+
+
 def self_command(*args: str) -> list[str]:
     src = Path(__file__).resolve().parents[1]
     return ["env", f"PYTHONPATH={src}", sys.executable, "-m", "ctfh_core.cli", *args]
@@ -2762,9 +2779,9 @@ def go(site: str | None, directory: str | None, opts: Options, attach: bool = Tr
                 print(f"Chrome에서 {url} 에 로그인한 뒤 다시 실행하세요.")
                 return 3
             input(f"Chrome에서 {url} 에 로그인한 뒤 Enter를 누르세요 (2FA·캡차 포함)... ")
-        tmux.new_session("checker", root, restart_loop(self_command("checker", str(root), *opts.to_args())))
+        tmux.new_session("checker", root, checker_argv(root, opts))
     elif "checker" not in tmux.windows():  # checker stopped (Ctrl-C): restart it with these options
-        tmux.new_window("checker", root, restart_loop(self_command("checker", str(root), *opts.to_args())))
+        tmux.new_window("checker", root, checker_argv(root, opts))
     print(f"tmux 세션: {tmux.session}  (붙기: tmux attach -t {tmux.session})")
     if attach and sys.stdin.isatty() and sys.stdout.isatty():
         verb = "switch-client" if os.environ.get("TMUX") else "attach"
